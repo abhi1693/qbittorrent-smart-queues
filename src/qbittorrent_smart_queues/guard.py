@@ -29,6 +29,10 @@ TV_SEASON_PATTERN = re.compile(
     r"(?:^|[ ._\[\(\-])s(?P<season>\d{1,3})(?:[ ._\]\)\-]|$)",
     re.IGNORECASE,
 )
+TV_SEASON_WORD_PATTERN = re.compile(
+    r"(?:^|[ ._\[\(\-])season[ ._\-]*(?P<season>\d{1,3})(?:[ ._\]\)\-]|$)",
+    re.IGNORECASE,
+)
 MEDIA_FILE_EXTENSIONS = {
     ".avi",
     ".m2ts",
@@ -1245,7 +1249,7 @@ def parse_tv_episode_order(value):
             "season_pack": False,
         }
 
-    match = TV_SEASON_PATTERN.search(text)
+    match = TV_SEASON_PATTERN.search(text) or TV_SEASON_WORD_PATTERN.search(text)
     if match:
         return {
             "series": normalize_tv_sort_text(text[:match.start()]),
@@ -1506,6 +1510,165 @@ class SonarrQueueMetadata:
         return None
 
 
+def jellyfin_episode_watch_order(item):
+    if not isinstance(item, dict):
+        return None
+    if item.get("Type") and str(item.get("Type")).lower() != "episode":
+        return None
+
+    series = (
+        item.get("SeriesName")
+        or item.get("Series")
+        or item.get("SeriesTitle")
+        or ""
+    )
+    season = int_or_none(
+        item.get("ParentIndexNumber")
+        or item.get("SeasonNumber")
+        or item.get("Season")
+    )
+    episode = int_or_none(
+        item.get("IndexNumber")
+        or item.get("EpisodeNumber")
+        or item.get("Episode")
+    )
+    series = normalize_tv_sort_text(series)
+    if not series or season is None:
+        return None
+    return {
+        "series": series,
+        "season": season,
+        "episode": episode or 0,
+    }
+
+
+class JellyfinWatchMetadata:
+    def __init__(self):
+        self.enabled = env_bool("QBT_TV_WATCH_JELLYFIN_ENABLED", True)
+        self.timeout = env_int(
+            "QBT_TV_WATCH_TIMEOUT",
+            env_int("QBT_ARR_QUEUE_TIMEOUT", env_int("QBT_TV_QUEUE_TIMEOUT", 10)),
+        )
+        self.active_within_seconds = max(
+            1,
+            env_int("QBT_TV_WATCH_ACTIVE_WITHIN_SECONDS", 7200),
+        )
+        self.by_series_season = {}
+        if self.enabled:
+            self.load()
+
+    def configs(self):
+        api_key = (
+            os.environ.get("QBT_TV_WATCH_JELLYFIN_API_KEY")
+            or os.environ.get("JELLYFIN_API_KEY")
+            or ""
+        ).strip()
+        urls = split_lines_or_csv(
+            first_env(["QBT_TV_WATCH_JELLYFIN_URLS", "JELLYFIN_URLS", "JELLYFIN_URL"])
+        ) or ["http://jellyfin.media.svc.cluster.local:8096"]
+        if not api_key:
+            return []
+        return [("jellyfin", url.rstrip("/"), api_key) for url in urls]
+
+    def load(self):
+        configs = self.configs()
+        if not configs:
+            log_debug("Jellyfin watch enrichment disabled; JELLYFIN_API_KEY is not set")
+            return
+
+        for label, base_url, api_key in configs:
+            try:
+                self.load_sessions(label, base_url, api_key)
+            except ApiError as exc:
+                log_warning(f"Failed to read {label} active sessions: {exc}")
+
+    def load_sessions(self, label, base_url, api_key):
+        opener = urllib.request.build_opener()
+        params = urllib.parse.urlencode({
+            "ActiveWithinSeconds": str(self.active_within_seconds),
+        })
+        url = join_url(base_url, "/Sessions") + "?" + params
+        try:
+            data, _ = request_json(
+                opener,
+                "GET",
+                url,
+                headers={"Accept": "application/json", "X-Emby-Token": api_key},
+                timeout=self.timeout,
+            )
+        except ApiError as exc:
+            raise ApiError("GET /Sessions failed") from exc
+        sessions = response_rows(data, f"{label} sessions")
+
+        loaded = 0
+        for position, session in enumerate(sessions):
+            if not isinstance(session, dict):
+                continue
+            item = session.get("NowPlayingItem")
+            watch_order = jellyfin_episode_watch_order(item)
+            if not watch_order:
+                continue
+            activity_at = (
+                parse_utc(session.get("LastActivityDate"))
+                or parse_utc(session.get("LastPlaybackCheckIn"))
+                or parse_utc((item.get("UserData") or {}).get("LastPlayedDate") if isinstance(item, dict) else None)
+            )
+            self.record_watch(
+                watch_order["series"],
+                watch_order["season"],
+                watch_order["episode"],
+                position,
+                activity_at,
+                "jellyfin-active-session",
+            )
+            loaded += 1
+        log_info(f"Loaded {loaded} active {label} TV watch session(s)")
+
+    def record_watch(self, series, season, episode, position, activity_at, source):
+        key = (series, int(season))
+        rank = (
+            0 if activity_at else 1,
+            -int(activity_at.timestamp()) if activity_at else 0,
+            int(position),
+        )
+        existing = self.by_series_season.get(key)
+        if existing and existing["rank"] <= rank:
+            return
+        self.by_series_season[key] = {
+            "series": series,
+            "season": int(season),
+            "episode": int(episode or 0),
+            "position": int(position),
+            "activity_at": format_utc(activity_at) if activity_at else None,
+            "source": source,
+            "rank": rank,
+        }
+
+    def torrent_watch_priority(self, torrent, order):
+        if not self.enabled or not order:
+            return None
+        if not tv_order_is_full_season_pack(torrent, order):
+            return None
+
+        series = order.get("series")
+        season = int_or_none(order.get("season"))
+        if not series or season is None:
+            return None
+        watch = self.by_series_season.get((series, season))
+        if not watch:
+            return None
+
+        return {
+            "series": watch["series"],
+            "season": watch["season"],
+            "episode": watch["episode"],
+            "next_episode": watch["episode"] + 1,
+            "activity_at": watch.get("activity_at"),
+            "source": watch.get("source", ""),
+            "rank": watch["rank"],
+        }
+
+
 class RadarrQueueMetadata:
     def __init__(self):
         self.enabled = env_bool("QBT_MOVIE_QUEUE_RADARR_ENABLED", True)
@@ -1634,9 +1797,19 @@ def tv_torrent_order(torrent, tv_order_categories, sonarr_queue):
     }
 
 
-def build_tv_order_state(torrents, tv_order_categories, sonarr_queue):
+def tv_order_is_full_season_pack(torrent, order):
+    if not order or not order.get("season_pack"):
+        return False
+    parsed = parse_tv_episode_order(torrent_name(torrent))
+    if parsed and parsed.get("season_pack"):
+        return True
+    return int_or_none(order.get("episode")) == 0
+
+
+def build_tv_order_state(torrents, tv_order_categories, sonarr_queue, watch_metadata=None):
     orders = {}
     series_ranks = {}
+    watch_priorities = {}
 
     for torrent in torrents:
         item_hash = torrent_hash(torrent)
@@ -1644,6 +1817,13 @@ def build_tv_order_state(torrents, tv_order_categories, sonarr_queue):
         if not item_hash or not order:
             continue
         orders[item_hash] = order
+        watch_priority = (
+            watch_metadata.torrent_watch_priority(torrent, order)
+            if watch_metadata
+            else None
+        )
+        if watch_priority:
+            watch_priorities[item_hash] = watch_priority
 
         series = order["series"]
         rank = (
@@ -1655,7 +1835,11 @@ def build_tv_order_state(torrents, tv_order_categories, sonarr_queue):
         if series not in series_ranks or rank < series_ranks[series]:
             series_ranks[series] = rank
 
-    return {"orders": orders, "series_ranks": series_ranks}
+    return {
+        "orders": orders,
+        "series_ranks": series_ranks,
+        "watch_priorities": watch_priorities,
+    }
 
 
 def tv_episode_order_key(torrent, tv_order_categories, tv_order_state):
@@ -1671,8 +1855,11 @@ def tv_episode_order_key(torrent, tv_order_categories, tv_order_state):
         order["series"],
         (999999, int(order["season"]), int(order["episode"]), order["series"]),
     )
+    watch_priority = tv_order_state.get("watch_priorities", {}).get(torrent_hash(torrent))
     return (
         0,
+        0 if watch_priority else 1,
+        watch_priority.get("rank", (999999, 999999, 999999)) if watch_priority else (),
         series_rank,
         int(order["season"]),
         int(order["episode"]),
@@ -1816,7 +2003,14 @@ def is_media_file(file_item):
     return any(path.endswith(extension) for extension in MEDIA_FILE_EXTENSIONS)
 
 
-def apply_tv_episode_file_priorities(client, torrent, tv_order_categories, enabled, lookahead_episodes):
+def apply_tv_episode_file_priorities(
+    client,
+    torrent,
+    tv_order_categories,
+    enabled,
+    lookahead_episodes,
+    watch_priority=None,
+):
     item_hash = torrent_hash(torrent)
     if not enabled or not item_hash or torrent_category(torrent).lower() not in tv_order_categories:
         return
@@ -1861,8 +2055,23 @@ def apply_tv_episode_file_priorities(client, torrent, tv_order_categories, enabl
         if short_key not in ordered_episode_keys:
             ordered_episode_keys.append(short_key)
 
+    high_candidate_keys = ordered_episode_keys
+    if watch_priority:
+        watched_season = int_or_none(watch_priority.get("season"))
+        watched_episode = int_or_none(watch_priority.get("episode")) or 0
+        watch_ordered_keys = [
+            episode_key for episode_key in ordered_episode_keys
+            if episode_key[0] == watched_season and episode_key[1] > watched_episode
+        ]
+        if watch_ordered_keys:
+            high_candidate_keys = watch_ordered_keys
+            ordered_episode_keys = watch_ordered_keys + [
+                episode_key for episode_key in ordered_episode_keys
+                if episode_key not in watch_ordered_keys
+            ]
+
     maximum_keys = set(ordered_episode_keys[:1])
-    high_keys = set(ordered_episode_keys[1:1 + max(0, lookahead_episodes)])
+    high_keys = set(high_candidate_keys[1:1 + max(0, lookahead_episodes)])
     maximum_ids = [
         file_id for episode_key, file_id, _ in episode_files
         if episode_key[:2] in maximum_keys
@@ -1885,10 +2094,18 @@ def apply_tv_episode_file_priorities(client, torrent, tv_order_categories, enabl
         client.set_file_priority(item_hash, maximum_ids, QBT_FILE_PRIORITY_MAXIMUM)
 
     season, episode = ordered_episode_keys[0]
-    log_info(
-        f"Prioritized TV episode files: "
-        f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first"
-    )
+    if watch_priority:
+        watched_episode = int(watch_priority.get("episode") or 0)
+        log_info(
+            f"Prioritized watched TV season pack files: "
+            f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first "
+            f"after watched S{int(watch_priority['season']):02d}E{watched_episode:02d}"
+        )
+    else:
+        log_info(
+            f"Prioritized TV episode files: "
+            f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first"
+        )
 
 
 def torrent_priority_reason(torrent, priority_tags, priority_categories):
@@ -1912,6 +2129,16 @@ def priority_log_suffix(torrent, priority_tags, priority_categories):
     if reason:
         return f"; priority via {reason}"
     return ""
+
+
+def watch_priority_log_suffix(torrent, tv_order_state):
+    watch_priority = tv_order_state.get("watch_priorities", {}).get(torrent_hash(torrent))
+    if not watch_priority:
+        return ""
+    return (
+        f"; watched season pack target S{int(watch_priority['season']):02d}"
+        f"E{int(watch_priority['next_episode']):02d}"
+    )
 
 
 def cleanup_qbt_client(client):
@@ -2628,6 +2855,7 @@ def apply_single_download(
     )
     health_store = TorrentHealthStore()
     sonarr_queue = SonarrQueueMetadata()
+    jellyfin_watch = JellyfinWatchMetadata()
     radarr_queue = RadarrQueueMetadata()
 
     for client in clients:
@@ -2725,7 +2953,12 @@ def apply_single_download(
                 else:
                     eligible_torrents.append(torrent)
 
-            tv_order_state = build_tv_order_state(torrents, tv_order_categories, sonarr_queue)
+            tv_order_state = build_tv_order_state(
+                torrents,
+                tv_order_categories,
+                sonarr_queue,
+                jellyfin_watch,
+            )
             movie_order_state = build_movie_order_state(torrents, movie_order_categories, radarr_queue)
             all_candidates = sorted(
                 eligible_torrents,
@@ -2782,12 +3015,20 @@ def apply_single_download(
                     continue
                 available_candidates.append(torrent)
 
+            watch_priority_candidates = [
+                torrent for torrent in available_candidates
+                if torrent_hash(torrent) in tv_order_state.get("watch_priorities", {})
+            ]
             priority_candidates = [
                 torrent for torrent in available_candidates
                 if torrent_priority_reason(torrent, priority_tags, priority_categories)
             ]
-            selection_candidates = priority_candidates or available_candidates
-            if priority_candidates:
+            selection_candidates = watch_priority_candidates or priority_candidates or available_candidates
+            if watch_priority_candidates:
+                rejected_counts["deferred_by_watch_activity"] += (
+                    len(available_candidates) - len(watch_priority_candidates)
+                )
+            elif priority_candidates:
                 rejected_counts["deferred_by_priority"] += len(available_candidates) - len(priority_candidates)
 
             productive_candidates = []
@@ -2818,6 +3059,8 @@ def apply_single_download(
                 "available": len(available_candidates),
                 "selection_pool": len(selection_candidates),
                 "priority": len(priority_candidates),
+                "watch_priority": len(watch_priority_candidates),
+                "watched_tv_season_packs": len(tv_order_state.get("watch_priorities", {})),
                 "productive": len(productive_candidates),
                 "slow": len(slow_candidates),
             }
@@ -2836,6 +3079,7 @@ def apply_single_download(
                     tv_order_categories,
                     tv_file_priority_enabled,
                     tv_file_priority_lookahead,
+                    tv_order_state.get("watch_priorities", {}).get(keep_hash),
                 )
                 client.top_priority([keep_hash])
                 emit_decision_log(
@@ -2854,6 +3098,7 @@ def apply_single_download(
                     f"monthly usage {human_size(usage_bytes)} / {human_size(monthly_limit_bytes)}; "
                     f"limit {human_download_limit(download_limit)} down ({limit_reason})"
                     f"{priority_log_suffix(keep, priority_tags, priority_categories)}"
+                    f"{watch_priority_log_suffix(keep, tv_order_state)}"
                     f"{health_store.summary(keep, now)}"
                 )
                 if stall_check_seconds <= 0:
@@ -3114,6 +3359,7 @@ def apply_single_download(
                 tv_order_categories,
                 tv_file_priority_enabled,
                 tv_file_priority_lookahead,
+                tv_order_state.get("watch_priorities", {}).get(selected_hash),
             )
             client.top_priority([selected_hash])
             try:
@@ -3141,6 +3387,7 @@ def apply_single_download(
                 f"monthly usage {human_size(usage_bytes)} / {human_size(monthly_limit_bytes)}; "
                 f"limit {human_download_limit(download_limit)} down ({limit_reason})"
                 f"{priority_log_suffix(selected, priority_tags, priority_categories)}"
+                f"{watch_priority_log_suffix(selected, tv_order_state)}"
                 f"{health_store.summary(selected, now)}"
             )
 

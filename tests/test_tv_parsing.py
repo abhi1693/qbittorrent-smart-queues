@@ -39,6 +39,16 @@ class TvParsingTests(unittest.TestCase):
             "season_pack": True,
         }, parsed)
 
+    def test_parse_season_word_pack(self):
+        parsed = self.guard.parse_tv_episode_order("Gamma Show Season 04 2160p BluRay")
+
+        self.assertEqual({
+            "series": "gamma show",
+            "season": 4,
+            "episode": 0,
+            "season_pack": True,
+        }, parsed)
+
     def test_queue_record_episode_order_uses_earliest_episode(self):
         record = {
             "episodes": [
@@ -94,6 +104,30 @@ class TvParsingTests(unittest.TestCase):
         self.assertEqual("zeta movie", queue.by_download_id["mov123"]["title"])
         self.assertEqual(2026, queue.by_download_id["mov123"]["year"])
         self.assertEqual("zeta movie", queue.by_title["zeta movie"]["title"])
+
+    def test_jellyfin_session_loads_active_episode_watch_state(self):
+        watch = self.guard.JellyfinWatchMetadata.__new__(self.guard.JellyfinWatchMetadata)
+        watch.timeout = 10
+        watch.active_within_seconds = 7200
+        watch.by_series_season = {}
+        session = {
+            "LastActivityDate": "2026-05-31T20:30:00Z",
+            "NowPlayingItem": {
+                "Type": "Episode",
+                "SeriesName": "Eta Show",
+                "ParentIndexNumber": 2,
+                "IndexNumber": 5,
+            },
+        }
+
+        with mock.patch.object(self.guard, "request_json", return_value=([session], object())):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                watch.load_sessions("jellyfin", "http://jellyfin.test", "api-key")
+
+        priority = watch.by_series_season[("eta show", 2)]
+        self.assertEqual(5, priority["episode"])
+        self.assertEqual("jellyfin-active-session", priority["source"])
 
 
 if __name__ == "__main__":

@@ -6,8 +6,9 @@ media qBittorrent deployment.
 It runs as a continuous Kubernetes controller and controls qBittorrent through
 the Web API. The controller enforces WAN quota budgets, single-active-download
 behavior, stall cooldowns, persistent torrent health scoring, storage headroom
-checks, optional Sonarr queue-aware TV ordering, optional Radarr queue-aware
-movie ordering, and NVMe thermal stops.
+checks, optional Sonarr queue-aware TV ordering, optional Jellyfin watch-aware
+season-pack boosts, optional Radarr queue-aware movie ordering, and NVMe
+thermal stops.
 
 ## Image
 
@@ -43,6 +44,12 @@ enrichment uses `RADARR_API_KEY` or `QBT_MOVIE_QUEUE_RADARR_API_KEY` with
 `QBT_MOVIE_QUEUE_RADARR_URLS`. Both integrations read `/api/v3/queue`, index
 records by download ID and title, and fall back to torrent-name parsing/order
 when credentials or queue records are unavailable.
+
+Jellyfin watch enrichment uses `JELLYFIN_API_KEY` or
+`QBT_TV_WATCH_JELLYFIN_API_KEY` with `QBT_TV_WATCH_JELLYFIN_URLS`. Active
+episode sessions from `/Sessions` boost only matching full-season TV pack
+torrents, then file priorities inside that pack start at the next episode after
+the episode currently being watched.
 
 Each controller pass checks NVMe thermal state before selecting or starting
 torrents. Set `QBT_FULL_GUARD_THERMAL_CHECK_ENABLED=false` only if another
