@@ -3,10 +3,11 @@
 `qbittorrent-smart-queues` is the queue and quota controller used by the home-lab
 media qBittorrent deployment.
 
-It runs as a Kubernetes CronJob and controls qBittorrent through the Web API. The
-controller enforces WAN quota budgets, single-active-download behavior, stall
-cooldowns, persistent torrent health scoring, storage headroom checks, optional
-Sonarr queue-aware TV ordering, and NVMe thermal stops.
+It can run once or as a continuous Kubernetes controller and controls
+qBittorrent through the Web API. The controller enforces WAN quota budgets,
+single-active-download behavior, stall cooldowns, persistent torrent health
+scoring, storage headroom checks, optional Sonarr queue-aware TV ordering, and
+NVMe thermal stops.
 
 ## Image
 
@@ -39,6 +40,11 @@ Kubernetes Secrets in the consuming deployment.
 Full guard mode checks NVMe thermal state before selecting or starting torrents.
 Set `QBT_FULL_GUARD_THERMAL_CHECK_ENABLED=false` only if another controller is
 responsible for thermal gating.
+
+Set `QBT_GUARD_MODE=continuous` or `QBT_GUARD_LOOP_ENABLED=true` to keep the
+controller running and polling. `QBT_GUARD_POLL_SECONDS` controls the normal
+poll interval, and `QBT_GUARD_ERROR_POLL_SECONDS` controls the retry delay after
+an errored one-shot pass.
 
 Structured decision logs are emitted as JSON lines by default. Set
 `QBT_STRUCTURED_DECISION_LOGS_ENABLED=false` to disable them. Decision events

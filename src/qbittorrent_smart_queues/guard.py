@@ -4,8 +4,10 @@ import json
 import math
 import os
 import re
+import signal
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -3131,9 +3133,11 @@ def apply_single_download(
             )
 
 
-def main():
+def run_once():
     now = datetime.now(timezone.utc)
     guard_mode = os.environ.get("QBT_GUARD_MODE", "full").strip().lower()
+    if guard_mode in {"continuous", "daemon", "loop"}:
+        guard_mode = "full"
 
     if guard_mode == "thermal-only":
         thermal_guard = NvmeThermalGuard()
@@ -3352,6 +3356,76 @@ def main():
     cleanup_qbt_clients(clients)
 
     return 0
+
+
+def install_loop_signal_handlers(stop_event):
+    def handle_signal(signum, frame):
+        print(f"Received signal {signum}; stopping qBittorrent guard loop")
+        stop_event.set()
+
+    for signal_name in ("SIGTERM", "SIGINT"):
+        signum = getattr(signal, signal_name, None)
+        if signum is not None:
+            signal.signal(signum, handle_signal)
+
+
+def loop_sleep_seconds(result, elapsed_seconds, poll_seconds, error_poll_seconds):
+    target = error_poll_seconds if result else poll_seconds
+    if env_bool("QBT_GUARD_POLL_FIXED_RATE", True):
+        return max(0.0, float(target) - max(0.0, float(elapsed_seconds)))
+    return float(target)
+
+
+def run_loop():
+    poll_seconds = max(1, env_int("QBT_GUARD_POLL_SECONDS", 60))
+    error_poll_seconds = max(1, env_int("QBT_GUARD_ERROR_POLL_SECONDS", poll_seconds))
+    stop_event = threading.Event()
+    install_loop_signal_handlers(stop_event)
+    print(
+        "Starting continuous qBittorrent guard loop: "
+        f"poll={poll_seconds}s, error_poll={error_poll_seconds}s"
+    )
+
+    while not stop_event.is_set():
+        started = time.monotonic()
+        result = 0
+        try:
+            result = int(run_once() or 0)
+        except Exception as exc:
+            result = 1
+            print(f"Unhandled qBittorrent guard loop error: {exc}", file=sys.stderr)
+
+        if result and env_bool("QBT_GUARD_LOOP_EXIT_ON_ERROR", False):
+            return result
+        if stop_event.is_set():
+            break
+
+        elapsed_seconds = time.monotonic() - started
+        sleep_seconds = loop_sleep_seconds(
+            result,
+            elapsed_seconds,
+            poll_seconds,
+            error_poll_seconds,
+        )
+        emit_decision_log(
+            "qbt_guard_loop",
+            action="sleep",
+            result=result,
+            elapsed_seconds=round(elapsed_seconds, 3),
+            sleep_seconds=round(sleep_seconds, 3),
+        )
+        if sleep_seconds > 0 and stop_event.wait(sleep_seconds):
+            break
+
+    print("Continuous qBittorrent guard loop stopped")
+    return 0
+
+
+def main():
+    guard_mode = os.environ.get("QBT_GUARD_MODE", "full").strip().lower()
+    if guard_mode in {"continuous", "daemon", "loop"} or env_bool("QBT_GUARD_LOOP_ENABLED", False):
+        return run_loop()
+    return run_once()
 
 
 if __name__ == "__main__":
