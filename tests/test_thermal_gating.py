@@ -11,9 +11,6 @@ class FakeUdmClient:
     def download_usage_snapshot(self, now):
         return 0, 0
 
-    def idle_download_state(self, now):
-        return None
-
 
 class FakeQbtClient:
     base_url = "http://qbittorrent.test"
@@ -41,7 +38,6 @@ class FullGuardThermalGatingTests(unittest.TestCase):
         client = FakeQbtClient()
         env = {
             "QBT_STRUCTURED_DECISION_LOGS_ENABLED": "false",
-            "UDM_IDLE_ELEVATED_DOWNLOAD_ENABLED": "false",
         }
 
         with mock.patch.dict("os.environ", env, clear=False), \
@@ -72,7 +68,6 @@ class FullGuardThermalGatingTests(unittest.TestCase):
         client = FakeQbtClient()
         env = {
             "QBT_STRUCTURED_DECISION_LOGS_ENABLED": "false",
-            "UDM_IDLE_ELEVATED_DOWNLOAD_ENABLED": "false",
         }
 
         with mock.patch.dict("os.environ", env, clear=False), \

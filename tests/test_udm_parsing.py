@@ -1,6 +1,4 @@
-import contextlib
 import importlib
-import io
 import json
 import unittest
 from datetime import datetime, timezone
@@ -45,9 +43,7 @@ class UdmParsingTests(unittest.TestCase):
             return {"data": [{"wan-rx_bytes": 10}]}, FakeResponse()
 
         with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json):
-            stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout):
-                rows = client.stats_rows("hourly", start, end, ["wan-rx_bytes", "time"])
+            rows = client.stats_rows("hourly", start, end, ["wan-rx_bytes", "time"])
 
         self.assertEqual([{"wan-rx_bytes": 10}], rows)
         self.assertEqual("POST", calls[0]["method"])
@@ -67,14 +63,12 @@ class UdmParsingTests(unittest.TestCase):
             "request_json",
             return_value=([{"time": row_time_ms, "wan-rx_bytes": 10}], FakeResponse()),
         ):
-            stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout):
-                rows = client.stats_rows(
-                    "daily",
-                    datetime(2026, 6, 1, tzinfo=timezone.utc),
-                    datetime(2026, 6, 2, tzinfo=timezone.utc),
-                    ["wan-rx_bytes", "time"],
-                )
+            rows = client.stats_rows(
+                "daily",
+                datetime(2026, 6, 1, tzinfo=timezone.utc),
+                datetime(2026, 6, 2, tzinfo=timezone.utc),
+                ["wan-rx_bytes", "time"],
+            )
 
         self.assertEqual([{"time": row_time_ms, "wan-rx_bytes": 10}], rows)
         self.assertEqual(row_time, client.latest_stats_at)
@@ -94,18 +88,6 @@ class UdmParsingTests(unittest.TestCase):
                     datetime(2026, 6, 2, tzinfo=timezone.utc),
                     ["wan-rx_bytes", "time"],
                 )
-
-    def test_active_clients_accepts_wrapped_data_response(self):
-        client = self.guard.UdmClient()
-
-        with mock.patch.object(client, "login"), mock.patch.object(
-            self.guard,
-            "request_json",
-            return_value=({"data": [{"name": "ABHI-PC"}]}, FakeResponse()),
-        ):
-            rows = client.active_clients()
-
-        self.assertEqual([{"name": "ABHI-PC"}], rows)
 
 
 if __name__ == "__main__":

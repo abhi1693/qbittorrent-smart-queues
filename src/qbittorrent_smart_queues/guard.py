@@ -688,96 +688,6 @@ class UdmClient:
         month_total, _ = self.download_usage_snapshot(now)
         return month_total
 
-    def active_clients(self):
-        self.login()
-        endpoint = f"{self.api_base_path}/api/s/{self.site}/stat/sta"
-        url = join_url(self.base_url, endpoint)
-        data, _ = request_json(
-            self.opener,
-            "GET",
-            url,
-            headers=self.headers(),
-            timeout=self.timeout,
-        )
-        return response_rows(data, "UDM client")
-
-    def idle_download_state(self, now):
-        idle_enabled = env_bool(
-            "UDM_IDLE_ELEVATED_DOWNLOAD_ENABLED",
-            env_bool("UDM_IDLE_UNLIMITED_DOWNLOAD_ENABLED", True),
-        )
-        if not idle_enabled:
-            return None
-
-        clients = self.active_clients()
-        max_age_seconds = env_int(
-            "UDM_IDLE_ELEVATED_CLIENT_MAX_AGE_SECONDS",
-            env_int("UDM_IDLE_UNLIMITED_CLIENT_MAX_AGE_SECONDS", 300),
-        )
-        activity_threshold = env_int(
-            "UDM_IDLE_ELEVATED_ACTIVITY_THRESHOLD_BYTES_PER_SEC",
-            env_int("UDM_IDLE_UNLIMITED_ACTIVITY_THRESHOLD_BYTES_PER_SEC", 65_536),
-        )
-        watched_clients = split_lines_or_csv(
-            first_env([
-                "UDM_IDLE_ELEVATED_ACTIVITY_CLIENTS",
-                "UDM_IDLE_UNLIMITED_ACTIVITY_CLIENTS",
-            ])
-        ) or ["ABHI-PC"]
-        wifi_exclusions = split_lines_or_csv(
-            first_env([
-                "UDM_IDLE_ELEVATED_WIFI_EXCLUDE_CLIENTS",
-                "UDM_IDLE_UNLIMITED_WIFI_EXCLUDE_CLIENTS",
-            ])
-        )
-
-        recent_clients = [
-            client for client in clients
-            if is_recent_udm_client(client, now, max_age_seconds)
-        ]
-        wifi_clients = [
-            client for client in recent_clients
-            if is_wifi_udm_client(client) and not udm_client_matches(client, wifi_exclusions)
-        ]
-        watched = [
-            client for client in recent_clients
-            if udm_client_matches(client, watched_clients)
-        ]
-        watched_rates = [
-            (client, udm_client_activity_rate(client))
-            for client in watched
-        ]
-        active_watched = [
-            (client, rate) for client, rate in watched_rates
-            if rate >= activity_threshold
-        ]
-        total_watched_rate = sum(rate for _, rate in watched_rates)
-        allow_elevated = not wifi_clients and not active_watched
-
-        watched_label = ", ".join(watched_clients)
-        active_summary = ", ".join(
-            f"{udm_client_name(client)} {human_rate(rate)}"
-            for client, rate in active_watched
-        ) or "none"
-        log_info(
-            "UDM idle download check: "
-            f"{len(wifi_clients)} connected Wi-Fi client(s), "
-            f"{len(watched)} watched client match(es) for {watched_label}, "
-            f"watched activity {human_rate(total_watched_rate)} "
-            f"(threshold {human_rate(activity_threshold)}), "
-            f"active watched client(s): {active_summary}"
-        )
-
-        return {
-            "allow_elevated": allow_elevated,
-            "wifi_count": len(wifi_clients),
-            "watched_count": len(watched),
-            "active_watched_count": len(active_watched),
-            "watched_label": watched_label,
-            "watched_rate": total_watched_rate,
-            "activity_threshold": activity_threshold,
-        }
-
 
 class QbtClient:
     def __init__(self, base_url):
@@ -1036,78 +946,6 @@ def human_download_limit(value):
     return human_rate(limit)
 
 
-def qbt_current_download_limit(client):
-    try:
-        transfer_info = client.transfer_info()
-        return int(transfer_info.get("dl_rate_limit") or 0)
-    except (ApiError, TypeError, ValueError) as exc:
-        log_warning(
-            f"Failed to read current qBittorrent download limit at "
-            f"{client.base_url}: {exc}",
-        )
-        return None
-
-
-def ramped_download_limit(clients, target_limit, ramp_step):
-    target_limit = max(1, int(target_limit))
-    ramp_step = max(0, int(ramp_step))
-    if ramp_step <= 0:
-        return target_limit, "idle ramp disabled"
-
-    current_limits = [
-        limit for limit in (
-            qbt_current_download_limit(client) for client in clients
-        )
-        if limit is not None
-    ]
-    finite_limits = [limit for limit in current_limits if limit > 0]
-    if not finite_limits:
-        return target_limit, "current qBittorrent limit is uncapped or unknown; applying bounded idle cap"
-
-    current_limit = max(finite_limits)
-    if current_limit < target_limit:
-        next_limit = min(target_limit, current_limit + ramp_step)
-        return (
-            next_limit,
-            f"ramping idle cap up from {human_rate(current_limit)} toward {human_rate(target_limit)}",
-        )
-    if current_limit > target_limit:
-        next_limit = max(target_limit, current_limit - ramp_step)
-        return (
-            next_limit,
-            f"ramping idle cap down from {human_rate(current_limit)} toward {human_rate(target_limit)}",
-        )
-    return target_limit, f"idle cap already at {human_rate(target_limit)}"
-
-
-def idle_download_limit(clients, regular_limit, monthly_forecast_limit, max_download_limit):
-    idle_max_limit = env_int("QBT_IDLE_DOWNLOAD_MAX_LIMIT_BYTES_PER_SEC", max_download_limit)
-    if idle_max_limit <= 0:
-        idle_max_limit = max_download_limit
-    if idle_max_limit <= 0:
-        idle_max_limit = env_int("QBT_SINGLE_DOWNLOAD_DOWNLOAD_LIMIT_BYTES_PER_SEC", 10_485_760)
-    idle_max_limit = max(1, idle_max_limit)
-
-    forecast_multiplier = max(1.0, env_float("QBT_IDLE_DOWNLOAD_MONTHLY_FORECAST_MULTIPLIER", 4.0))
-    forecast_cap = max(1, math.floor(max(1, monthly_forecast_limit) * forecast_multiplier))
-    target_limit = min(idle_max_limit, forecast_cap)
-    if regular_limit > 0:
-        target_limit = max(target_limit, min(idle_max_limit, int(regular_limit)))
-
-    ramp_step = env_int("QBT_IDLE_DOWNLOAD_RAMP_STEP_BYTES_PER_SEC", 2 * 1024 * 1024)
-    effective_limit, ramp_reason = ramped_download_limit(clients, target_limit, ramp_step)
-    if effective_limit > idle_max_limit:
-        effective_limit = idle_max_limit
-        ramp_reason = f"{ramp_reason}; absolute idle cap applied"
-    reason = (
-        f"bounded idle cap {human_rate(effective_limit)} "
-        f"(target {human_rate(target_limit)}, monthly forecast "
-        f"{human_rate(max(1, monthly_forecast_limit))} x{forecast_multiplier:g}, "
-        f"absolute cap {human_rate(idle_max_limit)}, {ramp_reason})"
-    )
-    return effective_limit, idle_max_limit, reason
-
-
 def quota_rate_state(
     now,
     usage_bytes,
@@ -1146,72 +984,6 @@ def quota_rate_state(
         "aggregate_limit": aggregate_limit,
         "smart_download_limit": max(1, aggregate_limit),
     }
-
-
-def udm_client_name(client):
-    return (
-        client.get("name")
-        or client.get("hostname")
-        or client.get("ip")
-        or client.get("mac")
-        or "<unknown>"
-    )
-
-
-def udm_client_matches(client, matchers):
-    if not matchers:
-        return False
-    values = {
-        str(client.get("name") or "").strip().lower(),
-        str(client.get("hostname") or "").strip().lower(),
-        str(client.get("ip") or "").strip().lower(),
-        str(client.get("mac") or "").strip().lower(),
-        str(client.get("_id") or "").strip().lower(),
-        str(client.get("user_id") or "").strip().lower(),
-    }
-    values.discard("")
-    for matcher in matchers:
-        candidate = matcher.strip().lower()
-        if candidate and candidate in values:
-            return True
-    return False
-
-
-def is_recent_udm_client(client, now, max_age_seconds):
-    if max_age_seconds <= 0:
-        return True
-    try:
-        last_seen = int(client.get("last_seen"))
-    except (TypeError, ValueError):
-        return True
-    return last_seen >= int(now.timestamp()) - max_age_seconds
-
-
-def is_wifi_udm_client(client):
-    if client.get("is_wired") is False:
-        return True
-    if client.get("radio") or client.get("essid"):
-        return True
-    return False
-
-
-def udm_client_activity_rate(client):
-    total = 0.0
-    for field in (
-        "wired-tx_bytes-r",
-        "wired-rx_bytes-r",
-        "tx_bytes-r",
-        "rx_bytes-r",
-        "tx_bytes_r",
-        "rx_bytes_r",
-    ):
-        try:
-            value = float(client.get(field) or 0)
-        except (TypeError, ValueError):
-            value = 0.0
-        if value > 0:
-            total += value
-    return total
 
 
 def torrent_hash(torrent):
@@ -3511,8 +3283,6 @@ def run_once():
     )
 
     storage_guard = DownloadStorageGuard()
-    idle_download_state = None
-    idle_download_error = ""
     try:
         udm_client = UdmClient()
         usage_bytes, day_usage_bytes = udm_client.download_usage_snapshot(now)
@@ -3547,15 +3317,6 @@ def run_once():
         )
         cleanup_qbt_clients(clients)
         return 0
-    else:
-        try:
-            idle_download_state = udm_client.idle_download_state(now)
-        except ApiError as exc:
-            idle_download_error = str(exc)
-            log_warning(
-                f"Failed to read UDM client activity for idle elevated download check: {exc}; "
-                "using smart quota rate",
-            )
 
     usage_percent = (usage_bytes / cap_bytes) * 100 if cap_bytes else 0
     day_usage_percent = (day_usage_bytes / daily_cap_bytes) * 100 if daily_cap_bytes else 0
@@ -3602,10 +3363,6 @@ def run_once():
             "rate_headroom_fraction": headroom,
         },
         "udm": udm_decision_summary(udm_client, now),
-        "idle": {
-            "state": idle_download_state,
-            "error": idle_download_error,
-        },
         "thermal": thermal_decision_summary(thermal_state),
     }
 
@@ -3637,32 +3394,7 @@ def run_once():
         cleanup_qbt_clients(clients)
         return 0
 
-    monthly_limit = quota_state["monthly_limit"]
     smart_download_limit = quota_state["smart_download_limit"]
-
-    if idle_download_state and idle_download_state.get("allow_elevated"):
-        idle_limit, idle_limit_ceiling, idle_limit_reason = idle_download_limit(
-            clients,
-            smart_download_limit,
-            monthly_limit,
-            max_download_limit,
-        )
-        apply_single_download(
-            clients,
-            usage_bytes,
-            cap_bytes,
-            idle_limit,
-            (
-                "idle network elevated cap: no connected Wi-Fi clients and no active "
-                f"{idle_download_state.get('watched_label', 'watched client')} traffic; "
-                f"{idle_limit_reason}"
-            ),
-            storage_guard,
-            idle_limit_ceiling,
-            decision_context=base_decision_context,
-        )
-        cleanup_qbt_clients(clients)
-        return 0
 
     apply_single_download(
         clients,
