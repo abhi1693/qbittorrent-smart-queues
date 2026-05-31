@@ -1,0 +1,17 @@
+[project]
+name = "qbittorrent-smart-queues"
+version = "0.1.0"
+description = "qBittorrent queue, quota, and health controller for Kubernetes CronJobs"
+requires-python = ">=3.13"
+readme = "README.md"
+license = "MIT"
+authors = [
+  { name = "Abhimanyu Saharan" }
+]
+
+[project.scripts]
+qbittorrent-smart-queues = "qbittorrent_smart_queues.guard:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
