@@ -60,7 +60,7 @@ class FullGuardThermalGatingTests(unittest.TestCase):
                 mock.patch.object(self.guard, "apply_single_download") as apply_single_download, \
                 mock.patch.object(self.guard, "cleanup_qbt_clients"), \
                 contextlib.redirect_stdout(io.StringIO()):
-            result = self.guard.main()
+            result = self.guard.run_once()
 
         self.assertEqual(0, result)
         self.assertEqual([1], client.download_limits)
@@ -91,7 +91,7 @@ class FullGuardThermalGatingTests(unittest.TestCase):
                 mock.patch.object(self.guard, "apply_single_download") as apply_single_download, \
                 mock.patch.object(self.guard, "cleanup_qbt_clients"), \
                 contextlib.redirect_stdout(io.StringIO()):
-            result = self.guard.main()
+            result = self.guard.run_once()
 
         self.assertEqual(0, result)
         apply_single_download.assert_called_once()

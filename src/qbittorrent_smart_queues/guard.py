@@ -3135,45 +3135,6 @@ def apply_single_download(
 
 def run_once():
     now = datetime.now(timezone.utc)
-    guard_mode = os.environ.get("QBT_GUARD_MODE", "full").strip().lower()
-    if guard_mode in {"continuous", "daemon", "loop"}:
-        guard_mode = "full"
-
-    if guard_mode == "thermal-only":
-        thermal_guard = NvmeThermalGuard()
-        thermal_state = thermal_guard.check()
-        thermal_state["enabled"] = True
-        decision_context = {"thermal": thermal_decision_summary(thermal_state)}
-        emit_decision_log(
-            "qbt_guard_thermal_check",
-            action="thermal_stop" if thermal_state.get("stop") else "thermal_clear",
-            **decision_context,
-        )
-        if thermal_state.get("stop"):
-            clients = reachable_qbt_clients()
-            if clients:
-                apply_stop_limits(
-                    clients,
-                    thermal_state["reason"],
-                    pause_torrents=True,
-                    decision_context=decision_context,
-                )
-            else:
-                emit_decision_log(
-                    "qbt_guard_stop",
-                    action="thermal_stop_no_clients",
-                    reason=thermal_state["reason"],
-                    client_count=0,
-                    **decision_context,
-                )
-                print(
-                    "Thermal stop condition is active, but no qBittorrent clients are reachable; "
-                    f"{thermal_state['reason']}"
-                )
-        else:
-            print("NVMe thermal guard clear; leaving qBittorrent quota state unchanged")
-        return 0
-
     monthly_quota = env_int("UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES", 2_500_000_000_000)
     cap_fraction = env_float("UDM_MONTHLY_CAP_FRACTION", 1.0)
     cap_bytes = env_int(
@@ -3422,10 +3383,7 @@ def run_loop():
 
 
 def main():
-    guard_mode = os.environ.get("QBT_GUARD_MODE", "full").strip().lower()
-    if guard_mode in {"continuous", "daemon", "loop"} or env_bool("QBT_GUARD_LOOP_ENABLED", False):
-        return run_loop()
-    return run_once()
+    return run_loop()
 
 
 if __name__ == "__main__":

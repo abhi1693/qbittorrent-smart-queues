@@ -7,35 +7,23 @@ class LoopModeTests(unittest.TestCase):
     def setUp(self):
         self.guard = importlib.import_module("qbittorrent_smart_queues.guard")
 
-    def test_continuous_guard_mode_dispatches_to_loop(self):
-        with mock.patch.dict("os.environ", {"QBT_GUARD_MODE": "continuous"}, clear=True), \
+    def test_main_always_dispatches_to_loop(self):
+        with mock.patch.dict("os.environ", {}, clear=True), \
+                mock.patch.object(self.guard, "run_loop", return_value=0) as run_loop:
+            result = self.guard.main()
+
+        self.assertEqual(0, result)
+        run_loop.assert_called_once()
+
+    def test_main_never_dispatches_directly_to_single_pass(self):
+        with mock.patch.dict("os.environ", {}, clear=True), \
                 mock.patch.object(self.guard, "run_loop", return_value=0) as run_loop, \
-                mock.patch.object(self.guard, "run_once", return_value=0) as run_once:
+                mock.patch.object(self.guard, "run_once", return_value=1) as run_once:
             result = self.guard.main()
 
         self.assertEqual(0, result)
         run_loop.assert_called_once()
         run_once.assert_not_called()
-
-    def test_loop_enabled_env_dispatches_to_loop(self):
-        with mock.patch.dict("os.environ", {"QBT_GUARD_LOOP_ENABLED": "true"}, clear=True), \
-                mock.patch.object(self.guard, "run_loop", return_value=0) as run_loop, \
-                mock.patch.object(self.guard, "run_once", return_value=0) as run_once:
-            result = self.guard.main()
-
-        self.assertEqual(0, result)
-        run_loop.assert_called_once()
-        run_once.assert_not_called()
-
-    def test_full_guard_mode_keeps_one_shot_behavior(self):
-        with mock.patch.dict("os.environ", {"QBT_GUARD_MODE": "full"}, clear=True), \
-                mock.patch.object(self.guard, "run_loop", return_value=0) as run_loop, \
-                mock.patch.object(self.guard, "run_once", return_value=0) as run_once:
-            result = self.guard.main()
-
-        self.assertEqual(0, result)
-        run_once.assert_called_once()
-        run_loop.assert_not_called()
 
     def test_fixed_rate_sleep_subtracts_elapsed_time(self):
         with mock.patch.dict("os.environ", {}, clear=True):
