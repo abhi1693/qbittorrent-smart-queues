@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 
@@ -173,6 +174,67 @@ def parse_utc(value):
         return None
 
 
+def json_safe(value):
+    if isinstance(value, datetime):
+        return format_utc(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [json_safe(item) for item in sorted(value)]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def emit_decision_log(event, **fields):
+    if not env_bool("QBT_STRUCTURED_DECISION_LOGS_ENABLED", True):
+        return
+    record = {
+        "event": event,
+        "timestamp": format_utc(datetime.now(timezone.utc)),
+    }
+    record.update(fields)
+    print(json.dumps(json_safe(record), sort_keys=True, separators=(",", ":")))
+
+
+def parse_udm_row_time(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return parse_utc(raw)
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp <= 0:
+        return None
+    if timestamp > 10_000_000_000:
+        timestamp = timestamp / 1000.0
+    try:
+        return datetime.fromtimestamp(timestamp, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def latest_udm_row_time(rows):
+    latest = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_time = parse_udm_row_time(row.get("time"))
+        if row_time and (latest is None or row_time > latest):
+            latest = row_time
+    return latest
+
+
 def request_json(opener, method, url, headers=None, body=None, timeout=30):
     request = urllib.request.Request(
         url,
@@ -191,6 +253,18 @@ def request_json(opener, method, url, headers=None, body=None, timeout=30):
         raise ApiError(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise ApiError(f"{method} {url} failed: {exc}") from exc
+
+
+def response_rows(data, label, key="data"):
+    if isinstance(data, dict):
+        rows = data.get(key, [])
+    elif isinstance(data, list):
+        rows = data
+    else:
+        raise ApiError(f"{label} response has unexpected shape: {type(data).__name__}")
+    if not isinstance(rows, list):
+        raise ApiError(f"{label} response has unexpected shape: {type(rows).__name__}")
+    return rows
 
 
 class NvmeThermalGuard:
@@ -357,6 +431,7 @@ class UdmClient:
         ).strip()
         self.password = (os.environ.get("UDM_PASSWORD") or os.environ.get("UNIFI_PASSWORD") or "").strip()
         self.csrf_token = ""
+        self.latest_stats_at = None
         self.cookie_jar = CookieJar()
         context = None
         if not self.verify_tls:
@@ -436,9 +511,10 @@ class UdmClient:
             body=payload,
             timeout=self.timeout,
         )
-        rows = data.get("data", data if isinstance(data, list) else [])
-        if not isinstance(rows, list):
-            raise ApiError(f"UDM stats response has unexpected shape: {type(rows).__name__}")
+        rows = response_rows(data, "UDM stats")
+        latest_row_time = latest_udm_row_time(rows)
+        if latest_row_time and (self.latest_stats_at is None or latest_row_time > self.latest_stats_at):
+            self.latest_stats_at = latest_row_time
         print(f"UDM returned {len(rows)} {interval}.{report_type} rows")
         return rows
 
@@ -496,10 +572,7 @@ class UdmClient:
             headers=self.headers(),
             timeout=self.timeout,
         )
-        rows = data.get("data", data if isinstance(data, list) else [])
-        if not isinstance(rows, list):
-            raise ApiError(f"UDM client response has unexpected shape: {type(rows).__name__}")
-        return rows
+        return response_rows(data, "UDM client")
 
     def idle_download_state(self, now):
         idle_enabled = env_bool(
@@ -773,12 +846,22 @@ def apply_fail_closed():
     return True
 
 
-def apply_stop_limits(clients, reason, pause_torrents):
+def apply_stop_limits(clients, reason, pause_torrents, decision_context=None):
     stop_limit = env_int("QBT_STOP_DOWNLOAD_LIMIT_BYTES_PER_SEC", 1)
     stop_upload_limit = env_int("QBT_STOP_UPLOAD_LIMIT_BYTES_PER_SEC", 1)
     for client in clients:
         client.set_download_limit(stop_limit)
         client.set_upload_limit(stop_upload_limit)
+        emit_decision_log(
+            "qbt_guard_stop",
+            **decision_base_context(decision_context, client),
+            action="pause_all" if pause_torrents else "throttle",
+            reason=reason,
+            effective_cap={
+                "download_limit_bytes_per_sec": stop_limit,
+                "upload_limit_bytes_per_sec": stop_upload_limit,
+            },
+        )
         if pause_torrents:
             client.stop_all()
             print(f"Paused all torrents at {client.base_url}; {reason}")
@@ -789,14 +872,29 @@ def apply_stop_limits(clients, reason, pause_torrents):
             )
 
 
-def apply_full_guard_thermal_stop(clients):
-    if not clients or not env_bool("QBT_FULL_GUARD_THERMAL_CHECK_ENABLED", True):
+def full_guard_thermal_state():
+    if not env_bool("QBT_FULL_GUARD_THERMAL_CHECK_ENABLED", True):
+        return {
+            "enabled": False,
+            "stop": False,
+            "reason": "full guard thermal check disabled",
+            "readings": [],
+        }
+    state = NvmeThermalGuard().check()
+    state["enabled"] = True
+    return state
+
+
+def apply_full_guard_thermal_stop(clients, thermal_state=None, decision_context=None):
+    if not clients:
         return False
-    thermal_guard = NvmeThermalGuard()
-    thermal_state = thermal_guard.check()
+    if thermal_state is None:
+        thermal_state = full_guard_thermal_state()
     if not thermal_state.get("stop"):
         return False
-    apply_stop_limits(clients, thermal_state["reason"], pause_torrents=True)
+    context = dict(decision_context or {})
+    context["thermal"] = thermal_decision_summary(thermal_state)
+    apply_stop_limits(clients, thermal_state["reason"], pause_torrents=True, decision_context=context)
     cleanup_qbt_clients(clients)
     return True
 
@@ -882,6 +980,46 @@ def idle_download_limit(clients, regular_limit, monthly_forecast_limit, max_down
         f"absolute cap {human_rate(idle_max_limit)}, {ramp_reason})"
     )
     return effective_limit, idle_max_limit, reason
+
+
+def quota_rate_state(
+    now,
+    usage_bytes,
+    day_usage_bytes,
+    cap_bytes,
+    daily_cap_bytes,
+    headroom,
+    max_download_limit,
+):
+    if usage_bytes >= cap_bytes:
+        return {"stop_reason": "monthly UDM quota guardrail reached"}
+    if day_usage_bytes >= daily_cap_bytes:
+        return {"stop_reason": "daily UDM quota guardrail reached"}
+
+    day_end = utc_day_end(now)
+    day_seconds_remaining = max(1, int((day_end - now).total_seconds()))
+    daily_remaining_bytes = daily_cap_bytes - day_usage_bytes
+
+    _, month_end = utc_month_window(now)
+    month_seconds_remaining = max(1, int((month_end - now).total_seconds()))
+    monthly_remaining_bytes = cap_bytes - usage_bytes
+    monthly_limit = math.floor((monthly_remaining_bytes / month_seconds_remaining) * headroom)
+    daily_limit = math.floor((daily_remaining_bytes / day_seconds_remaining) * headroom)
+    aggregate_limit = min(monthly_limit, daily_limit)
+    if max_download_limit > 0:
+        aggregate_limit = min(aggregate_limit, max_download_limit)
+
+    return {
+        "stop_reason": "",
+        "monthly_remaining_bytes": monthly_remaining_bytes,
+        "daily_remaining_bytes": daily_remaining_bytes,
+        "month_seconds_remaining": month_seconds_remaining,
+        "day_seconds_remaining": day_seconds_remaining,
+        "monthly_limit": monthly_limit,
+        "daily_limit": daily_limit,
+        "aggregate_limit": aggregate_limit,
+        "smart_download_limit": max(1, aggregate_limit),
+    }
 
 
 def udm_client_name(client):
@@ -1087,6 +1225,83 @@ def torrent_availability(torrent):
     return torrent_float(torrent, "availability")
 
 
+def torrent_decision_summary(torrent):
+    if not torrent:
+        return None
+    return {
+        "hash": torrent_hash(torrent),
+        "name": torrent_name(torrent),
+        "category": torrent_category(torrent),
+        "state": torrent_state(torrent),
+        "progress": torrent_progress(torrent),
+        "amount_left_bytes": torrent_amount_left(torrent),
+        "downloaded_bytes": torrent_downloaded_bytes(torrent),
+        "download_speed_bytes_per_sec": torrent_download_speed(torrent),
+        "connected_seeds": torrent_connected_seeds(torrent),
+        "reported_seeds": torrent_reported_seeds(torrent),
+        "availability": torrent_availability(torrent),
+        "tags": sorted(torrent_tags(torrent)),
+    }
+
+
+def storage_decision_summary(storage_state):
+    if not storage_state:
+        return None
+    keys = (
+        "enabled",
+        "stop",
+        "reason",
+        "path",
+        "total_bytes",
+        "free_bytes",
+        "reserve_bytes",
+        "headroom_bytes",
+    )
+    return {key: storage_state.get(key) for key in keys if key in storage_state}
+
+
+def thermal_decision_summary(thermal_state):
+    if not thermal_state:
+        return None
+    readings = thermal_state.get("readings") or []
+    max_temperature = None
+    for reading in readings:
+        try:
+            temperature = float(reading.get("temperature"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if max_temperature is None or temperature > max_temperature:
+            max_temperature = temperature
+    return {
+        "enabled": thermal_state.get("enabled", True),
+        "stop": bool(thermal_state.get("stop")),
+        "reason": thermal_state.get("reason", ""),
+        "max_temperature_celsius": max_temperature,
+        "readings": readings,
+    }
+
+
+def udm_decision_summary(udm_client, now, error=None):
+    latest_stats_at = getattr(udm_client, "latest_stats_at", None) if udm_client else None
+    age_seconds = None
+    if latest_stats_at:
+        age_seconds = max(0, int((now - latest_stats_at).total_seconds()))
+    return {
+        "available": error is None,
+        "error": str(error) if error else "",
+        "latest_stats_at": format_utc(latest_stats_at) if latest_stats_at else None,
+        "stats_age_seconds": age_seconds,
+    }
+
+
+def decision_base_context(decision_context, client, storage_state=None):
+    context = dict(decision_context or {})
+    context["client"] = getattr(client, "base_url", "")
+    if storage_state is not None:
+        context["storage"] = storage_decision_summary(storage_state)
+    return context
+
+
 def normalized_set(items):
     return {
         item.strip().lower()
@@ -1283,9 +1498,7 @@ class SonarrQueueMetadata:
             headers={"Accept": "application/json", "X-Api-Key": api_key},
             timeout=self.timeout,
         )
-        records = data.get("records", data if isinstance(data, list) else [])
-        if not isinstance(records, list):
-            raise ApiError(f"{label} queue response has unexpected shape: {type(records).__name__}")
+        records = response_rows(data, f"{label} queue", key="records")
 
         loaded = 0
         for position, record in enumerate(records):
@@ -1607,13 +1820,22 @@ def cleanup_qbt_clients(clients):
 
 
 def is_single_download_candidate(torrent, min_progress, max_remaining_bytes, categories):
+    return single_download_reject_reason(torrent, min_progress, max_remaining_bytes, categories) == ""
+
+
+def single_download_reject_reason(torrent, min_progress, max_remaining_bytes, categories):
     if not torrent_hash(torrent):
-        return False
+        return "missing_hash"
     if categories and torrent_category(torrent) not in categories:
-        return False
-    if torrent_progress(torrent) < min_progress or torrent_progress(torrent) >= 1.0:
-        return False
-    return max_remaining_bytes <= 0 or torrent_amount_left(torrent) <= max_remaining_bytes
+        return "category_not_allowed"
+    progress = torrent_progress(torrent)
+    if progress < min_progress:
+        return "below_min_progress"
+    if progress >= 1.0:
+        return "complete"
+    if max_remaining_bytes > 0 and torrent_amount_left(torrent) > max_remaining_bytes:
+        return "too_much_remaining"
+    return ""
 
 
 def is_stopped_torrent(torrent):
@@ -2210,6 +2432,7 @@ def apply_single_download(
     limit_reason,
     storage_guard=None,
     download_limit_ceiling=None,
+    decision_context=None,
 ):
     min_progress = env_float("QBT_SINGLE_DOWNLOAD_MIN_PROGRESS", 0.0)
     max_remaining_bytes = env_int("QBT_SINGLE_DOWNLOAD_MAX_REMAINING_BYTES", 0)
@@ -2224,6 +2447,21 @@ def apply_single_download(
         download_limit = max(1, min(requested_download_limit, configured_download_limit))
         slow_reference_limit = download_limit
     upload_limit = env_int("QBT_SINGLE_DOWNLOAD_UPLOAD_LIMIT_BYTES_PER_SEC", 524_288)
+    effective_cap = {
+        "requested_download_limit_bytes_per_sec": requested_download_limit,
+        "download_limit_bytes_per_sec": download_limit,
+        "upload_limit_bytes_per_sec": upload_limit,
+        "configured_download_ceiling_bytes_per_sec": configured_download_limit,
+        "slow_reference_limit_bytes_per_sec": slow_reference_limit,
+        "reason": limit_reason,
+    }
+    run_decision_context = dict(decision_context or {})
+    budget = dict(run_decision_context.get("budget") or {})
+    budget.setdefault("monthly_usage_bytes", usage_bytes)
+    budget.setdefault("monthly_guardrail_bytes", monthly_limit_bytes)
+    budget.setdefault("monthly_remaining_bytes", max(0, monthly_limit_bytes - usage_bytes))
+    run_decision_context["budget"] = budget
+    run_decision_context["effective_cap"] = effective_cap
     stall_check_seconds = env_int("QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS", 60)
     min_progress_bytes = env_int("QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES", 1_048_576)
     max_attempts = max(0, env_int("QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN", 0))
@@ -2263,9 +2501,24 @@ def apply_single_download(
     for client in clients:
         client.set_download_limit(download_limit)
         client.set_upload_limit(upload_limit)
+        storage_state = None
         if storage_guard:
             storage_state = storage_guard.check()
+        emit_decision_log(
+            "qbt_guard_run",
+            **decision_base_context(run_decision_context, client, storage_state),
+            action="start_client",
+        )
+        if storage_guard:
             if storage_state.get("stop"):
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="stop_for_storage",
+                    reason=storage_state["reason"],
+                    rejected_counts={"storage_stop": 1},
+                    selected_torrent=None,
+                )
                 client.stop_all()
                 print(f"Paused all torrents at {client.base_url}; {storage_state['reason']}")
                 continue
@@ -2276,6 +2529,14 @@ def apply_single_download(
         while True:
             if max_attempts > 0 and attempt >= max_attempts:
                 client.stop_all()
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="stop_attempt_limit",
+                    reason="max attempts reached",
+                    rejected_counts={"attempt_limit": 1},
+                    selected_torrent=None,
+                )
                 print(
                     f"No torrent became active after {max_attempts} attempt(s) "
                     f"at {client.base_url}; the next scheduled run will continue the cycle"
@@ -2283,6 +2544,14 @@ def apply_single_download(
                 break
             if time.monotonic() >= deadline:
                 client.stop_all()
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="stop_run_budget",
+                    reason="run time budget expired",
+                    rejected_counts={"run_budget_expired": 1},
+                    selected_torrent=None,
+                )
                 print(
                     f"No torrent became active before the {human_duration(max_run_seconds)} "
                     f"single-download run budget expired at {client.base_url}; "
@@ -2297,17 +2566,36 @@ def apply_single_download(
                 storage_state = storage_guard.snapshot()
                 if storage_state.get("stop"):
                     client.stop_all()
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action="stop_for_storage",
+                        reason=storage_state["reason"],
+                        rejected_counts={"storage_stop": 1},
+                        selected_torrent=None,
+                    )
                     print(f"Paused all torrents at {client.base_url}; {storage_state['reason']}")
                     break
             else:
                 storage_state = None
 
+            rejected_counts = Counter()
+            eligible_torrents = []
+            for torrent in torrents:
+                reject_reason = single_download_reject_reason(
+                    torrent,
+                    min_progress,
+                    max_remaining_bytes,
+                    categories,
+                )
+                if reject_reason:
+                    rejected_counts[reject_reason] += 1
+                else:
+                    eligible_torrents.append(torrent)
+
             tv_order_state = build_tv_order_state(torrents, tv_order_categories, sonarr_queue)
             all_candidates = sorted(
-                [
-                    torrent for torrent in torrents
-                    if is_single_download_candidate(torrent, min_progress, max_remaining_bytes, categories)
-                ],
+                eligible_torrents,
                 key=lambda torrent: candidate_sort_key(
                     torrent,
                     priority_tags,
@@ -2326,6 +2614,7 @@ def apply_single_download(
             for torrent in all_candidates:
                 storage_reason = storage_torrent_block_reason(client, torrent, storage_guard, storage_state)
                 if storage_reason:
+                    rejected_counts["storage_headroom"] += 1
                     storage_blocked_count += 1
                     if len(storage_blocked_examples) < 3:
                         storage_blocked_examples.append(f"{torrent_name(torrent)}: {storage_reason}")
@@ -2337,6 +2626,7 @@ def apply_single_download(
             for torrent in candidates:
                 candidate_hash = torrent_hash(torrent)
                 if candidate_hash in attempted_hashes:
+                    rejected_counts["attempted_this_run"] += 1
                     continue
                 active_tags = []
                 if stall_tag_prefix:
@@ -2348,6 +2638,7 @@ def apply_single_download(
                         stall_cooldown_seconds,
                     )
                 if active_tags:
+                    rejected_counts["cooldown"] += 1
                     cooldown_count += 1
                     print(
                         f"Skipping torrent in quota-stall cooldown "
@@ -2361,11 +2652,17 @@ def apply_single_download(
                 if torrent_priority_reason(torrent, priority_tags, priority_categories)
             ]
             selection_candidates = priority_candidates or available_candidates
+            if priority_candidates:
+                rejected_counts["deferred_by_priority"] += len(available_candidates) - len(priority_candidates)
 
             productive_candidates = []
             slow_candidates = []
             for torrent in selection_candidates:
                 if not is_productive_torrent(torrent):
+                    if is_running_torrent(torrent) and torrent_download_speed(torrent) <= 0:
+                        rejected_counts["not_productive_zero_speed"] += 1
+                    else:
+                        rejected_counts["not_productive"] += 1
                     continue
                 slow_reason = slow_torrent_reason(
                     torrent,
@@ -2375,9 +2672,20 @@ def apply_single_download(
                     slow_max_eta_seconds,
                 )
                 if slow_reason:
+                    rejected_counts["too_slow"] += 1
                     slow_candidates.append((torrent, slow_reason))
                 else:
                     productive_candidates.append(torrent)
+            candidate_counts = {
+                "total": len(torrents),
+                "eligible": len(all_candidates),
+                "after_storage": len(candidates),
+                "available": len(available_candidates),
+                "selection_pool": len(selection_candidates),
+                "priority": len(priority_candidates),
+                "productive": len(productive_candidates),
+                "slow": len(slow_candidates),
+            }
 
             if productive_candidates:
                 keep = productive_candidates[0]
@@ -2395,6 +2703,14 @@ def apply_single_download(
                     tv_file_priority_lookahead,
                 )
                 client.top_priority([keep_hash])
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="keep_productive",
+                    selected_torrent=torrent_decision_summary(keep),
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                )
                 print(
                     f"Keeping one torrent active at {client.base_url}: "
                     f"{torrent_name(keep)} "
@@ -2418,6 +2734,15 @@ def apply_single_download(
                     storage_state = storage_guard.snapshot()
                     if storage_state.get("stop"):
                         client.stop_hashes([keep_hash])
+                        emit_decision_log(
+                            "qbt_guard_decision",
+                            **decision_base_context(run_decision_context, client, storage_state),
+                            action="stop_kept_for_storage",
+                            reason=storage_state["reason"],
+                            selected_torrent=torrent_decision_summary(keep_refreshed or keep),
+                            rejected_counts={"storage_stop": 1},
+                            candidate_counts=candidate_counts,
+                        )
                         print(
                             f"Stopped kept torrent after storage check at "
                             f"{client.base_url}: {torrent_name(keep_refreshed or keep)}; "
@@ -2443,6 +2768,15 @@ def apply_single_download(
                             now,
                             stall_cooldown_seconds,
                         )
+                        emit_decision_log(
+                            "qbt_guard_decision",
+                            **decision_base_context(run_decision_context, client, storage_state),
+                            action="stop_kept_too_slow",
+                            reason=slow_reason,
+                            selected_torrent=torrent_decision_summary(keep_refreshed),
+                            rejected_counts={"too_slow_after_wait": 1},
+                            candidate_counts=candidate_counts,
+                        )
                         print(
                             f"Stopped kept torrent because it is too slow after "
                             f"{stall_check_seconds}s at {client.base_url}: "
@@ -2458,6 +2792,15 @@ def apply_single_download(
                         min_progress_bytes,
                     )
                 if progress_reason:
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action="confirm_kept_productive",
+                        reason=progress_reason,
+                        selected_torrent=torrent_decision_summary(keep_refreshed),
+                        rejected_counts=dict(rejected_counts),
+                        candidate_counts=candidate_counts,
+                    )
                     print(
                         f"Kept torrent is active after "
                         f"{stall_check_seconds}s at {client.base_url}: "
@@ -2485,6 +2828,15 @@ def apply_single_download(
                     now,
                     stall_cooldown_seconds,
                 )
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="stop_kept_no_progress",
+                    reason="did not make progress",
+                    selected_torrent=torrent_decision_summary(keep_refreshed or keep),
+                    rejected_counts={"no_progress_after_wait": 1},
+                    candidate_counts=candidate_counts,
+                )
                 print(
                     f"Stopped kept torrent because it did not make progress after "
                     f"{stall_check_seconds}s at {client.base_url}: "
@@ -2495,6 +2847,22 @@ def apply_single_download(
             if slow_candidates:
                 slow_hashes = [torrent_hash(torrent) for torrent, _ in slow_candidates]
                 client.stop_hashes(slow_hashes)
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="stop_slow_candidates",
+                    reason="slow candidates below productivity threshold",
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                    selected_torrent=None,
+                    rejected_torrents=[
+                        {
+                            "torrent": torrent_decision_summary(torrent),
+                            "reason": slow_reason,
+                        }
+                        for torrent, slow_reason in slow_candidates[:5]
+                    ],
+                )
                 for torrent, slow_reason in slow_candidates:
                     attempted_hashes.add(torrent_hash(torrent))
                     health_store.record_failure(torrent, now, slow_reason)
@@ -2520,8 +2888,23 @@ def apply_single_download(
                 if is_running_torrent(torrent) and is_stalled_torrent(torrent)
             ]
             if stalled_candidates:
+                rejected_counts["stalled_zero_speed"] += len(stalled_candidates)
+                candidate_counts["stalled"] = len(stalled_candidates)
                 stalled_hashes = [torrent_hash(torrent) for torrent in stalled_candidates]
                 client.stop_hashes(stalled_hashes)
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="stop_stalled_candidates",
+                    reason="stalled without download speed",
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                    selected_torrent=None,
+                    rejected_torrents=[
+                        torrent_decision_summary(torrent)
+                        for torrent in stalled_candidates[:5]
+                    ],
+                )
                 for torrent in stalled_candidates:
                     attempted_hashes.add(torrent_hash(torrent))
                     health_store.record_failure(torrent, now, "stalled without download speed")
@@ -2540,6 +2923,23 @@ def apply_single_download(
 
             if not available_candidates:
                 client.stop_all()
+                no_available_reason = "no eligible candidates"
+                if candidates:
+                    no_available_reason = "all candidates cooling down or already attempted"
+                elif storage_blocked_count:
+                    no_available_reason = "candidates blocked by storage headroom"
+                elif all_candidates:
+                    no_available_reason = "all candidates already attempted"
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="stop_no_available_candidates",
+                    reason=no_available_reason,
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                    selected_torrent=None,
+                    storage_blocked_examples=storage_blocked_examples,
+                )
                 if candidates:
                     print(
                         f"No torrents available for single-download policy at "
@@ -2590,6 +2990,16 @@ def apply_single_download(
                     file=sys.stderr,
                 )
             client.start_hashes([selected_hash])
+            emit_decision_log(
+                "qbt_guard_decision",
+                **decision_base_context(run_decision_context, client, storage_state),
+                action="try_candidate",
+                selected_torrent=torrent_decision_summary(selected),
+                rejected_counts=dict(rejected_counts),
+                candidate_counts=candidate_counts,
+                attempt=attempt,
+                attempt_limit=max_attempts,
+            )
             print(
                 f"Trying torrent {attempt}/{attempt_limit_label} at {client.base_url}: "
                 f"{torrent_name(selected)} "
@@ -2614,6 +3024,15 @@ def apply_single_download(
                 storage_state = storage_guard.snapshot()
                 if storage_state.get("stop"):
                     client.stop_hashes([selected_hash])
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action="stop_selected_for_storage",
+                        reason=storage_state["reason"],
+                        selected_torrent=torrent_decision_summary(selected_refreshed or selected),
+                        rejected_counts={"storage_stop": 1},
+                        candidate_counts=candidate_counts,
+                    )
                     print(
                         f"Stopped selected torrent after storage check at "
                         f"{client.base_url}: {torrent_name(selected_refreshed or selected)}; "
@@ -2638,6 +3057,15 @@ def apply_single_download(
                         now,
                         stall_cooldown_seconds,
                     )
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action="stop_selected_too_slow",
+                        reason=slow_reason,
+                        selected_torrent=torrent_decision_summary(selected_refreshed),
+                        rejected_counts={"too_slow_after_wait": 1},
+                        candidate_counts=candidate_counts,
+                    )
                     print(
                         f"Stopped selected torrent because it is too slow after "
                         f"{stall_check_seconds}s at {client.base_url}: "
@@ -2653,6 +3081,15 @@ def apply_single_download(
                     min_progress_bytes,
                 )
             if progress_reason:
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="confirm_selected_productive",
+                    reason=progress_reason,
+                    selected_torrent=torrent_decision_summary(selected_refreshed),
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                )
                 print(
                     f"Selected torrent is active after "
                     f"{stall_check_seconds}s at {client.base_url}: "
@@ -2679,6 +3116,15 @@ def apply_single_download(
                 now,
                 stall_cooldown_seconds,
             )
+            emit_decision_log(
+                "qbt_guard_decision",
+                **decision_base_context(run_decision_context, client, storage_state),
+                action="stop_selected_no_progress",
+                reason="did not make progress",
+                selected_torrent=torrent_decision_summary(selected_refreshed or selected),
+                rejected_counts={"no_progress_after_wait": 1},
+                candidate_counts=candidate_counts,
+            )
             print(
                 f"Stopped torrent because it did not make progress after "
                 f"{stall_check_seconds}s at {client.base_url}: {torrent_name(selected_refreshed or selected)}"
@@ -2692,11 +3138,30 @@ def main():
     if guard_mode == "thermal-only":
         thermal_guard = NvmeThermalGuard()
         thermal_state = thermal_guard.check()
+        thermal_state["enabled"] = True
+        decision_context = {"thermal": thermal_decision_summary(thermal_state)}
+        emit_decision_log(
+            "qbt_guard_thermal_check",
+            action="thermal_stop" if thermal_state.get("stop") else "thermal_clear",
+            **decision_context,
+        )
         if thermal_state.get("stop"):
             clients = reachable_qbt_clients()
             if clients:
-                apply_stop_limits(clients, thermal_state["reason"], pause_torrents=True)
+                apply_stop_limits(
+                    clients,
+                    thermal_state["reason"],
+                    pause_torrents=True,
+                    decision_context=decision_context,
+                )
             else:
+                emit_decision_log(
+                    "qbt_guard_stop",
+                    action="thermal_stop_no_clients",
+                    reason=thermal_state["reason"],
+                    client_count=0,
+                    **decision_context,
+                )
                 print(
                     "Thermal stop condition is active, but no qBittorrent clients are reachable; "
                     f"{thermal_state['reason']}"
@@ -2722,6 +3187,7 @@ def main():
 
     storage_guard = DownloadStorageGuard()
     idle_download_state = None
+    idle_download_error = ""
     try:
         udm_client = UdmClient()
         usage_bytes, day_usage_bytes = udm_client.download_usage_snapshot(now)
@@ -2732,7 +3198,18 @@ def main():
                 return 0
             return 1
         clients = reachable_qbt_clients()
-        if apply_full_guard_thermal_stop(clients):
+        thermal_state = full_guard_thermal_state()
+        fallback_context = {
+            "budget": {
+                "monthly_usage_bytes": 0,
+                "monthly_guardrail_bytes": monthly_quota,
+                "monthly_remaining_bytes": monthly_quota,
+                "quota_source": "fallback",
+            },
+            "udm": udm_decision_summary(None, now, error=exc),
+            "thermal": thermal_decision_summary(thermal_state),
+        }
+        if apply_full_guard_thermal_stop(clients, thermal_state, fallback_context):
             return 0
         apply_single_download(
             clients,
@@ -2741,6 +3218,7 @@ def main():
             fallback_download_limit,
             "UDM quota data unavailable fallback",
             storage_guard,
+            decision_context=fallback_context,
         )
         cleanup_qbt_clients(clients)
         return 0
@@ -2748,6 +3226,7 @@ def main():
         try:
             idle_download_state = udm_client.idle_download_state(now)
         except ApiError as exc:
+            idle_download_error = str(exc)
             print(
                 f"Failed to read UDM client activity for idle elevated download check: {exc}; "
                 "using smart quota rate",
@@ -2769,35 +3248,73 @@ def main():
 
     clients = reachable_qbt_clients()
     if not clients:
+        emit_decision_log(
+            "qbt_guard_decision",
+            action="no_reachable_clients",
+            client_count=0,
+            budget={
+                "monthly_usage_bytes": usage_bytes,
+                "monthly_guardrail_bytes": cap_bytes,
+                "monthly_remaining_bytes": max(0, cap_bytes - usage_bytes),
+                "day_usage_bytes": day_usage_bytes,
+                "daily_guardrail_bytes": daily_cap_bytes,
+                "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
+            },
+            udm=udm_decision_summary(udm_client, now),
+        )
         print("No qBittorrent clients reachable; leaving quota state unchanged")
         return 0
 
-    if apply_full_guard_thermal_stop(clients):
+    thermal_state = full_guard_thermal_state()
+    base_decision_context = {
+        "budget": {
+            "monthly_usage_bytes": usage_bytes,
+            "monthly_guardrail_bytes": cap_bytes,
+            "monthly_remaining_bytes": max(0, cap_bytes - usage_bytes),
+            "day_usage_bytes": day_usage_bytes,
+            "daily_guardrail_bytes": daily_cap_bytes,
+            "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
+            "days_in_month": days_in_month,
+            "rate_headroom_fraction": headroom,
+        },
+        "udm": udm_decision_summary(udm_client, now),
+        "idle": {
+            "state": idle_download_state,
+            "error": idle_download_error,
+        },
+        "thermal": thermal_decision_summary(thermal_state),
+    }
+
+    if apply_full_guard_thermal_stop(clients, thermal_state, base_decision_context):
         return 0
 
-    day_end = utc_day_end(now)
-    day_seconds_remaining = max(1, int((day_end - now).total_seconds()))
-    daily_remaining_bytes = daily_cap_bytes - day_usage_bytes
-
-    if usage_bytes >= cap_bytes:
-        apply_stop_limits(clients, "monthly UDM quota guardrail reached", pause_torrents=True)
+    quota_state = quota_rate_state(
+        now,
+        usage_bytes,
+        day_usage_bytes,
+        cap_bytes,
+        daily_cap_bytes,
+        headroom,
+        max_download_limit,
+    )
+    base_decision_context["budget"].update({
+        "monthly_limit_bytes_per_sec": quota_state.get("monthly_limit"),
+        "daily_limit_bytes_per_sec": quota_state.get("daily_limit"),
+        "smart_download_limit_bytes_per_sec": quota_state.get("smart_download_limit"),
+        "max_download_limit_bytes_per_sec": max_download_limit,
+    })
+    if quota_state["stop_reason"]:
+        apply_stop_limits(
+            clients,
+            quota_state["stop_reason"],
+            pause_torrents=True,
+            decision_context=base_decision_context,
+        )
         cleanup_qbt_clients(clients)
         return 0
 
-    if day_usage_bytes >= daily_cap_bytes:
-        apply_stop_limits(clients, "daily UDM quota guardrail reached", pause_torrents=True)
-        cleanup_qbt_clients(clients)
-        return 0
-
-    _, month_end = utc_month_window(now)
-    month_seconds_remaining = max(1, int((month_end - now).total_seconds()))
-    monthly_remaining_bytes = cap_bytes - usage_bytes
-    monthly_limit = math.floor((monthly_remaining_bytes / month_seconds_remaining) * headroom)
-    daily_limit = math.floor((daily_remaining_bytes / day_seconds_remaining) * headroom)
-    aggregate_limit = min(monthly_limit, daily_limit)
-    if max_download_limit > 0:
-        aggregate_limit = min(aggregate_limit, max_download_limit)
-    smart_download_limit = max(1, aggregate_limit)
+    monthly_limit = quota_state["monthly_limit"]
+    smart_download_limit = quota_state["smart_download_limit"]
 
     if idle_download_state and idle_download_state.get("allow_elevated"):
         idle_limit, idle_limit_ceiling, idle_limit_reason = idle_download_limit(
@@ -2818,6 +3335,7 @@ def main():
             ),
             storage_guard,
             idle_limit_ceiling,
+            decision_context=base_decision_context,
         )
         cleanup_qbt_clients(clients)
         return 0
@@ -2829,6 +3347,7 @@ def main():
         smart_download_limit,
         "monthly and daily quota guard",
         storage_guard,
+        decision_context=base_decision_context,
     )
     cleanup_qbt_clients(clients)
 

@@ -35,3 +35,12 @@ The controller is configured entirely through environment variables. qBittorrent
 credentials are read from `QBT_USER`/`QBT_PASSWORD` or compatible existing
 variables. UDM and optional Sonarr API credentials are expected to be injected by
 Kubernetes Secrets in the consuming deployment.
+
+Full guard mode checks NVMe thermal state before selecting or starting torrents.
+Set `QBT_FULL_GUARD_THERMAL_CHECK_ENABLED=false` only if another controller is
+responsible for thermal gating.
+
+Structured decision logs are emitted as JSON lines by default. Set
+`QBT_STRUCTURED_DECISION_LOGS_ENABLED=false` to disable them. Decision events
+include the selected torrent, rejection counts, budget, effective cap, UDM stats
+age, storage headroom, and thermal state.
