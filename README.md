@@ -60,9 +60,9 @@ controls the normal poll interval, and `QBT_GUARD_ERROR_POLL_SECONDS` controls
 the retry delay after an errored pass.
 
 Logs default to plain text at `INFO` level, with routine poll telemetry kept at
-`DEBUG`. Set `QBT_LOG_LEVEL` to `debug`, `info`, `warning`, or `error` to tune
-verbosity. Set `QBT_LOG_FORMAT=json` when machine-readable JSON lines are
-preferred.
+`DEBUG` while a compact active-torrent heartbeat stays at `INFO`. Set
+`QBT_LOG_LEVEL` to `debug`, `info`, `warning`, or `error` to tune verbosity. Set
+`QBT_LOG_FORMAT=json` when machine-readable JSON lines are preferred.
 
 Decision events are emitted at `DEBUG` by default and include the selected
 torrent, rejection counts, budget, effective cap, UDM stats age, storage

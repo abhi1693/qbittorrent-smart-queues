@@ -3094,16 +3094,15 @@ def apply_single_download(
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
                 )
-                log_debug(
-                    f"Keeping one torrent active: "
+                log_info(
+                    f"Keeping active: "
                     f"{torrent_name(keep)} "
                     f"({torrent_progress(keep) * 100:.2f}% complete, "
-                    f"{human_size(torrent_amount_left(keep))} left); "
-                    f"monthly usage {human_size(usage_bytes)} / {human_size(monthly_limit_bytes)}; "
-                    f"limit {human_download_limit(download_limit)} down ({limit_reason})"
+                    f"{human_size(torrent_amount_left(keep))} left, "
+                    f"{human_rate(torrent_download_speed(keep))} down); "
+                    f"limit {human_download_limit(download_limit)}"
                     f"{priority_log_suffix(keep, priority_tags, priority_categories)}"
                     f"{watch_priority_log_suffix(keep, tv_order_state)}"
-                    f"{health_store.summary(keep, now)}"
                 )
                 if stall_check_seconds <= 0:
                     break
