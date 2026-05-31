@@ -74,6 +74,27 @@ class TvParsingTests(unittest.TestCase):
         self.assertEqual("epsilon show", queue.by_download_id["abc123"]["series"])
         self.assertEqual(2, queue.by_download_id["abc123"]["episode"])
 
+    def test_radarr_queue_load_accepts_raw_list_response(self):
+        queue = self.guard.RadarrQueueMetadata.__new__(self.guard.RadarrQueueMetadata)
+        queue.timeout = 10
+        queue.by_download_id = {}
+        queue.by_title = {}
+        record = {
+            "downloadId": "MOV-123",
+            "title": "Zeta.Movie.2026.1080p.WEB",
+            "movieId": 42,
+            "movie": {"title": "Zeta Movie", "sortTitle": "Zeta Movie", "year": 2026},
+        }
+
+        with mock.patch.object(self.guard, "request_json", return_value=({"records": [record]}, object())):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                queue.load_queue("radarr", "http://radarr.test", "api-key")
+
+        self.assertEqual("zeta movie", queue.by_download_id["mov123"]["title"])
+        self.assertEqual(2026, queue.by_download_id["mov123"]["year"])
+        self.assertEqual("zeta movie", queue.by_title["zeta movie"]["title"])
+
 
 if __name__ == "__main__":
     unittest.main()

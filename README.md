@@ -6,7 +6,8 @@ media qBittorrent deployment.
 It runs as a continuous Kubernetes controller and controls qBittorrent through
 the Web API. The controller enforces WAN quota budgets, single-active-download
 behavior, stall cooldowns, persistent torrent health scoring, storage headroom
-checks, optional Sonarr queue-aware TV ordering, and NVMe thermal stops.
+checks, optional Sonarr queue-aware TV ordering, optional Radarr queue-aware
+movie ordering, and NVMe thermal stops.
 
 ## Image
 
@@ -33,8 +34,15 @@ docker build -t qbittorrent-smart-queues:dev .
 
 The controller is configured entirely through environment variables. qBittorrent
 credentials are read from `QBT_USER`/`QBT_PASSWORD` or compatible existing
-variables. UDM and optional Sonarr API credentials are expected to be injected by
-Kubernetes Secrets in the consuming deployment.
+variables. UDM and optional Sonarr/Radarr API credentials are expected to be
+injected by Kubernetes Secrets in the consuming deployment.
+
+Sonarr queue enrichment uses `SONARR_API_KEY` or
+`QBT_TV_QUEUE_SONARR_API_KEY` with `QBT_TV_QUEUE_SONARR_URLS`. Radarr queue
+enrichment uses `RADARR_API_KEY` or `QBT_MOVIE_QUEUE_RADARR_API_KEY` with
+`QBT_MOVIE_QUEUE_RADARR_URLS`. Both integrations read `/api/v3/queue`, index
+records by download ID and title, and fall back to torrent-name parsing/order
+when credentials or queue records are unavailable.
 
 Each controller pass checks NVMe thermal state before selecting or starting
 torrents. Set `QBT_FULL_GUARD_THERMAL_CHECK_ENABLED=false` only if another

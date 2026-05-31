@@ -40,6 +40,26 @@ class CandidateSortingTests(unittest.TestCase):
                 priority_categories or set(),
                 set(),
                 {},
+                set(),
+                {},
+                3,
+                1.05,
+                health_store,
+                self.now,
+            ),
+        )
+
+    def sort_with_movie_queue(self, torrents, health_store, movie_state):
+        return sorted(
+            torrents,
+            key=lambda torrent: self.guard.candidate_sort_key(
+                torrent,
+                set(),
+                set(),
+                set(),
+                {},
+                {"movies"},
+                movie_state,
                 3,
                 1.05,
                 health_store,
@@ -84,6 +104,33 @@ class CandidateSortingTests(unittest.TestCase):
         ordered = self.sort([unhealthy, healthy], store)
 
         self.assertEqual(["healthy", "unhealthy"], [item["hash"] for item in ordered])
+
+    def test_radarr_movie_queue_position_breaks_before_health_score(self):
+        first_in_radarr = self.torrent("first")
+        healthier_later = self.torrent("later")
+        movie_state = {
+            "orders": {
+                "first": {
+                    "title": "first movie",
+                    "movie_id": 1,
+                    "year": 2026,
+                    "queue_position": 0,
+                    "source": "radarr",
+                },
+                "later": {
+                    "title": "later movie",
+                    "movie_id": 2,
+                    "year": 2026,
+                    "queue_position": 5,
+                    "source": "radarr",
+                },
+            }
+        }
+        store = FakeHealthStore({"first": -25.0, "later": 100.0})
+
+        ordered = self.sort_with_movie_queue([healthier_later, first_in_radarr], store, movie_state)
+
+        self.assertEqual(["first", "later"], [item["hash"] for item in ordered])
 
 
 if __name__ == "__main__":

@@ -83,6 +83,13 @@ def env_float(name, default):
     return float(raw)
 
 
+def int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def first_env(names):
     for name in names:
         value = os.environ.get(name)
@@ -1405,6 +1412,39 @@ def queue_record_titles(record):
     return titles
 
 
+def queue_record_movie_titles(record):
+    titles = queue_record_titles(record)
+
+    movie = record.get("movie")
+    if isinstance(movie, dict):
+        for key in ("sortTitle", "title", "originalTitle", "cleanTitle", "titleSlug"):
+            value = movie.get(key)
+            if value:
+                titles.append(str(value))
+
+        alternate_titles = movie.get("alternateTitles")
+        if isinstance(alternate_titles, list):
+            for item in alternate_titles:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("title", "sourceTitle"):
+                    value = item.get(key)
+                    if value:
+                        titles.append(str(value))
+
+    parsed = record.get("parsedMovieInfo")
+    if isinstance(parsed, dict):
+        raw_titles = parsed.get("movieTitles")
+        if isinstance(raw_titles, list):
+            titles.extend(str(item) for item in raw_titles if item)
+        for key in ("primaryMovieTitle", "originalTitle", "releaseTitle", "simpleReleaseTitle"):
+            value = parsed.get(key)
+            if value:
+                titles.append(str(value))
+
+    return titles
+
+
 def queue_record_series_title(record):
     series = record.get("series")
     if isinstance(series, dict):
@@ -1416,6 +1456,34 @@ def queue_record_series_title(record):
     episode_order = parse_tv_episode_order(record.get("sourceTitle") or record.get("title") or "")
     if episode_order:
         return episode_order["series"]
+    return ""
+
+
+def queue_record_movie_title(record):
+    movie = record.get("movie")
+    if isinstance(movie, dict):
+        for key in ("sortTitle", "title", "originalTitle", "cleanTitle"):
+            value = movie.get(key)
+            if value:
+                return str(value)
+
+    parsed = record.get("parsedMovieInfo")
+    if isinstance(parsed, dict):
+        raw_titles = parsed.get("movieTitles")
+        if isinstance(raw_titles, list):
+            for value in raw_titles:
+                if value:
+                    return str(value)
+        for key in ("primaryMovieTitle", "originalTitle", "simpleReleaseTitle"):
+            value = parsed.get(key)
+            if value:
+                return str(value)
+
+    for key in ("sourceTitle", "title"):
+        value = record.get(key)
+        if value:
+            return str(value)
+
     return ""
 
 
@@ -1547,6 +1615,110 @@ class SonarrQueueMetadata:
         return None
 
 
+class RadarrQueueMetadata:
+    def __init__(self):
+        self.enabled = env_bool("QBT_MOVIE_QUEUE_RADARR_ENABLED", True)
+        self.timeout = env_int(
+            "QBT_MOVIE_QUEUE_TIMEOUT",
+            env_int("QBT_ARR_QUEUE_TIMEOUT", env_int("QBT_TV_QUEUE_TIMEOUT", 10)),
+        )
+        self.by_download_id = {}
+        self.by_title = {}
+        if self.enabled:
+            self.load()
+
+    def configs(self):
+        api_key = (
+            os.environ.get("QBT_MOVIE_QUEUE_RADARR_API_KEY")
+            or os.environ.get("RADARR_API_KEY")
+            or ""
+        ).strip()
+        urls = split_lines_or_csv(
+            first_env(["QBT_MOVIE_QUEUE_RADARR_URLS", "RADARR_URLS", "RADARR_URL"])
+        ) or ["http://radarr.media.svc.cluster.local:7878"]
+        if not api_key:
+            return []
+        return [("radarr", url.rstrip("/"), api_key) for url in urls]
+
+    def load(self):
+        configs = self.configs()
+        if not configs:
+            print("Radarr queue enrichment disabled; RADARR_API_KEY is not set")
+            return
+
+        for label, base_url, api_key in configs:
+            try:
+                self.load_queue(label, base_url, api_key)
+            except ApiError as exc:
+                print(f"Failed to read {label} queue from {base_url}: {exc}", file=sys.stderr)
+
+    def load_queue(self, label, base_url, api_key):
+        opener = urllib.request.build_opener()
+        params = urllib.parse.urlencode({
+            "page": "1",
+            "pageSize": (
+                os.environ.get("QBT_MOVIE_QUEUE_PAGE_SIZE")
+                or os.environ.get("QBT_ARR_QUEUE_PAGE_SIZE")
+                or os.environ.get("QBT_TV_QUEUE_PAGE_SIZE", "1000")
+            ),
+            "includeUnknownMovieItems": "true",
+            "includeMovie": "true",
+        })
+        url = join_url(base_url, "/api/v3/queue") + "?" + params
+        data, _ = request_json(
+            opener,
+            "GET",
+            url,
+            headers={"Accept": "application/json", "X-Api-Key": api_key},
+            timeout=self.timeout,
+        )
+        records = response_rows(data, f"{label} queue", key="records")
+
+        loaded = 0
+        for position, record in enumerate(records):
+            if not isinstance(record, dict):
+                continue
+            metadata = self.record_metadata(record, position, label)
+            if not metadata:
+                continue
+            for download_id in queue_record_download_ids(record):
+                self.by_download_id[download_id] = metadata
+            for title in queue_record_movie_titles(record):
+                normalized_title = normalize_tv_sort_text(title)
+                if normalized_title:
+                    self.by_title[normalized_title] = metadata
+            loaded += 1
+        print(f"Loaded {loaded} {label} queue record(s) for movie ordering")
+
+    def record_metadata(self, record, position, source):
+        title = normalize_tv_sort_text(queue_record_movie_title(record))
+        if not title:
+            return None
+
+        movie = record.get("movie") if isinstance(record.get("movie"), dict) else {}
+        movie_id = int_or_none(record.get("movieId") or movie.get("id"))
+        year = int_or_none(movie.get("year"))
+        return {
+            "title": title,
+            "movie_id": movie_id,
+            "year": year,
+            "queue_position": position,
+            "source": source,
+        }
+
+    def torrent_metadata(self, torrent):
+        for download_id in torrent_download_ids(torrent):
+            metadata = self.by_download_id.get(download_id)
+            if metadata:
+                return metadata
+
+        normalized_name = normalize_tv_sort_text(torrent_name(torrent))
+        metadata = self.by_title.get(normalized_name)
+        if metadata:
+            return metadata
+        return None
+
+
 def tv_torrent_order(torrent, tv_order_categories, sonarr_queue):
     category = torrent_category(torrent).lower()
     if category not in tv_order_categories:
@@ -1615,6 +1787,70 @@ def tv_episode_order_key(torrent, tv_order_categories, tv_order_state):
         int(order["episode"]),
         torrent_name(torrent).lower(),
     )
+
+
+def movie_torrent_order(torrent, movie_order_categories, radarr_queue):
+    category = torrent_category(torrent).lower()
+    if category not in movie_order_categories:
+        return None
+
+    metadata = radarr_queue.torrent_metadata(torrent) if radarr_queue else None
+    if metadata:
+        return dict(metadata)
+
+    return {
+        "title": normalize_tv_sort_text(torrent_name(torrent)),
+        "movie_id": None,
+        "year": None,
+        "queue_position": 999999,
+        "source": "torrent-name",
+    }
+
+
+def build_movie_order_state(torrents, movie_order_categories, radarr_queue):
+    orders = {}
+
+    for torrent in torrents:
+        item_hash = torrent_hash(torrent)
+        order = movie_torrent_order(torrent, movie_order_categories, radarr_queue)
+        if not item_hash or not order:
+            continue
+        orders[item_hash] = order
+
+    return {"orders": orders}
+
+
+def movie_queue_order_key(torrent, movie_order_categories, movie_order_state):
+    category = torrent_category(torrent).lower()
+    if category not in movie_order_categories:
+        return (2, 999999, "", torrent_name(torrent).lower())
+
+    order = movie_order_state.get("orders", {}).get(torrent_hash(torrent))
+    if not order:
+        return (1, 999999, normalize_tv_sort_text(torrent_name(torrent)), torrent_name(torrent).lower())
+
+    return (
+        0,
+        int(order.get("queue_position", 999999)),
+        int(order.get("year") or 0),
+        order.get("title", ""),
+        torrent_name(torrent).lower(),
+    )
+
+
+def media_queue_order_key(
+    torrent,
+    tv_order_categories,
+    tv_order_state,
+    movie_order_categories,
+    movie_order_state,
+):
+    category = torrent_category(torrent).lower()
+    if category in tv_order_categories:
+        return (0, tv_episode_order_key(torrent, tv_order_categories, tv_order_state))
+    if category in movie_order_categories:
+        return (1, movie_queue_order_key(torrent, movie_order_categories, movie_order_state))
+    return (2, torrent_name(torrent).lower())
 
 
 def file_path(file_item):
@@ -2196,6 +2432,8 @@ def candidate_sort_key(
     priority_categories,
     tv_order_categories,
     tv_order_state,
+    movie_order_categories,
+    movie_order_state,
     healthy_min_seeds,
     healthy_min_availability,
     health_store,
@@ -2205,7 +2443,13 @@ def candidate_sort_key(
     reported_sources = max(torrent_connected_seeds(torrent), torrent_reported_seeds(torrent))
     return (
         0 if is_priority else 1,
-        tv_episode_order_key(torrent, tv_order_categories, tv_order_state),
+        media_queue_order_key(
+            torrent,
+            tv_order_categories,
+            tv_order_state,
+            movie_order_categories,
+            movie_order_state,
+        ),
         -health_store.score(torrent, now),
         candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
         -min(torrent_availability(torrent), 100.0),
@@ -2486,6 +2730,11 @@ def apply_single_download(
     tv_order_categories = normalized_set(
         split_lines_or_csv(os.environ.get("QBT_SINGLE_DOWNLOAD_TV_ORDER_CATEGORIES", "tv,priority-tv"))
     )
+    movie_order_categories = normalized_set(
+        split_lines_or_csv(
+            os.environ.get("QBT_SINGLE_DOWNLOAD_MOVIE_ORDER_CATEGORIES", "movies,priority-movies")
+        )
+    )
     priority_tags = normalized_set(
         split_lines_or_csv(os.environ.get("QBT_SINGLE_DOWNLOAD_PRIORITY_TAGS", "priority"))
     )
@@ -2499,6 +2748,7 @@ def apply_single_download(
     )
     health_store = TorrentHealthStore()
     sonarr_queue = SonarrQueueMetadata()
+    radarr_queue = RadarrQueueMetadata()
 
     for client in clients:
         client.set_download_limit(download_limit)
@@ -2596,6 +2846,7 @@ def apply_single_download(
                     eligible_torrents.append(torrent)
 
             tv_order_state = build_tv_order_state(torrents, tv_order_categories, sonarr_queue)
+            movie_order_state = build_movie_order_state(torrents, movie_order_categories, radarr_queue)
             all_candidates = sorted(
                 eligible_torrents,
                 key=lambda torrent: candidate_sort_key(
@@ -2604,6 +2855,8 @@ def apply_single_download(
                     priority_categories,
                     tv_order_categories,
                     tv_order_state,
+                    movie_order_categories,
+                    movie_order_state,
                     healthy_min_seeds,
                     healthy_min_availability,
                     health_store,
