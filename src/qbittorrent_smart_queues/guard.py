@@ -239,6 +239,10 @@ def decision_logs_enabled():
     return env_bool("QBT_STRUCTURED_DECISION_LOGS_ENABLED", True)
 
 
+def configured_decision_log_level():
+    return normalize_log_level(os.environ.get("QBT_DECISION_LOG_LEVEL"), "debug")
+
+
 def text_log_value(value):
     safe_value = json_safe(value)
     if isinstance(safe_value, str):
@@ -324,7 +328,7 @@ def emit_decision_log(event, **fields):
     if not decision_logs_enabled():
         return
     emit_log(
-        normalize_log_level(os.environ.get("QBT_DECISION_LOG_LEVEL"), "info"),
+        configured_decision_log_level(),
         decision_log_message(event, fields),
         event=event,
         **fields,
@@ -446,7 +450,7 @@ class NvmeThermalGuard:
             f"{item['node']}={item['temperature']:.1f}C"
             for item in readings
         )
-        log_info(f"NVMe thermal check: {summary}; stop threshold {self.threshold:.1f}C")
+        log_debug(f"NVMe thermal check: {summary}; stop threshold {self.threshold:.1f}C")
 
         hot_readings = [
             item for item in readings
@@ -535,7 +539,7 @@ class DownloadStorageGuard:
             return state
         if state.get("total_bytes") is None:
             return state
-        log_info(
+        log_debug(
             f"Download storage check: {state['path']} has "
             f"{human_size(state['free_bytes'])} free of {human_size(state['total_bytes'])}; "
             f"reserve {human_size(state['reserve_bytes'])}, "
@@ -587,7 +591,7 @@ class UdmClient:
         if self.authenticated:
             return
         if self.api_key:
-            log_info("Using UDM API key authentication")
+            log_debug("Using UDM API key authentication")
             self.authenticated = True
             return
         if not self.username or not self.password:
@@ -1479,7 +1483,7 @@ class SonarrQueueMetadata:
                 if normalized_title:
                     self.by_title[normalized_title] = metadata
             loaded += 1
-        log_info(f"Loaded {loaded} {label} queue record(s) for TV ordering")
+        log_debug(f"Loaded {loaded} {label} queue record(s) for TV ordering")
 
     def record_metadata(self, record, position, source):
         series = normalize_tv_sort_text(queue_record_series_title(record))
@@ -1622,7 +1626,7 @@ class JellyfinWatchMetadata:
                 "jellyfin-active-session",
             )
             loaded += 1
-        log_info(f"Loaded {loaded} active {label} TV watch session(s)")
+        log_debug(f"Loaded {loaded} active {label} TV watch session(s)")
 
     def record_watch(self, series, season, episode, position, activity_at, source):
         key = (series, int(season))
@@ -1742,7 +1746,7 @@ class RadarrQueueMetadata:
                 if normalized_title:
                     self.by_title[normalized_title] = metadata
             loaded += 1
-        log_info(f"Loaded {loaded} {label} queue record(s) for movie ordering")
+        log_debug(f"Loaded {loaded} {label} queue record(s) for movie ordering")
 
     def record_metadata(self, record, position, source):
         title = normalize_tv_sort_text(queue_record_movie_title(record))
@@ -2096,13 +2100,13 @@ def apply_tv_episode_file_priorities(
     season, episode = ordered_episode_keys[0]
     if watch_priority:
         watched_episode = int(watch_priority.get("episode") or 0)
-        log_info(
+        log_debug(
             f"Prioritized watched TV season pack files: "
             f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first "
             f"after watched S{int(watch_priority['season']):02d}E{watched_episode:02d}"
         )
     else:
-        log_info(
+        log_debug(
             f"Prioritized TV episode files: "
             f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first"
         )
@@ -2162,7 +2166,7 @@ def cleanup_qbt_client(client):
         log_debug(f"No missing-files torrents need cleanup")
 
     if to_start:
-        log_info(
+        log_debug(
             f"Leaving {len(to_start)} recoverable errored torrent(s) for "
             f"the single-download selector"
         )
@@ -3090,7 +3094,7 @@ def apply_single_download(
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
                 )
-                log_info(
+                log_debug(
                     f"Keeping one torrent active: "
                     f"{torrent_name(keep)} "
                     f"({torrent_progress(keep) * 100:.2f}% complete, "
@@ -3181,7 +3185,7 @@ def apply_single_download(
                         rejected_counts=dict(rejected_counts),
                         candidate_counts=candidate_counts,
                     )
-                    log_info(
+                    log_debug(
                         f"Kept torrent is active after "
                         f"{stall_check_seconds}s: "
                         f"{torrent_name(keep_refreshed)}; {progress_reason}"
@@ -3566,12 +3570,12 @@ def run_once():
 
     usage_percent = (usage_bytes / cap_bytes) * 100 if cap_bytes else 0
     day_usage_percent = (day_usage_bytes / daily_cap_bytes) * 100 if daily_cap_bytes else 0
-    log_info(
+    log_debug(
         "UDM month-to-date WAN download usage: "
         f"{human_size(usage_bytes)} of {human_size(cap_bytes)} monthly guardrail "
         f"({usage_percent:.2f}%)"
     )
-    log_info(
+    log_debug(
         "UDM day-to-date WAN download usage: "
         f"{human_size(day_usage_bytes)} of {human_size(daily_cap_bytes)} daily guardrail "
         f"({day_usage_percent:.2f}%; {human_size(cap_bytes)} / {days_in_month} days)"

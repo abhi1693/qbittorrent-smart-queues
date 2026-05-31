@@ -146,6 +146,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
             "QBT_TV_QUEUE_SONARR_ENABLED": "false",
             "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
         }
 
         with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(self.guard.time, "sleep"):

@@ -39,9 +39,18 @@ class LoggingTests(unittest.TestCase):
         self.assertIn("visible warning", stderr.getvalue())
         self.assertNotIn("hidden info", stderr.getvalue())
 
-    def test_json_log_format_preserves_decision_fields(self):
+    def test_default_decision_logs_are_debug(self):
         stdout = io.StringIO()
         env = {"QBT_LOG_FORMAT": "json"}
+
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            self.guard.emit_decision_log("qbt_guard_decision", action="hidden_at_info")
+
+        self.assertEqual("", stdout.getvalue())
+
+    def test_json_log_format_preserves_decision_fields_when_enabled_at_info(self):
+        stdout = io.StringIO()
+        env = {"QBT_LOG_FORMAT": "json", "QBT_DECISION_LOG_LEVEL": "info"}
 
         with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
             self.guard.emit_decision_log(

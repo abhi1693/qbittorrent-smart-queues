@@ -59,12 +59,14 @@ The entrypoint always runs the polling controller. `QBT_GUARD_POLL_SECONDS`
 controls the normal poll interval, and `QBT_GUARD_ERROR_POLL_SECONDS` controls
 the retry delay after an errored pass.
 
-Logs default to plain text at `INFO` level. Set `QBT_LOG_LEVEL` to `debug`,
-`info`, `warning`, or `error` to tune verbosity. Set `QBT_LOG_FORMAT=json` when
-machine-readable JSON lines are preferred.
+Logs default to plain text at `INFO` level, with routine poll telemetry kept at
+`DEBUG`. Set `QBT_LOG_LEVEL` to `debug`, `info`, `warning`, or `error` to tune
+verbosity. Set `QBT_LOG_FORMAT=json` when machine-readable JSON lines are
+preferred.
 
-Decision events are emitted at `INFO` by default and include the selected
+Decision events are emitted at `DEBUG` by default and include the selected
 torrent, rejection counts, budget, effective cap, UDM stats age, storage
-headroom, and thermal state. Set `QBT_DECISION_LOGS_ENABLED=false` to disable
-them. The legacy `QBT_STRUCTURED_DECISION_LOGS_ENABLED=false` switch is still
-accepted as a compatibility alias for disabling decision logs.
+headroom, and thermal state. Set `QBT_DECISION_LOG_LEVEL=info` when tuning and
+`QBT_DECISION_LOGS_ENABLED=false` to disable them. The legacy
+`QBT_STRUCTURED_DECISION_LOGS_ENABLED=false` switch is still accepted as a
+compatibility alias for disabling decision logs.
