@@ -145,6 +145,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
             "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
             "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
         }
 
         with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(self.guard.time, "sleep"):
@@ -168,8 +169,15 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             for line in stdout.getvalue().splitlines()
             if line.startswith("{")
         ]
-        try_event = next(item for item in decision_logs if item["action"] == "try_candidate")
-        stop_event = next(item for item in decision_logs if item["action"] == "stop_selected_no_progress")
+        decision_events = [
+            item for item in decision_logs
+            if item.get("event") == "qbt_guard_decision"
+        ]
+        try_event = next(item for item in decision_events if item.get("action") == "try_candidate")
+        stop_event = next(
+            item for item in decision_events
+            if item.get("action") == "stop_selected_no_progress"
+        )
 
         self.assertEqual("zero", try_event["selected_torrent"]["hash"])
         self.assertEqual(1024, try_event["effective_cap"]["download_limit_bytes_per_sec"])
