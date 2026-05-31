@@ -185,6 +185,8 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual(42, try_event["udm"]["stats_age_seconds"])
         self.assertEqual(4000, try_event["storage"]["headroom_bytes"])
         self.assertFalse(try_event["thermal"]["stop"])
+        self.assertNotIn("client", try_event)
+        self.assertNotIn("client", stop_event)
         self.assertEqual(1, try_event["rejected_counts"]["not_productive_zero_speed"])
         self.assertEqual("zero", stop_event["selected_torrent"]["hash"])
         self.assertEqual(1, stop_event["rejected_counts"]["no_progress_after_wait"])

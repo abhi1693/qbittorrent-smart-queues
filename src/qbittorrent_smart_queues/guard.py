@@ -717,7 +717,7 @@ class QbtClient:
                 last_error = exc
                 if attempt < self.request_attempts:
                     time.sleep(self.retry_delay)
-        raise ApiError(f"{method} {url} failed after {self.request_attempts} attempts: {last_error}")
+        raise ApiError(f"{method} {path} failed after {self.request_attempts} attempts: {last_error}")
 
     def login(self):
         if not self.username:
@@ -728,7 +728,7 @@ class QbtClient:
             {"username": self.username, "password": self.password},
         ).decode("utf-8", errors="replace")
         if response.strip().lower() not in {"", "ok."}:
-            raise ApiError(f"qBittorrent login failed for {self.base_url}: {response}")
+            raise ApiError(f"qBittorrent login failed: {response}")
 
     def set_download_limit(self, limit_bytes_per_second):
         self.request(
@@ -853,8 +853,12 @@ class QbtClient:
         )
 
 
+def qbt_urls():
+    return split_lines_or_csv(os.environ.get("QBT_URLS")) or QBT_DEFAULT_URLS
+
+
 def reachable_qbt_clients():
-    urls = split_lines_or_csv(os.environ.get("QBT_URLS")) or QBT_DEFAULT_URLS
+    urls = qbt_urls()
     clients = []
     for url in urls:
         client = QbtClient(url)
@@ -862,9 +866,9 @@ def reachable_qbt_clients():
             client.login()
             client.request("GET", "/api/v2/app/version")
             clients.append(client)
-            log_info(f"Connected to qBittorrent at {url}")
+            log_debug("Connected to qBittorrent service")
         except ApiError as exc:
-            log_warning(f"Skipping unavailable qBittorrent at {url}: {exc}")
+            log_warning(f"Skipping unavailable qBittorrent service: {exc}")
     return clients
 
 
@@ -879,7 +883,7 @@ def apply_fail_closed():
         client.set_download_limit(stop_limit)
         client.set_upload_limit(stop_upload_limit)
         client.stop_all()
-        log_info(f"Paused all torrents at {client.base_url} because UDM quota data is unavailable")
+        log_info("Paused all torrents because UDM quota data is unavailable")
     return True
 
 
@@ -901,10 +905,10 @@ def apply_stop_limits(clients, reason, pause_torrents, decision_context=None):
         )
         if pause_torrents:
             client.stop_all()
-            log_info(f"Paused all torrents at {client.base_url}; {reason}")
+            log_info(f"Paused all torrents; {reason}")
         else:
             log_info(
-                f"Throttled {client.base_url} to {human_rate(stop_limit)} down "
+                f"Throttled qBittorrent to {human_rate(stop_limit)} down "
                 f"and {human_rate(stop_upload_limit)} up; {reason}"
             )
 
@@ -1014,7 +1018,7 @@ def optional_filtered_torrents(client, filter_name):
     except ApiError as exc:
         log_warning(
             f"Failed to list qBittorrent torrents with {filter_name!r} "
-            f"filter at {client.base_url}: {exc}",
+            f"filter: {exc}",
         )
         return []
 
@@ -1193,7 +1197,6 @@ def udm_decision_summary(udm_client, now, error=None):
 
 def decision_base_context(decision_context, client, storage_state=None):
     context = dict(decision_context or {})
-    context["client"] = getattr(client, "base_url", "")
     if storage_state is not None:
         context["storage"] = storage_decision_summary(storage_state)
     return context
@@ -1823,7 +1826,7 @@ def apply_tv_episode_file_priorities(client, torrent, tv_order_categories, enabl
     except ApiError as exc:
         log_warning(
             f"Failed to read qBittorrent file list for TV ordering "
-            f"at {client.base_url}: {torrent_name(torrent)}; {exc}",
+            f"{torrent_name(torrent)}; {exc}",
         )
         return
 
@@ -1883,7 +1886,7 @@ def apply_tv_episode_file_priorities(client, torrent, tv_order_categories, enabl
 
     season, episode = ordered_episode_keys[0]
     log_info(
-        f"Prioritized TV episode files at {client.base_url}: "
+        f"Prioritized TV episode files: "
         f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first"
     )
 
@@ -1924,17 +1927,17 @@ def cleanup_qbt_client(client):
     ]
 
     if to_delete:
-        log_info(f"Deleting {len(to_delete)} missing-files torrent(s) at {client.base_url}:")
+        log_info(f"Deleting {len(to_delete)} missing-files torrent(s):")
         for torrent in to_delete:
             log_info(f"- {torrent_name(torrent)}")
         client.delete_hashes([torrent_hash(torrent) for torrent in to_delete], delete_files)
     else:
-        log_debug(f"No missing-files torrents need cleanup at {client.base_url}")
+        log_debug(f"No missing-files torrents need cleanup")
 
     if to_start:
         log_info(
             f"Leaving {len(to_start)} recoverable errored torrent(s) for "
-            f"the single-download selector at {client.base_url}"
+            f"the single-download selector"
         )
 
 
@@ -2365,7 +2368,7 @@ def selected_storage_remaining_state(client, torrent):
     except ApiError as exc:
         log_warning(
             f"Failed to read qBittorrent file list for storage fit "
-            f"at {client.base_url}: {torrent_name(torrent)}; {exc}; "
+            f"{torrent_name(torrent)}; {exc}; "
             "using torrent amount_left",
         )
         return fallback
@@ -2443,12 +2446,12 @@ def clear_expired_stall_tags(client, torrent, prefix, now, cooldown_seconds):
             client.remove_tags([torrent_hash(torrent)], expired_tags)
             log_info(
                 f"Cleared expired quota-stall cooldown tag(s) from "
-                f"{torrent_name(torrent)} at {client.base_url}"
+                f"{torrent_name(torrent)}"
             )
         except ApiError as exc:
             log_warning(
                 f"Failed to clear expired quota-stall cooldown tag(s) from "
-                f"{torrent_name(torrent)} at {client.base_url}: {exc}",
+                f"{torrent_name(torrent)}: {exc}",
             )
     return active_tags
 
@@ -2461,12 +2464,12 @@ def add_stall_cooldown_tag(client, torrent, prefix, now, cooldown_seconds):
         client.add_tags([torrent_hash(torrent)], [tag])
         log_info(
             f"Marked {torrent_name(torrent)} with quota-stall cooldown "
-            f"for {cooldown_seconds}s at {client.base_url}"
+            f"for {cooldown_seconds}s"
         )
     except ApiError as exc:
         log_warning(
-            f"Failed to mark {torrent_name(torrent)} with quota-stall cooldown "
-            f"at {client.base_url}: {exc}",
+            f"Failed to mark {torrent_name(torrent)} with quota-stall cooldown: "
+            f"{exc}",
         )
 
 
@@ -2484,8 +2487,8 @@ def cleanup_stall_tags(client):
         torrents = single_download_torrents(client)
     except ApiError as exc:
         log_warning(
-            f"Failed to list qBittorrent torrents for quota-stall tag cleanup "
-            f"at {client.base_url}: {exc}",
+            "Failed to list qBittorrent torrents for quota-stall tag cleanup: "
+            f"{exc}",
         )
         return
 
@@ -2511,21 +2514,21 @@ def cleanup_stall_tags(client):
         except ApiError as exc:
             log_warning(
                 f"Failed to clear expired quota-stall cooldown tag(s) from "
-                f"{torrent_name(torrent)} at {client.base_url}: {exc}",
+                f"{torrent_name(torrent)}: {exc}",
             )
 
     if removed_assignments:
         log_info(
             f"Cleared {removed_assignments} expired quota-stall cooldown tag "
-            f"assignment(s) from {affected_torrents} torrent(s) at {client.base_url}"
+            f"assignment(s) from {affected_torrents} torrent(s)"
         )
 
     try:
         all_tags = client.all_tags()
     except ApiError as exc:
         log_warning(
-            f"Failed to list qBittorrent tags for unused quota-stall tag cleanup "
-            f"at {client.base_url}: {exc}",
+            "Failed to list qBittorrent tags for unused quota-stall tag cleanup: "
+            f"{exc}",
         )
         return
 
@@ -2535,18 +2538,15 @@ def cleanup_stall_tags(client):
         and tag not in active_stall_tags
     )
     if not unused_stall_tags:
-        log_debug(f"No unused quota-stall tags need cleanup at {client.base_url}")
+        log_debug(f"No unused quota-stall tags need cleanup")
         return
 
     try:
         client.delete_tags(unused_stall_tags)
-        log_info(
-            f"Deleted {len(unused_stall_tags)} unused quota-stall tag(s) "
-            f"at {client.base_url}"
-        )
+        log_info(f"Deleted {len(unused_stall_tags)} unused quota-stall tag(s)")
     except ApiError as exc:
         log_warning(
-            f"Failed to delete unused quota-stall tag(s) at {client.base_url}: {exc}",
+            f"Failed to delete unused quota-stall tag(s): {exc}",
         )
 
 
@@ -2652,7 +2652,7 @@ def apply_single_download(
                     selected_torrent=None,
                 )
                 client.stop_all()
-                log_info(f"Paused all torrents at {client.base_url}; {storage_state['reason']}")
+                log_info(f"Paused all torrents; {storage_state['reason']}")
                 continue
         attempted_hashes = set()
         attempt = 0
@@ -2671,7 +2671,7 @@ def apply_single_download(
                 )
                 log_info(
                     f"No torrent became active after {max_attempts} attempt(s) "
-                    f"at {client.base_url}; the next scheduled run will continue the cycle"
+                    "the next scheduled run will continue the cycle"
                 )
                 break
             if time.monotonic() >= deadline:
@@ -2686,7 +2686,7 @@ def apply_single_download(
                 )
                 log_info(
                     f"No torrent became active before the {human_duration(max_run_seconds)} "
-                    f"single-download run budget expired at {client.base_url}; "
+                    f"single-download run budget expired; "
                     "the next scheduled run will continue the cycle"
                 )
                 break
@@ -2706,7 +2706,7 @@ def apply_single_download(
                         rejected_counts={"storage_stop": 1},
                         selected_torrent=None,
                     )
-                    log_info(f"Paused all torrents at {client.base_url}; {storage_state['reason']}")
+                    log_info(f"Paused all torrents; {storage_state['reason']}")
                     break
             else:
                 storage_state = None
@@ -2777,7 +2777,7 @@ def apply_single_download(
                     cooldown_count += 1
                     log_info(
                         f"Skipping torrent in quota-stall cooldown "
-                        f"at {client.base_url}: {torrent_name(torrent)}"
+                        f"{torrent_name(torrent)}"
                     )
                     continue
                 available_candidates.append(torrent)
@@ -2847,7 +2847,7 @@ def apply_single_download(
                     candidate_counts=candidate_counts,
                 )
                 log_info(
-                    f"Keeping one torrent active at {client.base_url}: "
+                    f"Keeping one torrent active: "
                     f"{torrent_name(keep)} "
                     f"({torrent_progress(keep) * 100:.2f}% complete, "
                     f"{human_size(torrent_amount_left(keep))} left); "
@@ -2879,8 +2879,8 @@ def apply_single_download(
                             candidate_counts=candidate_counts,
                         )
                         log_info(
-                            f"Stopped kept torrent after storage check at "
-                            f"{client.base_url}: {torrent_name(keep_refreshed or keep)}; "
+                            f"Stopped kept torrent after storage check: "
+                            f"{torrent_name(keep_refreshed or keep)}; "
                             f"{storage_state['reason']}"
                         )
                         break
@@ -2914,7 +2914,7 @@ def apply_single_download(
                         )
                         log_info(
                             f"Stopped kept torrent because it is too slow after "
-                            f"{stall_check_seconds}s at {client.base_url}: "
+                            f"{stall_check_seconds}s: "
                             f"{torrent_name(keep_refreshed)}; {slow_reason}"
                         )
                         continue
@@ -2938,7 +2938,7 @@ def apply_single_download(
                     )
                     log_info(
                         f"Kept torrent is active after "
-                        f"{stall_check_seconds}s at {client.base_url}: "
+                        f"{stall_check_seconds}s: "
                         f"{torrent_name(keep_refreshed)}; {progress_reason}"
                     )
                     health_store.record_productive(
@@ -2974,7 +2974,7 @@ def apply_single_download(
                 )
                 log_info(
                     f"Stopped kept torrent because it did not make progress after "
-                    f"{stall_check_seconds}s at {client.base_url}: "
+                    f"{stall_check_seconds}s: "
                     f"{torrent_name(keep_refreshed or keep)}"
                 )
                 continue
@@ -3009,12 +3009,12 @@ def apply_single_download(
                         stall_cooldown_seconds,
                     )
                     log_info(
-                        f"Stopped slow torrent at {client.base_url}: "
+                        f"Stopped slow torrent: "
                         f"{torrent_name(torrent)}; {slow_reason}"
                     )
                 log_info(
                     f"Stopped {len(slow_candidates)} slow torrent(s) "
-                    f"at {client.base_url}; trying the next eligible candidate"
+                    "while trying the next eligible candidate"
                 )
                 continue
 
@@ -3052,7 +3052,7 @@ def apply_single_download(
                     )
                 log_info(
                     f"Stopped {len(stalled_candidates)} stalled torrent(s) "
-                    f"at {client.base_url}; trying the next eligible candidate"
+                    "while trying the next eligible candidate"
                 )
                 continue
 
@@ -3077,25 +3077,25 @@ def apply_single_download(
                 )
                 if candidates:
                     log_info(
-                        f"No torrents available for single-download policy at "
-                        f"{client.base_url}; {cooldown_count} candidate(s) are cooling down "
+                        "No torrents available for single-download policy; "
+                        f"{cooldown_count} candidate(s) are cooling down "
                         "or were already tried in this run"
                     )
                 elif storage_blocked_count:
                     log_info(
-                        f"No torrents available for single-download policy at "
-                        f"{client.base_url}; {storage_blocked_count} candidate(s) do not fit "
+                        "No torrents available for single-download policy; "
+                        f"{storage_blocked_count} candidate(s) do not fit "
                         "download storage headroom"
                     )
                     for example in storage_blocked_examples:
                         log_info(f"- {example}")
                 elif all_candidates:
                     log_info(
-                        f"No torrents available for single-download policy at "
-                        f"{client.base_url}; all candidate(s) were already tried in this run"
+                        "No torrents available for single-download policy; "
+                        "all candidate(s) were already tried in this run"
                     )
                 else:
-                    log_info(f"No torrents eligible for single-download policy at {client.base_url}")
+                    log_info(f"No torrents eligible for single-download policy")
                 break
 
             selected = selection_candidates[0]
@@ -3120,8 +3120,7 @@ def apply_single_download(
                 client.reannounce_hashes([selected_hash])
             except ApiError as exc:
                 log_warning(
-                    f"Failed to reannounce selected torrent at "
-                    f"{client.base_url}: {exc}",
+                    f"Failed to reannounce selected torrent: {exc}",
                 )
             client.start_hashes([selected_hash])
             emit_decision_log(
@@ -3135,7 +3134,7 @@ def apply_single_download(
                 attempt_limit=max_attempts,
             )
             log_info(
-                f"Trying torrent {attempt}/{attempt_limit_label} at {client.base_url}: "
+                f"Trying torrent {attempt}/{attempt_limit_label}: "
                 f"{torrent_name(selected)} "
                 f"({torrent_progress(selected) * 100:.2f}% complete, "
                 f"{human_size(torrent_amount_left(selected))} left); "
@@ -3168,8 +3167,8 @@ def apply_single_download(
                         candidate_counts=candidate_counts,
                     )
                     log_info(
-                        f"Stopped selected torrent after storage check at "
-                        f"{client.base_url}: {torrent_name(selected_refreshed or selected)}; "
+                        f"Stopped selected torrent after storage check: "
+                        f"{torrent_name(selected_refreshed or selected)}; "
                         f"{storage_state['reason']}"
                     )
                     break
@@ -3202,7 +3201,7 @@ def apply_single_download(
                     )
                     log_info(
                         f"Stopped selected torrent because it is too slow after "
-                        f"{stall_check_seconds}s at {client.base_url}: "
+                        f"{stall_check_seconds}s: "
                         f"{torrent_name(selected_refreshed)}; {slow_reason}"
                     )
                     continue
@@ -3226,7 +3225,7 @@ def apply_single_download(
                 )
                 log_info(
                     f"Selected torrent is active after "
-                    f"{stall_check_seconds}s at {client.base_url}: "
+                    f"{stall_check_seconds}s: "
                     f"{torrent_name(selected_refreshed)}; {progress_reason}"
                 )
                 health_store.record_productive(
@@ -3261,7 +3260,7 @@ def apply_single_download(
             )
             log_info(
                 f"Stopped torrent because it did not make progress after "
-                f"{stall_check_seconds}s at {client.base_url}: {torrent_name(selected_refreshed or selected)}"
+                f"{stall_check_seconds}s: {torrent_name(selected_refreshed or selected)}"
             )
 
 
@@ -3437,6 +3436,7 @@ def run_loop():
         "Starting continuous qBittorrent guard loop: "
         f"poll={poll_seconds}s, error_poll={error_poll_seconds}s"
     )
+    log_info("Configured qBittorrent service endpoint(s)", qbt_urls=qbt_urls())
 
     while not stop_event.is_set():
         started = time.monotonic()
