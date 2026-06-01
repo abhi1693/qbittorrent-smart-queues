@@ -50,7 +50,7 @@ class FullGuardThermalGatingTests(unittest.TestCase):
                         "enabled": True,
                         "stop": True,
                         "reason": "NVMe thermal stop threshold 80.0C reached",
-                        "readings": [{"node": "k8s-rpi1", "temperature": 81.2}],
+                        "readings": [{"node": "node-a", "temperature": 81.2}],
                     },
                 ), \
                 mock.patch.object(self.guard, "apply_single_download") as apply_single_download, \
@@ -80,7 +80,7 @@ class FullGuardThermalGatingTests(unittest.TestCase):
                         "enabled": True,
                         "stop": False,
                         "reason": "all NVMe temperatures below 80.0C",
-                        "readings": [{"node": "k8s-rpi1", "temperature": 55.0}],
+                        "readings": [{"node": "node-a", "temperature": 55.0}],
                     },
                 ), \
                 mock.patch.object(self.guard, "apply_single_download") as apply_single_download, \

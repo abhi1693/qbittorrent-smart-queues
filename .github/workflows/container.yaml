@@ -4,7 +4,7 @@ name: Container
 on:
   push:
     branches:
-      - main
+      - master
     tags:
       - "v*"
   pull_request:
@@ -41,7 +41,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/abhi1693/qbittorrent-smart-queues
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag

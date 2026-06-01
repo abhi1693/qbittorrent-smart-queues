@@ -1,21 +1,25 @@
 # qBittorrent Smart Queues
 
-`qbittorrent-smart-queues` is the queue and quota controller used by the home-lab
-media qBittorrent deployment.
+`qbittorrent-smart-queues` is a small qBittorrent Web API controller for
+running a more deliberate download queue.
 
-It runs as a continuous Kubernetes controller and controls qBittorrent through
-the Web API. The controller enforces WAN quota budgets, single-active-download
-behavior, stall cooldowns, persistent torrent health scoring, storage headroom
-checks, optional Sonarr queue-aware TV ordering, optional Jellyfin watch-aware
-single-episode boosts, optional Radarr queue-aware movie ordering, and NVMe
-thermal stops.
+It can enforce quota-aware download rates, keep only one useful download active,
+cool down stalled torrents, score torrent health over time, check local download
+storage headroom, optionally order TV and movie downloads from Sonarr/Radarr,
+optionally boost the next watched TV episode from Jellyfin activity, and
+optionally stop downloads when NVMe temperatures reported by Prometheus are too
+high.
+
+The app is configured entirely with environment variables. It does not ship with
+private network addresses, Kubernetes service names, or media-server defaults;
+set the endpoints for the services you want it to control.
 
 ## Image
 
-Images are published to:
+The GitHub Actions workflow publishes images to the repository package namespace:
 
 ```text
-ghcr.io/abhi1693/qbittorrent-smart-queues
+ghcr.io/<owner>/qbittorrent-smart-queues
 ```
 
 The container entrypoint is:
@@ -24,50 +28,77 @@ The container entrypoint is:
 python -m qbittorrent_smart_queues.guard
 ```
 
+## Quick Start
+
+Minimum qBittorrent-only configuration:
+
+```bash
+export QBT_URLS="http://qbittorrent.example:8080"
+export QBT_USER="admin"
+export QBT_PASSWORD="change-me"
+python -m qbittorrent_smart_queues.guard
+```
+
+Container example:
+
+```bash
+docker run --rm \
+  -e QBT_URLS="http://qbittorrent.example:8080" \
+  -e QBT_USER="admin" \
+  -e QBT_PASSWORD="change-me" \
+  -v qbittorrent-smart-queues-state:/state \
+  ghcr.io/<owner>/qbittorrent-smart-queues
+```
+
+## Configuration
+
+Required for normal operation:
+
+| Variable | Purpose |
+| --- | --- |
+| `QBT_URLS` | Comma-separated or newline-separated qBittorrent Web API base URLs. |
+| `QBT_USER`, `QBT_PASSWORD` | qBittorrent credentials. `QBT_USERNAME` is also accepted. |
+
+Quota control from UniFi Network / UDM is optional. When quota data is
+unavailable and `UDM_FAIL_CLOSED=false`, the controller uses
+`QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `UDM_URL` | unset | UniFi Network / UDM base URL, for example `https://unifi.example`. |
+| `UDM_API_KEY` | unset | API key authentication. |
+| `UDM_USER`, `UDM_PASSWORD` | unset | Login authentication fallback. |
+| `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
+| `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
+| `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
+
+Optional media integrations only load when both URL(s) and an API key are set:
+
+| Integration | URL variable(s) | API key variable(s) |
+| --- | --- | --- |
+| Sonarr TV queue | `QBT_TV_QUEUE_SONARR_URLS`, `SONARR_URLS`, `SONARR_URL` | `QBT_TV_QUEUE_SONARR_API_KEY`, `SONARR_API_KEY` |
+| Radarr movie queue | `QBT_MOVIE_QUEUE_RADARR_URLS`, `RADARR_URLS`, `RADARR_URL` | `QBT_MOVIE_QUEUE_RADARR_API_KEY`, `RADARR_API_KEY` |
+| Jellyfin watch state | `QBT_TV_WATCH_JELLYFIN_URLS`, `JELLYFIN_URLS`, `JELLYFIN_URL` | `QBT_TV_WATCH_JELLYFIN_API_KEY`, `JELLYFIN_API_KEY` |
+
+Optional storage and thermal guards:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QBT_DOWNLOAD_STORAGE_PATH` | `/downloads` | Filesystem path checked for free download headroom. |
+| `QBT_DOWNLOAD_STORAGE_MIN_FREE_BYTES` | `32212254720` | Minimum free-space reserve. |
+| `QBT_TORRENT_HEALTH_STATE_PATH` | `/state/torrent-health.json` | Persistent torrent health state file. |
+| `PROMETHEUS_URL` | unset | Prometheus base URL for thermal checks. |
+| `QBT_NVME_THERMAL_STOP_ENABLED` | enabled only when `PROMETHEUS_URL` is set | Enable NVMe thermal stop checks. |
+| `QBT_NVME_THERMAL_QUERY` | generic node-exporter NVMe composite-temperature query | PromQL query returning temperature samples. |
+
+Logs default to plain text at `INFO` level. Set `QBT_LOG_FORMAT=json` for JSON
+lines and `QBT_LOG_LEVEL=debug` for detailed decision telemetry. Full decision
+payloads are emitted at `DEBUG` by default; set `QBT_DECISION_LOG_LEVEL=info`
+while tuning, or `QBT_DECISION_LOGS_ENABLED=false` to disable them.
+
 ## Local Checks
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests
 docker build -t qbittorrent-smart-queues:dev .
 ```
-
-## Runtime
-
-The controller is configured entirely through environment variables. qBittorrent
-credentials are read from `QBT_USER`/`QBT_PASSWORD` or compatible existing
-variables. UDM and optional Sonarr/Radarr API credentials are expected to be
-injected by Kubernetes Secrets in the consuming deployment.
-
-Sonarr queue enrichment uses `SONARR_API_KEY` or
-`QBT_TV_QUEUE_SONARR_API_KEY` with `QBT_TV_QUEUE_SONARR_URLS`. Radarr queue
-enrichment uses `RADARR_API_KEY` or `QBT_MOVIE_QUEUE_RADARR_API_KEY` with
-`QBT_MOVIE_QUEUE_RADARR_URLS`. Both integrations read `/api/v3/queue`, index
-records by download ID and title, and fall back to torrent-name parsing/order
-when credentials or queue records are unavailable.
-
-Jellyfin watch enrichment uses `JELLYFIN_API_KEY` or
-`QBT_TV_WATCH_JELLYFIN_API_KEY` with `QBT_TV_WATCH_JELLYFIN_URLS`. Active
-episode sessions from `/Sessions` boost matching single-episode TV torrents for
-later episodes in the same season. Full-season packs are deliberately excluded
-because once a pack finishes, the entire season becomes available together.
-
-Each controller pass checks NVMe thermal state before selecting or starting
-torrents. Set `QBT_FULL_GUARD_THERMAL_CHECK_ENABLED=false` only if another
-controller is responsible for thermal gating.
-
-The entrypoint always runs the polling controller. `QBT_GUARD_POLL_SECONDS`
-controls the normal poll interval, and `QBT_GUARD_ERROR_POLL_SECONDS` controls
-the retry delay after an errored pass.
-
-Logs default to plain text at `INFO` level, with routine poll telemetry kept at
-`DEBUG` while compact behavior-changing decisions stay at `INFO`: pause,
-throttle, try, keep, stop, and no-candidate outcomes. Set `QBT_LOG_LEVEL` to
-`debug`, `info`, `warning`, or `error` to tune verbosity. Set `QBT_LOG_FORMAT=json`
-when machine-readable JSON lines are preferred.
-
-Full decision payloads are emitted at `DEBUG` by default and include the
-selected torrent, rejection counts, budget, effective cap, UDM stats age,
-storage headroom, and thermal state. Set `QBT_DECISION_LOG_LEVEL=info` when
-tuning and `QBT_DECISION_LOGS_ENABLED=false` to disable them. The legacy
-`QBT_STRUCTURED_DECISION_LOGS_ENABLED=false` switch is still accepted as a
-compatibility alias for disabling decision logs.

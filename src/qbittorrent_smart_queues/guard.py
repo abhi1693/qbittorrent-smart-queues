@@ -17,9 +17,7 @@ from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 
 
-QBT_DEFAULT_URLS = [
-    "http://qbittorrent.media.svc.cluster.local:8080",
-]
+QBT_DEFAULT_URLS = []
 
 TV_EPISODE_PATTERNS = [
     re.compile(r"(?:^|[ ._\[\(\-])s(?P<season>\d{1,3})[ ._\-]*e(?P<episode>\d{1,3})", re.IGNORECASE),
@@ -50,14 +48,12 @@ QBT_FILE_PRIORITY_NORMAL = 1
 QBT_FILE_PRIORITY_HIGH = 6
 QBT_FILE_PRIORITY_MAXIMUM = 7
 
-PROMETHEUS_DEFAULT_URL = "http://rancher-monitoring-prometheus.cattle-monitoring-system.svc.cluster.local:9090"
+PROMETHEUS_DEFAULT_URL = ""
 NVME_THERMAL_QUERY = (
-    'max by (nodename) ('
-    'node_hwmon_temp_celsius{job="node-exporter", chip=~"nvme_.*"} '
+    'max by (instance) ('
+    'node_hwmon_temp_celsius{chip=~"nvme_.*"} '
     '* on(instance, chip, sensor) group_left(label) '
-    'node_hwmon_sensor_label{job="node-exporter", chip=~"nvme_.*", label="Composite"} '
-    '* on(instance) group_left(nodename) '
-    'node_uname_info{job="node-exporter", machine="aarch64", nodename=~"k8s-rpi[123]"}'
+    'node_hwmon_sensor_label{chip=~"nvme_.*", label=~"Composite.*"}'
     ')'
 )
 
@@ -415,8 +411,8 @@ def response_rows(data, label, key="data"):
 
 class NvmeThermalGuard:
     def __init__(self):
-        self.enabled = env_bool("QBT_NVME_THERMAL_STOP_ENABLED", True)
-        self.prometheus_url = os.environ.get("PROMETHEUS_URL", PROMETHEUS_DEFAULT_URL).rstrip("/")
+        self.prometheus_url = os.environ.get("PROMETHEUS_URL", PROMETHEUS_DEFAULT_URL).strip().rstrip("/")
+        self.enabled = env_bool("QBT_NVME_THERMAL_STOP_ENABLED", bool(self.prometheus_url))
         self.query = os.environ.get("QBT_NVME_THERMAL_QUERY", NVME_THERMAL_QUERY).strip()
         self.threshold = env_float("QBT_NVME_THERMAL_STOP_CELSIUS", 80.0)
         self.timeout = env_int("QBT_NVME_THERMAL_TIMEOUT", 5)
@@ -425,7 +421,13 @@ class NvmeThermalGuard:
 
     def check(self):
         if not self.enabled:
-            return {"stop": False, "reason": "NVMe thermal guard disabled", "readings": []}
+            return {"enabled": False, "stop": False, "reason": "NVMe thermal guard disabled", "readings": []}
+        if not self.prometheus_url:
+            reason = "PROMETHEUS_URL is required when NVMe thermal guard is enabled"
+            if self.fail_closed:
+                return {"enabled": True, "stop": True, "reason": reason, "readings": []}
+            log_warning(f"{reason}; continuing because QBT_NVME_THERMAL_FAIL_CLOSED=false")
+            return {"enabled": True, "stop": False, "reason": reason, "readings": []}
 
         url = join_url(self.prometheus_url, "/api/v1/query")
         url += "?" + urllib.parse.urlencode({"query": self.query})
@@ -451,9 +453,9 @@ class NvmeThermalGuard:
         except (ApiError, IndexError, KeyError, TypeError, ValueError) as exc:
             reason = f"NVMe thermal check failed: {exc}"
             if self.fail_closed:
-                return {"stop": True, "reason": reason, "readings": []}
+                return {"enabled": True, "stop": True, "reason": reason, "readings": []}
             log_warning(f"{reason}; continuing because QBT_NVME_THERMAL_FAIL_CLOSED=false")
-            return {"stop": False, "reason": reason, "readings": []}
+            return {"enabled": True, "stop": False, "reason": reason, "readings": []}
 
         readings.sort(key=lambda item: item["node"])
         summary = ", ".join(
@@ -468,6 +470,7 @@ class NvmeThermalGuard:
         ]
         if not hot_readings:
             return {
+                "enabled": True,
                 "stop": False,
                 "reason": f"all NVMe temperatures below {self.threshold:.1f}C",
                 "readings": readings,
@@ -478,6 +481,7 @@ class NvmeThermalGuard:
             for item in hot_readings
         )
         return {
+            "enabled": True,
             "stop": True,
             "reason": f"NVMe thermal stop threshold {self.threshold:.1f}C reached: {hot_summary}",
             "readings": readings,
@@ -560,7 +564,7 @@ class DownloadStorageGuard:
 
 class UdmClient:
     def __init__(self):
-        self.base_url = os.environ.get("UDM_URL", "https://192.168.3.1").rstrip("/")
+        self.base_url = os.environ.get("UDM_URL", "").strip().rstrip("/")
         self.site = os.environ.get("UDM_SITE", "default")
         self.api_base_path = os.environ.get("UDM_API_BASE_PATH", "/proxy/network").strip()
         self.timeout = env_int("UDM_TIMEOUT", 30)
@@ -600,6 +604,8 @@ class UdmClient:
     def login(self):
         if self.authenticated:
             return
+        if not self.base_url:
+            raise ApiError("UDM_URL is required for UDM quota data")
         if self.api_key:
             log_debug("Using UDM API key authentication")
             self.authenticated = True
@@ -945,9 +951,7 @@ def full_guard_thermal_state():
             "reason": "full guard thermal check disabled",
             "readings": [],
         }
-    state = NvmeThermalGuard().check()
-    state["enabled"] = True
-    return state
+    return NvmeThermalGuard().check()
 
 
 def apply_full_guard_thermal_stop(clients, thermal_state=None, decision_context=None):
@@ -1447,17 +1451,21 @@ class SonarrQueueMetadata:
             or os.environ.get("SONARR_API_KEY")
             or ""
         ).strip()
-        urls = split_lines_or_csv(
-            first_env(["QBT_TV_QUEUE_SONARR_URLS", "SONARR_URLS", "SONARR_URL"])
-        ) or ["http://sonarr.media.svc.cluster.local:8989"]
-        if not api_key:
+        urls = [
+            url.rstrip("/")
+            for url in split_lines_or_csv(
+                first_env(["QBT_TV_QUEUE_SONARR_URLS", "SONARR_URLS", "SONARR_URL"])
+            )
+            if url.rstrip("/")
+        ]
+        if not api_key or not urls:
             return []
-        return [("sonarr", url.rstrip("/"), api_key) for url in urls]
+        return [("sonarr", url, api_key) for url in urls]
 
     def load(self):
         configs = self.configs()
         if not configs:
-            log_debug("Sonarr queue enrichment disabled; SONARR_API_KEY is not set")
+            log_debug("Sonarr queue enrichment disabled; API key and URL(s) are not both set")
             return
 
         for label, base_url, api_key in configs:
@@ -1583,17 +1591,21 @@ class JellyfinWatchMetadata:
             or os.environ.get("JELLYFIN_API_KEY")
             or ""
         ).strip()
-        urls = split_lines_or_csv(
-            first_env(["QBT_TV_WATCH_JELLYFIN_URLS", "JELLYFIN_URLS", "JELLYFIN_URL"])
-        ) or ["http://jellyfin.media.svc.cluster.local:8096"]
-        if not api_key:
+        urls = [
+            url.rstrip("/")
+            for url in split_lines_or_csv(
+                first_env(["QBT_TV_WATCH_JELLYFIN_URLS", "JELLYFIN_URLS", "JELLYFIN_URL"])
+            )
+            if url.rstrip("/")
+        ]
+        if not api_key or not urls:
             return []
-        return [("jellyfin", url.rstrip("/"), api_key) for url in urls]
+        return [("jellyfin", url, api_key) for url in urls]
 
     def load(self):
         configs = self.configs()
         if not configs:
-            log_debug("Jellyfin watch enrichment disabled; JELLYFIN_API_KEY is not set")
+            log_debug("Jellyfin watch enrichment disabled; API key and URL(s) are not both set")
             return
 
         for label, base_url, api_key in configs:
@@ -1712,17 +1724,21 @@ class RadarrQueueMetadata:
             or os.environ.get("RADARR_API_KEY")
             or ""
         ).strip()
-        urls = split_lines_or_csv(
-            first_env(["QBT_MOVIE_QUEUE_RADARR_URLS", "RADARR_URLS", "RADARR_URL"])
-        ) or ["http://radarr.media.svc.cluster.local:7878"]
-        if not api_key:
+        urls = [
+            url.rstrip("/")
+            for url in split_lines_or_csv(
+                first_env(["QBT_MOVIE_QUEUE_RADARR_URLS", "RADARR_URLS", "RADARR_URL"])
+            )
+            if url.rstrip("/")
+        ]
+        if not api_key or not urls:
             return []
-        return [("radarr", url.rstrip("/"), api_key) for url in urls]
+        return [("radarr", url, api_key) for url in urls]
 
     def load(self):
         configs = self.configs()
         if not configs:
-            log_debug("Radarr queue enrichment disabled; RADARR_API_KEY is not set")
+            log_debug("Radarr queue enrichment disabled; API key and URL(s) are not both set")
             return
 
         for label, base_url, api_key in configs:
@@ -2883,7 +2899,7 @@ def apply_single_download(
     tv_file_priority_lookahead = env_int("QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_LOOKAHEAD_EPISODES", 2)
     categories = {
         item.strip()
-        for item in split_lines_or_csv(os.environ.get("QBT_SINGLE_DOWNLOAD_CATEGORIES", "tv,movies,anime"))
+        for item in split_lines_or_csv(os.environ.get("QBT_SINGLE_DOWNLOAD_CATEGORIES", ""))
         if item.strip()
     }
     tv_order_categories = normalized_set(
