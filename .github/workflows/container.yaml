@@ -11,11 +11,10 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  REGISTRY: registry.abhimanyu-saharan.com
-  IMAGE_NAME: qbittorrent-smart-queues/qbittorrent-smart-queues
 
 jobs:
   image:
@@ -30,71 +29,30 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Harbor
+      - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=sha,prefix=sha-
 
-      - name: Build image archive
+      - name: Build and publish image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          build-args: |
-            PYTHON_IMAGE=${{ env.REGISTRY }}/docker.io/library/python:3.13.11-alpine3.22@sha256:2fd93799bfc6381d078a8f656a5f45d6092e5d11d16f55889b3d5cbfdc64f045
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=oci,dest=${{ runner.temp }}/qbittorrent-smart-queues.oci.tar
-
-      - name: Publish with regctl
-        if: github.event_name != 'pull_request'
-        env:
-          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
-          IMAGE_ARCHIVE: ${{ runner.temp }}/qbittorrent-smart-queues.oci.tar
-          REGISTRY_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-        run: |
-          set -euo pipefail
-          regctl_config="${RUNNER_TEMP}/regctl"
-          mkdir -p "${regctl_config}"
-          chmod 0777 "${regctl_config}"
-          printf '%s' "${REGISTRY_PASSWORD}" \
-            | docker run --rm -i \
-                -e REGCTL_CONFIG=/config/config.json \
-                -v "${regctl_config}:/config" \
-                regclient/regctl:latest \
-                registry login "${REGISTRY}" -u "${REGISTRY_USERNAME}" --pass-stdin
-          docker run --rm \
-            -e REGCTL_CONFIG=/config/config.json \
-            -v "${regctl_config}:/config" \
-            regclient/regctl:latest \
-            registry set "${REGISTRY}" --blob-chunk 10485760 --blob-max 1
-          while IFS= read -r image_tag; do
-            [ -n "${image_tag}" ] || continue
-            for attempt in 1 2 3; do
-              docker run --rm \
-                -e REGCTL_CONFIG=/config/config.json \
-                -v "${regctl_config}:/config" \
-                -v "${RUNNER_TEMP}:${RUNNER_TEMP}" \
-                regclient/regctl:latest \
-                image import "${image_tag}" "${IMAGE_ARCHIVE}" -v info && break
-              if [ "${attempt}" -eq 3 ]; then
-                exit 1
-              fi
-              sleep $((attempt * 15))
-            done
-          done <<< "${IMAGE_TAGS}"
