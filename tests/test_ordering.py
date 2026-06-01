@@ -11,10 +11,16 @@ class FakeWatchMetadata:
         self.enabled = True
 
     def torrent_watch_priority(self, torrent, order):
-        key = (order.get("series"), order.get("season"))
-        if not self.guard.tv_order_is_full_season_pack(torrent, order):
+        single_episode_order = self.guard.tv_order_single_episode_torrent_order(torrent, order)
+        if not single_episode_order:
             return None
-        return self.priorities.get(key)
+        season, episode = single_episode_order
+        priority = self.priorities.get((order.get("series"), season))
+        if not priority or episode <= priority.get("episode", 0):
+            return None
+        priority = dict(priority)
+        priority["target_episode"] = episode
+        return priority
 
 
 class FakeFilePriorityClient:
@@ -121,11 +127,11 @@ class TvOrderingTests(unittest.TestCase):
 
         self.assertEqual(["b1", "a1"], [item["hash"] for item in ordered])
 
-    def test_jellyfin_watch_priority_boosts_matching_season_pack_only(self):
+    def test_jellyfin_watch_priority_boosts_matching_single_episodes_only(self):
         queue = self.guard.SonarrQueueMetadata()
         watch = FakeWatchMetadata({
-            ("beta", 1): {
-                "series": "beta",
+            ("the punisher", 1): {
+                "series": "the punisher",
                 "season": 1,
                 "episode": 3,
                 "next_episode": 4,
@@ -136,18 +142,22 @@ class TvOrderingTests(unittest.TestCase):
         watch.guard = self.guard
         torrents = [
             {"hash": "a", "name": "Alpha.S01.1080p", "category": "tv"},
-            {"hash": "b", "name": "Beta.S01.1080p", "category": "tv"},
-            {"hash": "b-single", "name": "Beta.S01E04.1080p", "category": "tv"},
+            {"hash": "p-pack", "name": "The.Punisher.S01.1080p", "category": "tv"},
+            {"hash": "p-current", "name": "The.Punisher.S01E03.1080p", "category": "tv"},
+            {"hash": "p-next", "name": "The.Punisher.S01E04.1080p", "category": "tv"},
+            {"hash": "p-later", "name": "The.Punisher.S01E05.1080p", "category": "tv"},
         ]
 
         state = self.guard.build_tv_order_state(torrents, {"tv"}, queue, watch)
         ordered = sorted(torrents, key=lambda item: self.guard.tv_episode_order_key(item, {"tv"}, state))
 
-        self.assertEqual(["b", "a", "b-single"], [item["hash"] for item in ordered])
-        self.assertIn("b", state["watch_priorities"])
-        self.assertNotIn("b-single", state["watch_priorities"])
+        self.assertEqual(["p-next", "p-later"], [item["hash"] for item in ordered[:2]])
+        self.assertIn("p-next", state["watch_priorities"])
+        self.assertIn("p-later", state["watch_priorities"])
+        self.assertNotIn("p-pack", state["watch_priorities"])
+        self.assertNotIn("p-current", state["watch_priorities"])
 
-    def test_watched_season_pack_file_priority_starts_at_next_episode(self):
+    def test_watch_priority_file_order_starts_at_next_episode(self):
         client = FakeFilePriorityClient([
             {"index": 1, "name": "Beta.S01E01.mkv", "priority": 1, "progress": 0.0},
             {"index": 2, "name": "Beta.S01E02.mkv", "priority": 1, "progress": 0.0},

@@ -335,6 +335,16 @@ def emit_decision_log(event, **fields):
     )
 
 
+def log_decision_info(action, message, **fields):
+    emit_log(
+        "info",
+        message,
+        event="qbt_guard_decision",
+        action=action,
+        **fields,
+    )
+
+
 def parse_udm_row_time(value):
     if value is None:
         return None
@@ -891,7 +901,11 @@ def apply_fail_closed():
         client.set_download_limit(stop_limit)
         client.set_upload_limit(stop_upload_limit)
         client.stop_all()
-        log_info("Paused all torrents because UDM quota data is unavailable")
+        log_decision_info(
+            "pause_all",
+            "Paused all torrents because UDM quota data is unavailable",
+            reason="UDM quota data is unavailable",
+        )
     return True
 
 
@@ -913,11 +927,13 @@ def apply_stop_limits(clients, reason, pause_torrents, decision_context=None):
         )
         if pause_torrents:
             client.stop_all()
-            log_info(f"Paused all torrents; {reason}")
+            log_decision_info("pause_all", f"Paused all torrents; {reason}", reason=reason)
         else:
-            log_info(
+            log_decision_info(
+                "throttle",
                 f"Throttled qBittorrent to {human_rate(stop_limit)} down "
-                f"and {human_rate(stop_upload_limit)} up; {reason}"
+                f"and {human_rate(stop_upload_limit)} up; {reason}",
+                reason=reason,
             )
 
 
@@ -1651,15 +1667,19 @@ class JellyfinWatchMetadata:
     def torrent_watch_priority(self, torrent, order):
         if not self.enabled or not order:
             return None
-        if not tv_order_is_full_season_pack(torrent, order):
+        single_episode_order = tv_order_single_episode_torrent_order(torrent, order)
+        if not single_episode_order:
             return None
 
         series = order.get("series")
-        season = int_or_none(order.get("season"))
-        if not series or season is None:
+        season, candidate_episode = single_episode_order
+        if not series:
             return None
         watch = self.by_series_season.get((series, season))
         if not watch:
+            return None
+        watched_episode = int(watch.get("episode") or 0)
+        if candidate_episode <= watched_episode:
             return None
 
         return {
@@ -1667,6 +1687,7 @@ class JellyfinWatchMetadata:
             "season": watch["season"],
             "episode": watch["episode"],
             "next_episode": watch["episode"] + 1,
+            "target_episode": candidate_episode,
             "activity_at": watch.get("activity_at"),
             "source": watch.get("source", ""),
             "rank": watch["rank"],
@@ -1808,6 +1829,28 @@ def tv_order_is_full_season_pack(torrent, order):
     if parsed and parsed.get("season_pack"):
         return True
     return int_or_none(order.get("episode")) == 0
+
+
+def tv_order_single_episode_torrent_order(torrent, order):
+    if not order:
+        return None
+    parsed = parse_tv_episode_order(torrent_name(torrent))
+    if parsed:
+        episode = int_or_none(parsed.get("episode")) or 0
+        season = int_or_none(parsed.get("season"))
+        if not parsed.get("season_pack") and season is not None and episode > 0:
+            return season, episode
+        return None
+
+    episode = int_or_none(order.get("episode")) or 0
+    season = int_or_none(order.get("season"))
+    if not order.get("season_pack") and season is not None and episode > 0:
+        return season, episode
+    return None
+
+
+def tv_order_is_single_episode_torrent(torrent, order):
+    return tv_order_single_episode_torrent_order(torrent, order) is not None
 
 
 def build_tv_order_state(torrents, tv_order_categories, sonarr_queue, watch_metadata=None):
@@ -2101,7 +2144,7 @@ def apply_tv_episode_file_priorities(
     if watch_priority:
         watched_episode = int(watch_priority.get("episode") or 0)
         log_debug(
-            f"Prioritized watched TV season pack files: "
+            f"Prioritized watched TV episode files: "
             f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first "
             f"after watched S{int(watch_priority['season']):02d}E{watched_episode:02d}"
         )
@@ -2139,9 +2182,14 @@ def watch_priority_log_suffix(torrent, tv_order_state):
     watch_priority = tv_order_state.get("watch_priorities", {}).get(torrent_hash(torrent))
     if not watch_priority:
         return ""
+    target_episode = int(
+        watch_priority.get("target_episode")
+        or watch_priority.get("next_episode")
+        or 0
+    )
     return (
-        f"; watched season pack target S{int(watch_priority['season']):02d}"
-        f"E{int(watch_priority['next_episode']):02d}"
+        f"; watched TV target S{int(watch_priority['season']):02d}"
+        f"E{target_episode:02d}"
     )
 
 
@@ -2884,7 +2932,11 @@ def apply_single_download(
                     selected_torrent=None,
                 )
                 client.stop_all()
-                log_info(f"Paused all torrents; {storage_state['reason']}")
+                log_decision_info(
+                    "stop_for_storage",
+                    f"Paused all torrents; {storage_state['reason']}",
+                    reason=storage_state["reason"],
+                )
                 continue
         attempted_hashes = set()
         attempt = 0
@@ -2901,9 +2953,11 @@ def apply_single_download(
                     rejected_counts={"attempt_limit": 1},
                     selected_torrent=None,
                 )
-                log_info(
+                log_decision_info(
+                    "stop_attempt_limit",
                     f"No torrent became active after {max_attempts} attempt(s) "
-                    "the next scheduled run will continue the cycle"
+                    "the next scheduled run will continue the cycle",
+                    reason="max attempts reached",
                 )
                 break
             if time.monotonic() >= deadline:
@@ -2916,10 +2970,12 @@ def apply_single_download(
                     rejected_counts={"run_budget_expired": 1},
                     selected_torrent=None,
                 )
-                log_info(
+                log_decision_info(
+                    "stop_run_budget",
                     f"No torrent became active before the {human_duration(max_run_seconds)} "
                     f"single-download run budget expired; "
-                    "the next scheduled run will continue the cycle"
+                    "the next scheduled run will continue the cycle",
+                    reason="run time budget expired",
                 )
                 break
 
@@ -2938,7 +2994,11 @@ def apply_single_download(
                         rejected_counts={"storage_stop": 1},
                         selected_torrent=None,
                     )
-                    log_info(f"Paused all torrents; {storage_state['reason']}")
+                    log_decision_info(
+                        "stop_for_storage",
+                        f"Paused all torrents; {storage_state['reason']}",
+                        reason=storage_state["reason"],
+                    )
                     break
             else:
                 storage_state = None
@@ -3064,7 +3124,7 @@ def apply_single_download(
                 "selection_pool": len(selection_candidates),
                 "priority": len(priority_candidates),
                 "watch_priority": len(watch_priority_candidates),
-                "watched_tv_season_packs": len(tv_order_state.get("watch_priorities", {})),
+                "watched_tv_episode_torrents": len(tv_order_state.get("watch_priorities", {})),
                 "productive": len(productive_candidates),
                 "slow": len(slow_candidates),
             }
@@ -3094,7 +3154,8 @@ def apply_single_download(
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
                 )
-                log_info(
+                log_decision_info(
+                    "keep_productive",
                     f"Keeping active: "
                     f"{torrent_name(keep)} "
                     f"({torrent_progress(keep) * 100:.2f}% complete, "
@@ -3102,7 +3163,8 @@ def apply_single_download(
                     f"{human_rate(torrent_download_speed(keep))} down); "
                     f"limit {human_download_limit(download_limit)}"
                     f"{priority_log_suffix(keep, priority_tags, priority_categories)}"
-                    f"{watch_priority_log_suffix(keep, tv_order_state)}"
+                    f"{watch_priority_log_suffix(keep, tv_order_state)}",
+                    selected=torrent_name(keep),
                 )
                 if stall_check_seconds <= 0:
                     break
@@ -3126,10 +3188,13 @@ def apply_single_download(
                             rejected_counts={"storage_stop": 1},
                             candidate_counts=candidate_counts,
                         )
-                        log_info(
+                        log_decision_info(
+                            "stop_kept_for_storage",
                             f"Stopped kept torrent after storage check: "
                             f"{torrent_name(keep_refreshed or keep)}; "
-                            f"{storage_state['reason']}"
+                            f"{storage_state['reason']}",
+                            selected=torrent_name(keep_refreshed or keep),
+                            reason=storage_state["reason"],
                         )
                         break
                 if keep_refreshed:
@@ -3160,10 +3225,13 @@ def apply_single_download(
                             rejected_counts={"too_slow_after_wait": 1},
                             candidate_counts=candidate_counts,
                         )
-                        log_info(
+                        log_decision_info(
+                            "stop_kept_too_slow",
                             f"Stopped kept torrent because it is too slow after "
                             f"{stall_check_seconds}s: "
-                            f"{torrent_name(keep_refreshed)}; {slow_reason}"
+                            f"{torrent_name(keep_refreshed)}; {slow_reason}",
+                            selected=torrent_name(keep_refreshed),
+                            reason=slow_reason,
                         )
                         continue
 
@@ -3220,10 +3288,13 @@ def apply_single_download(
                     rejected_counts={"no_progress_after_wait": 1},
                     candidate_counts=candidate_counts,
                 )
-                log_info(
+                log_decision_info(
+                    "stop_kept_no_progress",
                     f"Stopped kept torrent because it did not make progress after "
                     f"{stall_check_seconds}s: "
-                    f"{torrent_name(keep_refreshed or keep)}"
+                    f"{torrent_name(keep_refreshed or keep)}",
+                    selected=torrent_name(keep_refreshed or keep),
+                    reason="did not make progress",
                 )
                 continue
 
@@ -3260,9 +3331,11 @@ def apply_single_download(
                         f"Stopped slow torrent: "
                         f"{torrent_name(torrent)}; {slow_reason}"
                     )
-                log_info(
+                log_decision_info(
+                    "stop_slow_candidates",
                     f"Stopped {len(slow_candidates)} slow torrent(s) "
-                    "while trying the next eligible candidate"
+                    "while trying the next eligible candidate",
+                    count=len(slow_candidates),
                 )
                 continue
 
@@ -3298,9 +3371,11 @@ def apply_single_download(
                         now,
                         stall_cooldown_seconds,
                     )
-                log_info(
+                log_decision_info(
+                    "stop_stalled_candidates",
                     f"Stopped {len(stalled_candidates)} stalled torrent(s) "
-                    "while trying the next eligible candidate"
+                    "while trying the next eligible candidate",
+                    count=len(stalled_candidates),
                 )
                 continue
 
@@ -3324,26 +3399,38 @@ def apply_single_download(
                     storage_blocked_examples=storage_blocked_examples,
                 )
                 if candidates:
-                    log_info(
+                    log_decision_info(
+                        "stop_no_available_candidates",
                         "No torrents available for single-download policy; "
                         f"{cooldown_count} candidate(s) are cooling down "
-                        "or were already tried in this run"
+                        "or were already tried in this run",
+                        reason=no_available_reason,
+                        cooldown_count=cooldown_count,
                     )
                 elif storage_blocked_count:
-                    log_info(
+                    log_decision_info(
+                        "stop_no_available_candidates",
                         "No torrents available for single-download policy; "
                         f"{storage_blocked_count} candidate(s) do not fit "
-                        "download storage headroom"
+                        "download storage headroom",
+                        reason=no_available_reason,
+                        storage_blocked_count=storage_blocked_count,
                     )
                     for example in storage_blocked_examples:
                         log_info(f"- {example}")
                 elif all_candidates:
-                    log_info(
+                    log_decision_info(
+                        "stop_no_available_candidates",
                         "No torrents available for single-download policy; "
-                        "all candidate(s) were already tried in this run"
+                        "all candidate(s) were already tried in this run",
+                        reason=no_available_reason,
                     )
                 else:
-                    log_info(f"No torrents eligible for single-download policy")
+                    log_decision_info(
+                        "stop_no_available_candidates",
+                        "No torrents eligible for single-download policy",
+                        reason=no_available_reason,
+                    )
                 break
 
             selected = selection_candidates[0]
@@ -3382,16 +3469,19 @@ def apply_single_download(
                 attempt=attempt,
                 attempt_limit=max_attempts,
             )
-            log_info(
+            log_decision_info(
+                "try_candidate",
                 f"Trying torrent {attempt}/{attempt_limit_label}: "
                 f"{torrent_name(selected)} "
                 f"({torrent_progress(selected) * 100:.2f}% complete, "
                 f"{human_size(torrent_amount_left(selected))} left); "
-                f"monthly usage {human_size(usage_bytes)} / {human_size(monthly_limit_bytes)}; "
-                f"limit {human_download_limit(download_limit)} down ({limit_reason})"
+                f"limit {human_download_limit(download_limit)}"
                 f"{priority_log_suffix(selected, priority_tags, priority_categories)}"
                 f"{watch_priority_log_suffix(selected, tv_order_state)}"
-                f"{health_store.summary(selected, now)}"
+                f"{health_store.summary(selected, now)}",
+                selected=torrent_name(selected),
+                attempt=attempt,
+                attempt_limit=max_attempts,
             )
 
             if stall_check_seconds <= 0:
@@ -3416,10 +3506,13 @@ def apply_single_download(
                         rejected_counts={"storage_stop": 1},
                         candidate_counts=candidate_counts,
                     )
-                    log_info(
+                    log_decision_info(
+                        "stop_selected_for_storage",
                         f"Stopped selected torrent after storage check: "
                         f"{torrent_name(selected_refreshed or selected)}; "
-                        f"{storage_state['reason']}"
+                        f"{storage_state['reason']}",
+                        selected=torrent_name(selected_refreshed or selected),
+                        reason=storage_state["reason"],
                     )
                     break
             if selected_refreshed:
@@ -3449,10 +3542,13 @@ def apply_single_download(
                         rejected_counts={"too_slow_after_wait": 1},
                         candidate_counts=candidate_counts,
                     )
-                    log_info(
+                    log_decision_info(
+                        "stop_selected_too_slow",
                         f"Stopped selected torrent because it is too slow after "
                         f"{stall_check_seconds}s: "
-                        f"{torrent_name(selected_refreshed)}; {slow_reason}"
+                        f"{torrent_name(selected_refreshed)}; {slow_reason}",
+                        selected=torrent_name(selected_refreshed),
+                        reason=slow_reason,
                     )
                     continue
 
@@ -3473,10 +3569,13 @@ def apply_single_download(
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
                 )
-                log_info(
+                log_decision_info(
+                    "confirm_selected_productive",
                     f"Selected torrent is active after "
                     f"{stall_check_seconds}s: "
-                    f"{torrent_name(selected_refreshed)}; {progress_reason}"
+                    f"{torrent_name(selected_refreshed)}; {progress_reason}",
+                    selected=torrent_name(selected_refreshed),
+                    reason=progress_reason,
                 )
                 health_store.record_productive(
                     selected,
@@ -3508,9 +3607,12 @@ def apply_single_download(
                 rejected_counts={"no_progress_after_wait": 1},
                 candidate_counts=candidate_counts,
             )
-            log_info(
+            log_decision_info(
+                "stop_selected_no_progress",
                 f"Stopped torrent because it did not make progress after "
-                f"{stall_check_seconds}s: {torrent_name(selected_refreshed or selected)}"
+                f"{stall_check_seconds}s: {torrent_name(selected_refreshed or selected)}",
+                selected=torrent_name(selected_refreshed or selected),
+                reason="did not make progress",
             )
 
 

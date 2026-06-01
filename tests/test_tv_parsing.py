@@ -129,6 +129,44 @@ class TvParsingTests(unittest.TestCase):
         self.assertEqual(5, priority["episode"])
         self.assertEqual("jellyfin-active-session", priority["source"])
 
+    def test_jellyfin_watch_priority_targets_single_future_episode_only(self):
+        watch = self.guard.JellyfinWatchMetadata.__new__(self.guard.JellyfinWatchMetadata)
+        watch.enabled = True
+        watch.by_series_season = {}
+        watch.record_watch("the punisher", 1, 3, 0, None, "test")
+
+        next_episode = watch.torrent_watch_priority(
+            {"hash": "next", "name": "The.Punisher.S01E04.1080p", "category": "tv"},
+            {
+                "series": "the punisher",
+                "season": 1,
+                "episode": 4,
+                "season_pack": False,
+            },
+        )
+        season_pack = watch.torrent_watch_priority(
+            {"hash": "pack", "name": "The.Punisher.S01.1080p", "category": "tv"},
+            {
+                "series": "the punisher",
+                "season": 1,
+                "episode": 0,
+                "season_pack": True,
+            },
+        )
+        current_episode = watch.torrent_watch_priority(
+            {"hash": "current", "name": "The.Punisher.S01E03.1080p", "category": "tv"},
+            {
+                "series": "the punisher",
+                "season": 1,
+                "episode": 3,
+                "season_pack": False,
+            },
+        )
+
+        self.assertEqual(4, next_episode["target_episode"])
+        self.assertIsNone(season_pack)
+        self.assertIsNone(current_episode)
+
 
 if __name__ == "__main__":
     unittest.main()

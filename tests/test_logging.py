@@ -48,6 +48,23 @@ class LoggingTests(unittest.TestCase):
 
         self.assertEqual("", stdout.getvalue())
 
+    def test_critical_decision_summary_is_info_by_default(self):
+        stdout = io.StringIO()
+        env = {"QBT_LOG_FORMAT": "json"}
+
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            self.guard.log_decision_info(
+                "try_candidate",
+                "Trying torrent 1/3: Example.S01E04",
+                selected="Example.S01E04",
+            )
+
+        record = json.loads(stdout.getvalue())
+        self.assertEqual("INFO", record["level"])
+        self.assertEqual("qbt_guard_decision", record["event"])
+        self.assertEqual("try_candidate", record["action"])
+        self.assertEqual("Example.S01E04", record["selected"])
+
     def test_json_log_format_preserves_decision_fields_when_enabled_at_info(self):
         stdout = io.StringIO()
         env = {"QBT_LOG_FORMAT": "json", "QBT_DECISION_LOG_LEVEL": "info"}
