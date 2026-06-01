@@ -8,6 +8,11 @@ on:
     tags:
       - "v*"
   pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver image version without a leading v
+        required: true
 
 permissions:
   contents: read
@@ -44,6 +49,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
             type=ref,event=branch
             type=ref,event=tag
             type=semver,pattern={{version}}
