@@ -57,6 +57,12 @@ NVME_THERMAL_QUERY = (
     ')'
 )
 RPI_COOLING_DEFAULT_NODES = ["k8s-rpi1", "k8s-rpi2", "k8s-rpi3"]
+RPI_COOLING_DEFAULT_DRAIN_IGNORE_NAMESPACES = {
+    "cattle-fleet-local-system",
+    "cattle-monitoring-system",
+    "kube-system",
+    "longhorn-system",
+}
 RPI_COOLING_CPU_QUERY = (
     'max by (nodename) ('
     'node_hwmon_temp_celsius{chip=~"thermal_thermal_zone.*"} '
@@ -783,8 +789,10 @@ class RpiThermalCoolingManager:
         self.cooldown_seconds = env_int("QBT_RPI_COOLING_COOLDOWN_SECONDS", 1200)
         self.drain_enabled = env_bool("QBT_RPI_COOLING_DRAIN_ENABLED", True)
         self.drain_timeout_seconds = env_int("QBT_RPI_COOLING_DRAIN_TIMEOUT_SECONDS", 300)
+        self.drain_abort_backoff_seconds = env_int("QBT_RPI_COOLING_DRAIN_ABORT_BACKOFF_SECONDS", 900)
         self.drain_grace_period_seconds = env_int("QBT_RPI_COOLING_DRAIN_POD_GRACE_PERIOD_SECONDS", 30)
-        self.drain_ignore_namespaces = set(
+        self.drain_ignore_namespaces = set(RPI_COOLING_DEFAULT_DRAIN_IGNORE_NAMESPACES)
+        self.drain_ignore_namespaces.update(
             split_lines_or_csv(os.environ.get("QBT_RPI_COOLING_DRAIN_IGNORE_NAMESPACES"))
         )
         self.require_all_ready = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_NODES_READY", True)
@@ -978,6 +986,31 @@ class RpiThermalCoolingManager:
         self.kubernetes.set_node_unschedulable(node_name, False)
         log_info("RPi cooling node uncordoned after returning Ready", node=node_name)
 
+    def abort_drain(self, active, now, drain, elapsed_seconds):
+        node_name = active["node"]
+        try:
+            self.kubernetes.set_node_unschedulable(node_name, False)
+            active["uncordoned_after_drain_abort"] = True
+        except ApiError as exc:
+            active["uncordoned_after_drain_abort"] = False
+            active["uncordon_error"] = str(exc)
+            log_warning("RPi cooling drain abort could not uncordon node", node=node_name, reason=str(exc))
+        active["phase"] = "drain_aborted"
+        active["last_drain"] = drain
+        active["drain_aborted_at"] = format_utc(now)
+        active["drain_backoff_until"] = format_utc(
+            now + timedelta(seconds=max(0, self.drain_abort_backoff_seconds))
+        )
+        self.state.save(active)
+        log_warning(
+            "RPi cooling drain timed out; node uncordoned and shutdown backed off",
+            node=node_name,
+            elapsed_seconds=elapsed_seconds,
+            timeout_seconds=self.drain_timeout_seconds,
+            backoff_seconds=self.drain_abort_backoff_seconds,
+            pending_pods=drain.get("pending_pods", []),
+        )
+
     def active_state_reconciled(self, now, ready):
         active = self.state.load()
         node_name = active.get("node")
@@ -1008,16 +1041,10 @@ class RpiThermalCoolingManager:
                 }
                 self.request_shutdown(candidate, now, existing_state=active)
             else:
-                self.state.save(active)
                 if elapsed_seconds >= self.drain_timeout_seconds:
-                    log_warning(
-                        "RPi cooling drain still pending; keeping node powered on",
-                        node=node_name,
-                        elapsed_seconds=elapsed_seconds,
-                        timeout_seconds=self.drain_timeout_seconds,
-                        pending_pods=drain.get("pending_pods", []),
-                    )
+                    self.abort_drain(active, now, drain, elapsed_seconds)
                 else:
+                    self.state.save(active)
                     log_info(
                         "RPi cooling drain pending before shutdown",
                         node=node_name,
@@ -1025,6 +1052,27 @@ class RpiThermalCoolingManager:
                         evicted_pods=drain.get("evicted_pods", []),
                     )
             return True
+
+        if phase == "drain_aborted":
+            backoff_until = parse_utc(active.get("drain_backoff_until")) or started_at
+            if node_ready is True and not active.get("uncordoned_after_drain_abort"):
+                try:
+                    self.kubernetes.set_node_unschedulable(node_name, False)
+                    active["uncordoned_after_drain_abort"] = True
+                    self.state.save(active)
+                except ApiError as exc:
+                    log_warning("RPi cooling drain abort could not uncordon node", node=node_name, reason=str(exc))
+            if now < backoff_until:
+                remaining_seconds = max(0, int((backoff_until - now).total_seconds()))
+                log_warning(
+                    "RPi cooling drain abort backoff active",
+                    node=node_name,
+                    remaining_seconds=remaining_seconds,
+                )
+                return True
+            log_warning("RPi cooling drain abort backoff elapsed; lock released", node=node_name)
+            self.state.clear()
+            return False
 
         if phase == "shutdown_requested":
             if node_ready is False:
@@ -1712,6 +1760,8 @@ def rpi_cooling_stop_reason(rpi_cooling_state):
         return f"RPi thermal cooling drain requested for {node_name}"
     if rpi_cooling_state.get("action") == "active" and active.get("phase") == "draining" and node_name:
         return f"RPi thermal cooling drain active for {node_name}"
+    if rpi_cooling_state.get("action") == "active" and active.get("phase") == "drain_aborted" and node_name:
+        return f"RPi thermal cooling drain backed off for {node_name}"
     if rpi_cooling_state.get("action") == "active" and active.get("phase") in {"shutdown_requested", "cooling", "booting"} and node_name:
         return f"RPi thermal cooling active for {node_name}"
     if rpi_cooling_state.get("action") == "shutdown_requested" and node_name:

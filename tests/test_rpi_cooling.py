@@ -221,6 +221,43 @@ class RpiCoolingTests(unittest.TestCase):
             )
             manager.kubernetes.evict_pod.assert_not_called()
 
+    def test_drain_ignores_default_system_namespaces(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager_with_drain(state_path)
+            manager.kubernetes.set_node_unschedulable = mock.Mock()
+            manager.kubernetes.list_pods_on_node = mock.Mock(
+                return_value=[
+                    {
+                        "metadata": {
+                            "namespace": "cattle-fleet-local-system",
+                            "name": "fleet-agent",
+                            "labels": {},
+                        },
+                        "status": {"phase": "Running"},
+                    },
+                    {
+                        "metadata": {
+                            "namespace": "cattle-monitoring-system",
+                            "name": "prometheus",
+                            "labels": {},
+                        },
+                        "status": {"phase": "Running"},
+                    },
+                ]
+            )
+            manager.kubernetes.evict_pod = mock.Mock()
+
+            result = manager.drain_node("k8s-rpi2")
+
+            self.assertTrue(result["drained"])
+            self.assertEqual([], result["pending_pods"])
+            self.assertEqual(
+                ["cattle-fleet-local-system/fleet-agent", "cattle-monitoring-system/prometheus"],
+                result["ignored_pods"],
+            )
+            manager.kubernetes.evict_pod.assert_not_called()
+
     def test_existing_drain_requests_shutdown_once_pods_are_gone(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "rpi-cooling.json")
@@ -270,6 +307,59 @@ class RpiCoolingTests(unittest.TestCase):
             with open(state_path, "r", encoding="utf-8") as state_file:
                 state = json.load(state_file)
             self.assertEqual("shutdown_requested", state["phase"])
+
+    def test_timed_out_drain_uncordons_and_backs_off(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(
+                    {
+                        "node": "k8s-rpi2",
+                        "phase": "draining",
+                        "started_at": "2026-06-01T00:00:00Z",
+                        "drain_started_at": "2026-06-01T00:00:00Z",
+                        "reason": "CPU temperature 80.0C reached threshold 75.0C",
+                        "temperature_kind": "CPU",
+                        "temperature_celsius": 80.0,
+                        "threshold_celsius": 75.0,
+                    },
+                    state_file,
+                )
+            manager = self.manager_with_drain(state_path)
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.kubernetes.set_node_unschedulable = mock.Mock()
+            manager.kubernetes.list_pods_on_node = mock.Mock(
+                return_value=[
+                    {
+                        "metadata": {
+                            "namespace": "media",
+                            "name": "sonarr-123",
+                            "labels": {"app.kubernetes.io/name": "sonarr"},
+                        },
+                        "status": {"phase": "Running"},
+                    },
+                ]
+            )
+            manager.kubernetes.evict_pod = mock.Mock(return_value={})
+
+            with mock.patch.object(self.guard, "request_json") as request_json:
+                result = manager.reconcile()
+
+            self.assertEqual("active", result["action"])
+            manager.kubernetes.set_node_unschedulable.assert_has_calls(
+                [
+                    mock.call("k8s-rpi2", True),
+                    mock.call("k8s-rpi2", False),
+                ]
+            )
+            request_json.assert_not_called()
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            self.assertEqual("drain_aborted", state["phase"])
+            self.assertTrue(state["uncordoned_after_drain_abort"])
+            self.assertIn("drain_backoff_until", state)
 
     def test_shutdown_failure_clears_prewritten_lock(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -383,6 +473,17 @@ class RpiCoolingTests(unittest.TestCase):
         )
 
         self.assertEqual("RPi thermal cooling drain active for k8s-rpi2", reason)
+
+    def test_aborted_drain_requests_download_stop_during_backoff(self):
+        reason = self.guard.rpi_cooling_stop_reason(
+            {
+                "enabled": True,
+                "action": "active",
+                "active": {"phase": "drain_aborted", "node": "k8s-rpi2"},
+            }
+        )
+
+        self.assertEqual("RPi thermal cooling drain backed off for k8s-rpi2", reason)
 
     def test_shutdown_allows_candidate_when_longhorn_replica_has_peer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
