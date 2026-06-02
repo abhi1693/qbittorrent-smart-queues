@@ -235,6 +235,143 @@ class RpiCoolingTests(unittest.TestCase):
         self.assertEqual([131072], client.upload_limits)
         self.assertEqual(0, client.stop_all_calls)
 
+    def test_unrelated_hot_node_does_not_throttle_qbittorrent_when_topology_enabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_CPU_PAUSE_CELSIUS": "80",
+                    "QBT_RPI_COOLING_NVME_PAUSE_CELSIUS": "76",
+                    "QBT_RPI_COOLING_QBT_TOPOLOGY_ENABLED": "true",
+                    "QBT_RPI_COOLING_QBT_AFFECTED_NODES": "k8s-rpi1,k8s-rpi2",
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 60.0, "k8s-rpi3": 78.0},
+                    {"k8s-rpi1": 45.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(return_value={"enabled": True, "changed": [], "errors": []})
+
+            result = manager.reconcile()
+
+            self.assertEqual("throttle", result["action"])
+            self.assertEqual("k8s-rpi3", result["candidate"]["node"])
+            self.assertEqual("", result["active"]["qbt_action"])
+            self.assertEqual(["k8s-rpi1", "k8s-rpi2"], result["active"]["qbt_topology"]["nodes"])
+            self.assertFalse(self.guard.apply_rpi_cooling_stop([FakeQbtClient()], result))
+
+    def test_qbittorrent_topology_discovers_pod_frontend_and_replica_nodes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_CPU_PAUSE_CELSIUS": "80",
+                    "QBT_RPI_COOLING_NVME_PAUSE_CELSIUS": "76",
+                    "QBT_RPI_COOLING_QBT_TOPOLOGY_ENABLED": "true",
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 60.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 74.5, "k8s-rpi2": 61.0, "k8s-rpi3": 55.0},
+                ]
+            )
+            manager.kubernetes.list_pods = mock.Mock(
+                return_value=[
+                    {
+                        "spec": {
+                            "nodeName": "k8s-rpi3",
+                            "volumes": [
+                                {"name": "downloads", "persistentVolumeClaim": {"claimName": "media-downloads"}}
+                            ],
+                        }
+                    }
+                ]
+            )
+            manager.kubernetes.fetch_pvc = mock.Mock(
+                return_value={"spec": {"volumeName": "pvc-media-downloads"}}
+            )
+            manager.kubernetes.fetch_pv = mock.Mock(
+                return_value={
+                    "metadata": {"name": "pvc-media-downloads"},
+                    "spec": {"csi": {"volumeHandle": "pvc-media-downloads"}},
+                }
+            )
+            manager.kubernetes.fetch_longhorn_volume = mock.Mock(
+                return_value={
+                    "spec": {"accessMode": "rwx", "nodeID": "k8s-rpi1"},
+                    "status": {"currentNodeID": "k8s-rpi1", "ownerID": "k8s-rpi1", "shareState": "running"},
+                }
+            )
+            manager.kubernetes.fetch_longhorn_share_manager = mock.Mock(
+                return_value={"status": {"ownerID": "k8s-rpi1"}}
+            )
+            manager.kubernetes.list_longhorn_replicas = mock.Mock(
+                return_value=[
+                    {
+                        "spec": {
+                            "active": True,
+                            "nodeID": "k8s-rpi2",
+                            "volumeName": "pvc-media-downloads",
+                        },
+                        "status": {"currentState": "running"},
+                    }
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(return_value={"enabled": True, "changed": [], "errors": []})
+
+            result = manager.reconcile()
+
+            self.assertEqual("throttle", result["action"])
+            self.assertEqual("k8s-rpi1", result["candidate"]["node"])
+            self.assertEqual("throttle", result["active"]["qbt_action"])
+            self.assertEqual(
+                ["k8s-rpi1", "k8s-rpi2", "k8s-rpi3"],
+                result["active"]["qbt_topology"]["nodes"],
+            )
+
+    def test_qbittorrent_topology_failure_fails_open_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_CPU_PAUSE_CELSIUS": "80",
+                    "QBT_RPI_COOLING_NVME_PAUSE_CELSIUS": "76",
+                    "QBT_RPI_COOLING_QBT_TOPOLOGY_ENABLED": "true",
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 60.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 74.5, "k8s-rpi2": 61.0, "k8s-rpi3": 55.0},
+                ]
+            )
+            manager.kubernetes.list_pods = mock.Mock(side_effect=self.guard.ApiError("forbidden"))
+            manager.batch_work.reconcile = mock.Mock(return_value={"enabled": True, "changed": [], "errors": []})
+
+            result = manager.reconcile()
+
+            self.assertEqual("throttle", result["action"])
+            self.assertEqual("", result["active"]["qbt_action"])
+            self.assertEqual("error-fail-open", result["active"]["qbt_topology"]["source"])
+
     def test_qbittorrent_pause_action_pauses_torrents(self):
         client = FakeQbtClient()
 

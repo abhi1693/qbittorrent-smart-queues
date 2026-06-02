@@ -613,6 +613,44 @@ class KubernetesNodeClient:
     def ready_map(self, node_names):
         return {node_name: self.node_ready(node_name) for node_name in node_names}
 
+    def list_pods(self, namespace, label_selector=""):
+        quoted_namespace = urllib.parse.quote(namespace, safe="")
+        path = f"/api/v1/namespaces/{quoted_namespace}/pods"
+        if label_selector:
+            path += "?" + urllib.parse.urlencode({"labelSelector": label_selector})
+        return self.fetch_path(path, f"Kubernetes pods in namespace {namespace}").get("items", [])
+
+    def fetch_pvc(self, namespace, name):
+        quoted_namespace = urllib.parse.quote(namespace, safe="")
+        quoted_name = urllib.parse.quote(name, safe="")
+        return self.fetch_path(
+            f"/api/v1/namespaces/{quoted_namespace}/persistentvolumeclaims/{quoted_name}",
+            f"PersistentVolumeClaim {namespace}/{name}",
+        )
+
+    def fetch_pv(self, name):
+        quoted_name = urllib.parse.quote(name, safe="")
+        return self.fetch_path(
+            f"/api/v1/persistentvolumes/{quoted_name}",
+            f"PersistentVolume {name}",
+        )
+
+    def fetch_longhorn_volume(self, namespace, name):
+        quoted_namespace = urllib.parse.quote(namespace, safe="")
+        quoted_name = urllib.parse.quote(name, safe="")
+        return self.fetch_path(
+            f"/apis/longhorn.io/v1beta2/namespaces/{quoted_namespace}/volumes/{quoted_name}",
+            f"Longhorn volume {namespace}/{name}",
+        )
+
+    def fetch_longhorn_share_manager(self, namespace, name):
+        quoted_namespace = urllib.parse.quote(namespace, safe="")
+        quoted_name = urllib.parse.quote(name, safe="")
+        return self.fetch_path(
+            f"/apis/longhorn.io/v1beta2/namespaces/{quoted_namespace}/sharemanagers/{quoted_name}",
+            f"Longhorn share manager {namespace}/{name}",
+        )
+
     def list_longhorn_replicas(self, namespace):
         quoted_namespace = urllib.parse.quote(namespace, safe="")
         return self.fetch_path(
@@ -791,6 +829,163 @@ class LonghornReplicaSafetyCheck:
         }
 
 
+def pod_pvc_names(pod):
+    names = []
+    for volume in (pod.get("spec") or {}).get("volumes") or []:
+        claim = volume.get("persistentVolumeClaim") or {}
+        claim_name = claim.get("claimName")
+        if claim_name:
+            names.append(str(claim_name))
+    return names
+
+
+def pv_longhorn_volume_name(pv):
+    spec = pv.get("spec") or {}
+    csi = spec.get("csi") or {}
+    handle = csi.get("volumeHandle")
+    if handle:
+        return str(handle)
+    return (pv.get("metadata") or {}).get("name") or ""
+
+
+def add_nonempty_node(nodes, node_name):
+    if node_name:
+        nodes.add(str(node_name))
+
+
+def longhorn_running_replica_nodes(replicas, volume_name):
+    nodes = set()
+    for replica in replicas:
+        spec = replica.get("spec") or {}
+        status = replica.get("status") or {}
+        if spec.get("volumeName") != volume_name:
+            continue
+        current_state = status.get("currentState") or spec.get("currentState") or spec.get("desireState")
+        if str(current_state or "").lower() != "running":
+            continue
+        if spec.get("active") is False:
+            continue
+        add_nonempty_node(nodes, spec.get("nodeID") or status.get("ownerID"))
+    return nodes
+
+
+class QbtThermalTopology:
+    def __init__(self, kubernetes):
+        self.kubernetes = kubernetes
+        self.enabled = env_bool("QBT_RPI_COOLING_QBT_TOPOLOGY_ENABLED", False)
+        self.fail_closed = env_bool("QBT_RPI_COOLING_QBT_TOPOLOGY_FAIL_CLOSED", False)
+        self.namespace = os.environ.get("QBT_RPI_COOLING_QBT_NAMESPACE", "media").strip() or "media"
+        self.selector = os.environ.get(
+            "QBT_RPI_COOLING_QBT_SELECTOR",
+            "app.kubernetes.io/instance=qbittorrent,app.kubernetes.io/name=qbittorrent",
+        ).strip()
+        self.longhorn_namespace = os.environ.get(
+            "QBT_RPI_COOLING_LONGHORN_NAMESPACE",
+            "longhorn-system",
+        ).strip()
+        self.static_nodes = set(split_lines_or_csv(os.environ.get("QBT_RPI_COOLING_QBT_AFFECTED_NODES")))
+
+    def affected_nodes(self):
+        if self.static_nodes:
+            return {
+                "enabled": self.enabled,
+                "source": "static",
+                "nodes": sorted(self.static_nodes),
+                "volumes": [],
+                "reason": "static qBittorrent affected nodes configured",
+            }
+        if not self.enabled:
+            return {
+                "enabled": False,
+                "source": "disabled",
+                "nodes": [],
+                "volumes": [],
+                "reason": "qBittorrent topology discovery disabled",
+            }
+
+        nodes = set()
+        volumes = []
+        try:
+            pods = self.kubernetes.list_pods(self.namespace, self.selector)
+            replicas = self.kubernetes.list_longhorn_replicas(self.longhorn_namespace)
+            for pod in pods:
+                add_nonempty_node(nodes, (pod.get("spec") or {}).get("nodeName"))
+                for claim_name in pod_pvc_names(pod):
+                    pvc = self.kubernetes.fetch_pvc(self.namespace, claim_name)
+                    volume_name = (pvc.get("spec") or {}).get("volumeName")
+                    if not volume_name:
+                        continue
+                    pv = self.kubernetes.fetch_pv(volume_name)
+                    longhorn_volume_name = pv_longhorn_volume_name(pv)
+                    if not longhorn_volume_name:
+                        continue
+                    volume_nodes = set()
+                    longhorn_volume = self.kubernetes.fetch_longhorn_volume(
+                        self.longhorn_namespace,
+                        longhorn_volume_name,
+                    )
+                    volume_spec = longhorn_volume.get("spec") or {}
+                    volume_status = longhorn_volume.get("status") or {}
+                    for node_name in (
+                        volume_spec.get("nodeID"),
+                        volume_status.get("currentNodeID"),
+                        volume_status.get("ownerID"),
+                    ):
+                        add_nonempty_node(volume_nodes, node_name)
+
+                    access_mode = str(volume_spec.get("accessMode") or "").lower()
+                    if access_mode == "rwx" or volume_status.get("shareState"):
+                        try:
+                            share_manager = self.kubernetes.fetch_longhorn_share_manager(
+                                self.longhorn_namespace,
+                                longhorn_volume_name,
+                            )
+                        except ApiError:
+                            share_manager = {}
+                        share_status = share_manager.get("status") or {}
+                        add_nonempty_node(volume_nodes, share_status.get("ownerID"))
+
+                    volume_nodes.update(longhorn_running_replica_nodes(replicas, longhorn_volume_name))
+                    nodes.update(volume_nodes)
+                    volumes.append({
+                        "claim": claim_name,
+                        "volume": longhorn_volume_name,
+                        "nodes": sorted(volume_nodes),
+                    })
+        except ApiError as exc:
+            if self.fail_closed:
+                log_warning(
+                    "qBittorrent thermal topology discovery failed; using all cooling nodes",
+                    reason=str(exc),
+                )
+                return {
+                    "enabled": True,
+                    "source": "error-fail-closed",
+                    "nodes": [],
+                    "volumes": volumes,
+                    "reason": str(exc),
+                }
+            log_warning(
+                "qBittorrent thermal topology discovery failed; leaving qBittorrent unmanaged for this cycle",
+                reason=str(exc),
+            )
+            return {
+                "enabled": True,
+                "source": "error-fail-open",
+                "nodes": [],
+                "volumes": volumes,
+                "reason": str(exc),
+            }
+
+        return {
+            "enabled": True,
+            "source": "discovered",
+            "nodes": sorted(nodes),
+            "volumes": volumes,
+            "reason": "qBittorrent affected nodes discovered",
+        }
+
+
 class RpiCoolingStateStore:
     def __init__(self, path):
         self.path = path
@@ -882,6 +1077,7 @@ class RpiThermalCoolingManager:
         self.kubernetes = KubernetesNodeClient()
         self.longhorn_replicas = LonghornReplicaSafetyCheck(self.kubernetes)
         self.batch_work = BatchWorkSuspender(self.kubernetes)
+        self.qbt_topology = QbtThermalTopology(self.kubernetes)
 
     def shutdown_url(self, node_name):
         return self.shutdown_urls.get(node_name) or self.shutdown_url_template.format(node=node_name)
@@ -998,6 +1194,19 @@ class RpiThermalCoolingManager:
             return THERMAL_ACTION_THROTTLE, throttle_candidate
         return THERMAL_ACTION_CLEAR, None
 
+    def qbt_action_for_candidate(self, action, candidate):
+        if action not in {THERMAL_ACTION_THROTTLE, THERMAL_ACTION_PAUSE} or not candidate:
+            return "", {}
+        topology = self.qbt_topology.affected_nodes()
+        if topology.get("source") == "disabled":
+            return action, topology
+        affected_nodes = set(topology.get("nodes") or [])
+        if topology.get("source") == "error-fail-closed":
+            affected_nodes = set(self.nodes)
+        if candidate.get("node") in affected_nodes:
+            return action, topology
+        return "", topology
+
     def all_temperatures_below_resume(self, temperatures):
         for readings in temperatures.values():
             cpu_temp = readings.get("cpu")
@@ -1025,6 +1234,9 @@ class RpiThermalCoolingManager:
     def thermal_state_from_candidate(self, action, candidate, now):
         state = self.cooling_state_from_candidate(candidate, now, action)
         state["thermal_action"] = action
+        qbt_action, topology = self.qbt_action_for_candidate(action, candidate)
+        state["qbt_action"] = qbt_action
+        state["qbt_topology"] = topology
         state["last_active_at"] = format_utc(now)
         state["shutdown_eligible_after"] = format_utc(now + timedelta(seconds=self.last_resort_min_active_seconds))
         return state
@@ -1114,6 +1326,9 @@ class RpiThermalCoolingManager:
                 active["temperature_kind"] = candidate["kind"]
                 active["temperature_celsius"] = candidate["temperature"]
                 active["threshold_celsius"] = candidate["threshold"]
+                qbt_action, topology = self.qbt_action_for_candidate(action, candidate)
+                active["qbt_action"] = qbt_action
+                active["qbt_topology"] = topology
             self.state.save(active)
 
         if (
@@ -2023,8 +2238,15 @@ def rpi_cooling_stop_reason(rpi_cooling_state):
 def rpi_cooling_qbt_action(rpi_cooling_state):
     if not rpi_cooling_state or not rpi_cooling_state.get("enabled", True):
         return ""
-    action = rpi_cooling_state.get("action")
+    qbt_action = rpi_cooling_state.get("qbt_action")
     active = rpi_cooling_state.get("active") or {}
+    if not qbt_action:
+        qbt_action = active.get("qbt_action")
+    if qbt_action in {THERMAL_ACTION_THROTTLE, THERMAL_ACTION_PAUSE}:
+        return qbt_action
+    if qbt_action == "":
+        return ""
+    action = rpi_cooling_state.get("action")
     phase = active.get("phase")
     if action in {THERMAL_ACTION_THROTTLE, THERMAL_ACTION_PAUSE}:
         return action
