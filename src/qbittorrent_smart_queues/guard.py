@@ -784,6 +784,9 @@ class RpiThermalCoolingManager:
         self.drain_enabled = env_bool("QBT_RPI_COOLING_DRAIN_ENABLED", True)
         self.drain_timeout_seconds = env_int("QBT_RPI_COOLING_DRAIN_TIMEOUT_SECONDS", 300)
         self.drain_grace_period_seconds = env_int("QBT_RPI_COOLING_DRAIN_POD_GRACE_PERIOD_SECONDS", 30)
+        self.drain_ignore_namespaces = set(
+            split_lines_or_csv(os.environ.get("QBT_RPI_COOLING_DRAIN_IGNORE_NAMESPACES"))
+        )
         self.require_all_ready = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_NODES_READY", True)
         self.require_all_temperatures = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_TEMPERATURES", True)
         self.shutdown_urls = split_key_value_lines(os.environ.get("QBT_RPI_COOLING_SHUTDOWN_URLS"))
@@ -906,8 +909,11 @@ class RpiThermalCoolingManager:
     def pod_is_drain_ignored(self, pod, node_name):
         metadata = pod.get("metadata") or {}
         status = pod.get("status") or {}
+        namespace = metadata.get("namespace") or "default"
         labels = metadata.get("labels") or {}
         annotations = metadata.get("annotations") or {}
+        if namespace in self.drain_ignore_namespaces:
+            return True
         if status.get("phase") in {"Succeeded", "Failed"}:
             return True
         if annotations.get("kubernetes.io/config.mirror"):

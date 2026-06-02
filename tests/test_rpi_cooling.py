@@ -51,6 +51,7 @@ class RpiCoolingTests(unittest.TestCase):
             "QBT_RPI_COOLING_DRAIN_ENABLED": "true",
             "QBT_RPI_COOLING_DRAIN_TIMEOUT_SECONDS": "300",
             "QBT_RPI_COOLING_DRAIN_POD_GRACE_PERIOD_SECONDS": "15",
+            "QBT_RPI_COOLING_DRAIN_IGNORE_NAMESPACES": "kube-system,longhorn-system",
         }
         with mock.patch.dict("os.environ", env, clear=True):
             return self.guard.RpiThermalCoolingManager()
@@ -182,6 +183,43 @@ class RpiCoolingTests(unittest.TestCase):
             self.assertEqual("draining", state["phase"])
             self.assertEqual(["media/sonarr-123"], state["last_drain"]["pending_pods"])
             self.assertIn("media/rpi-shutdown-k8s-rpi2-123", state["last_drain"]["ignored_pods"])
+
+    def test_drain_ignores_configured_namespaces(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager_with_drain(state_path)
+            manager.kubernetes.set_node_unschedulable = mock.Mock()
+            manager.kubernetes.list_pods_on_node = mock.Mock(
+                return_value=[
+                    {
+                        "metadata": {
+                            "namespace": "longhorn-system",
+                            "name": "instance-manager",
+                            "labels": {},
+                        },
+                        "status": {"phase": "Running"},
+                    },
+                    {
+                        "metadata": {
+                            "namespace": "kube-system",
+                            "name": "cilium",
+                            "labels": {},
+                        },
+                        "status": {"phase": "Running"},
+                    },
+                ]
+            )
+            manager.kubernetes.evict_pod = mock.Mock()
+
+            result = manager.drain_node("k8s-rpi2")
+
+            self.assertTrue(result["drained"])
+            self.assertEqual([], result["pending_pods"])
+            self.assertEqual(
+                ["longhorn-system/instance-manager", "kube-system/cilium"],
+                result["ignored_pods"],
+            )
+            manager.kubernetes.evict_pod.assert_not_called()
 
     def test_existing_drain_requests_shutdown_once_pods_are_gone(self):
         with tempfile.TemporaryDirectory() as tmpdir:
