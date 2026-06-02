@@ -879,6 +879,7 @@ class QbtThermalTopology:
             "QBT_RPI_COOLING_QBT_SELECTOR",
             "app.kubernetes.io/instance=qbittorrent,app.kubernetes.io/name=qbittorrent",
         ).strip()
+        self.volume_claims = set(split_lines_or_csv(os.environ.get("QBT_RPI_COOLING_QBT_VOLUME_CLAIMS")))
         self.longhorn_namespace = os.environ.get(
             "QBT_RPI_COOLING_LONGHORN_NAMESPACE",
             "longhorn-system",
@@ -911,6 +912,8 @@ class QbtThermalTopology:
             for pod in pods:
                 add_nonempty_node(nodes, (pod.get("spec") or {}).get("nodeName"))
                 for claim_name in pod_pvc_names(pod):
+                    if self.volume_claims and claim_name not in self.volume_claims:
+                        continue
                     pvc = self.kubernetes.fetch_pvc(self.namespace, claim_name)
                     volume_name = (pvc.get("spec") or {}).get("volumeName")
                     if not volume_name:

@@ -277,6 +277,7 @@ class RpiCoolingTests(unittest.TestCase):
                     "QBT_RPI_COOLING_CPU_PAUSE_CELSIUS": "80",
                     "QBT_RPI_COOLING_NVME_PAUSE_CELSIUS": "76",
                     "QBT_RPI_COOLING_QBT_TOPOLOGY_ENABLED": "true",
+                    "QBT_RPI_COOLING_QBT_VOLUME_CLAIMS": "media-downloads",
                 },
             )
             manager.kubernetes.ready_map = mock.Mock(
@@ -294,6 +295,7 @@ class RpiCoolingTests(unittest.TestCase):
                         "spec": {
                             "nodeName": "k8s-rpi3",
                             "volumes": [
+                                {"name": "config", "persistentVolumeClaim": {"claimName": "qbittorrent-config"}},
                                 {"name": "downloads", "persistentVolumeClaim": {"claimName": "media-downloads"}}
                             ],
                         }
@@ -341,6 +343,7 @@ class RpiCoolingTests(unittest.TestCase):
                 ["k8s-rpi1", "k8s-rpi2", "k8s-rpi3"],
                 result["active"]["qbt_topology"]["nodes"],
             )
+            manager.kubernetes.fetch_pvc.assert_called_once_with("media", "media-downloads")
 
     def test_qbittorrent_topology_failure_fails_open_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
