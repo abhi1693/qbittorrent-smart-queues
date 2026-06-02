@@ -697,6 +697,25 @@ def parse_namespaced_names(value):
     return targets
 
 
+def batch_work_target_key(namespace, name):
+    return f"{namespace}/{name}"
+
+
+def normalize_batch_work_original_suspensions(original_suspensions):
+    restored = {}
+    if not isinstance(original_suspensions, list):
+        return restored
+    for item in original_suspensions:
+        if not isinstance(item, dict):
+            continue
+        namespace = str(item.get("namespace") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not namespace or not name:
+            continue
+        restored[batch_work_target_key(namespace, name)] = bool(item.get("suspend", False))
+    return restored
+
+
 class BatchWorkSuspender:
     def __init__(self, kubernetes):
         self.enabled = env_bool("QBT_RPI_COOLING_BATCH_SUSPEND_ENABLED", False)
@@ -704,20 +723,51 @@ class BatchWorkSuspender:
         self.fail_closed = env_bool("QBT_RPI_COOLING_BATCH_SUSPEND_FAIL_CLOSED", False)
         self.kubernetes = kubernetes
 
-    def reconcile(self, suspended):
+    def current_suspensions(self):
+        if not self.enabled:
+            return {"enabled": False, "suspensions": [], "errors": []}
+        suspensions = []
+        errors = []
+        for namespace, name in self.targets:
+            try:
+                cronjob = self.kubernetes.fetch_cronjob(namespace, name)
+                spec = cronjob.get("spec") or {}
+                suspensions.append({
+                    "namespace": namespace,
+                    "name": name,
+                    "suspend": bool(spec.get("suspend", False)),
+                })
+            except ApiError as exc:
+                error = {"namespace": namespace, "name": name, "error": str(exc)}
+                errors.append(error)
+                log_warning(
+                    "Failed to read original thermal batch-work suspension",
+                    namespace=namespace,
+                    name=name,
+                    error=str(exc),
+                )
+        if errors and self.fail_closed:
+            raise ApiError(f"failed to read original thermal batch-work suspension for {len(errors)} CronJob(s)")
+        return {"enabled": True, "suspensions": suspensions, "errors": errors}
+
+    def reconcile(self, suspended, original_suspensions=None):
         if not self.enabled:
             return {"enabled": False, "changed": [], "errors": []}
         changed = []
         errors = []
+        restored = normalize_batch_work_original_suspensions(original_suspensions)
         for namespace, name in self.targets:
+            desired_suspended = bool(suspended)
+            if not suspended:
+                desired_suspended = restored.get(batch_work_target_key(namespace, name), False)
             try:
-                if self.kubernetes.set_cronjob_suspended(namespace, name, suspended):
-                    changed.append({"namespace": namespace, "name": name, "suspend": bool(suspended)})
+                if self.kubernetes.set_cronjob_suspended(namespace, name, desired_suspended):
+                    changed.append({"namespace": namespace, "name": name, "suspend": desired_suspended})
                     log_info(
                         "Updated thermal batch-work suspension",
                         namespace=namespace,
                         name=name,
-                        suspend=bool(suspended),
+                        suspend=desired_suspended,
                     )
             except ApiError as exc:
                 error = {"namespace": namespace, "name": name, "error": str(exc)}
@@ -726,7 +776,7 @@ class BatchWorkSuspender:
                     "Failed to update thermal batch-work suspension",
                     namespace=namespace,
                     name=name,
-                    suspend=bool(suspended),
+                    suspend=desired_suspended,
                     error=str(exc),
                 )
         if errors and self.fail_closed:
@@ -1244,8 +1294,32 @@ class RpiThermalCoolingManager:
         state["shutdown_eligible_after"] = format_utc(now + timedelta(seconds=self.last_resort_min_active_seconds))
         return state
 
-    def reconcile_batch_work(self, suspended):
-        return self.batch_work.reconcile(suspended)
+    def reconcile_batch_work(self, suspended, active_state=None, capture_missing=False):
+        if active_state is None:
+            if suspended:
+                return self.batch_work.reconcile(True)
+            return {
+                "enabled": self.batch_work.enabled,
+                "changed": [],
+                "errors": [],
+                "reason": "no active thermal batch-work state to restore",
+            }
+
+        if (
+            suspended
+            and capture_missing
+            and self.batch_work.enabled
+            and "batch_work_original_suspensions" not in active_state
+        ):
+            snapshot = self.batch_work.current_suspensions()
+            active_state["batch_work_original_suspensions"] = snapshot.get("suspensions", [])
+            active_state["batch_work_original_suspension_errors"] = snapshot.get("errors", [])
+            self.state.save(active_state)
+
+        original_suspensions = active_state.get("batch_work_original_suspensions")
+        if original_suspensions is None:
+            return self.batch_work.reconcile(suspended)
+        return self.batch_work.reconcile(suspended, original_suspensions)
 
     def thermal_state_reconciled(self, active, now, ready):
         node_name = active.get("node")
@@ -1256,11 +1330,11 @@ class RpiThermalCoolingManager:
         temperatures = self.temperature_snapshot()
         action, candidate = self.thermal_action_candidate(temperatures)
         shutdown_candidate = self.hot_candidate(temperatures)
-        batch = self.reconcile_batch_work(True)
 
         if action == THERMAL_ACTION_CLEAR and self.all_temperatures_below_resume(temperatures):
             clear_started_at = parse_utc(active.get("clear_started_at"))
             if clear_started_at is None:
+                batch = self.reconcile_batch_work(True, active)
                 active["clear_started_at"] = format_utc(now)
                 active["temperatures"] = temperatures
                 self.state.save(active)
@@ -1281,8 +1355,8 @@ class RpiThermalCoolingManager:
                 }
             clear_elapsed = max(0, int((now - clear_started_at).total_seconds()))
             if clear_elapsed >= self.resume_hold_seconds:
+                batch = self.reconcile_batch_work(False, active)
                 self.state.clear()
-                batch = self.reconcile_batch_work(False)
                 log_info("RPi thermal mitigation cleared after resume hold", elapsed_seconds=clear_elapsed)
                 return {
                     "enabled": True,
@@ -1293,6 +1367,7 @@ class RpiThermalCoolingManager:
                 }
             active["temperatures"] = temperatures
             self.state.save(active)
+            batch = self.reconcile_batch_work(True, active)
             return {
                 "enabled": True,
                 "action": phase,
@@ -1305,6 +1380,7 @@ class RpiThermalCoolingManager:
             }
 
         if candidate:
+            batch = self.reconcile_batch_work(True, active)
             if action != phase:
                 original_started_at = active.get("started_at")
                 active.update(self.thermal_state_from_candidate(action, candidate, now))
@@ -1333,6 +1409,8 @@ class RpiThermalCoolingManager:
                 active["qbt_action"] = qbt_action
                 active["qbt_topology"] = topology
             self.state.save(active)
+        else:
+            batch = self.reconcile_batch_work(True, active)
 
         if (
             shutdown_candidate
@@ -1511,18 +1589,18 @@ class RpiThermalCoolingManager:
         temperatures = self.temperature_snapshot()
         action, candidate = self.thermal_action_candidate(temperatures)
         if not candidate:
-            batch = self.reconcile_batch_work(False)
             return {
                 "enabled": True,
                 "action": THERMAL_ACTION_CLEAR,
                 "temperatures": temperatures,
                 "ready": ready,
-                "batch": batch,
+                "batch": self.reconcile_batch_work(False),
             }
 
-        batch = self.reconcile_batch_work(True)
         state = self.thermal_state_from_candidate(action, candidate, now)
         state["temperatures"] = temperatures
+        self.state.save(state)
+        batch = self.reconcile_batch_work(True, state, capture_missing=True)
         self.state.save(state)
         log_warning(
             "RPi thermal mitigation started",

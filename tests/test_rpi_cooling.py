@@ -30,6 +30,23 @@ class FakeQbtClient:
         return list(self.torrents)
 
 
+class FakeKubernetesCronJobClient:
+    def __init__(self, suspensions):
+        self.suspensions = dict(suspensions)
+        self.patch_calls = []
+
+    def fetch_cronjob(self, namespace, name):
+        return {"spec": {"suspend": self.suspensions[(namespace, name)]}}
+
+    def set_cronjob_suspended(self, namespace, name, suspended):
+        key = (namespace, name)
+        if self.suspensions[key] == bool(suspended):
+            return False
+        self.suspensions[key] = bool(suspended)
+        self.patch_calls.append((namespace, name, bool(suspended)))
+        return True
+
+
 class RpiCoolingTests(unittest.TestCase):
     def setUp(self):
         self.guard = importlib.import_module("qbittorrent_smart_queues.guard")
@@ -216,6 +233,152 @@ class RpiCoolingTests(unittest.TestCase):
             with open(state_path, "r", encoding="utf-8") as state_file:
                 state = json.load(state_file)
             self.assertIn("clear_started_at", state)
+
+    def test_batch_work_restores_original_suspension_values(self):
+        kubernetes = FakeKubernetesCronJobClient({
+            ("media", "active-job"): False,
+            ("media", "pre-suspended-job"): True,
+        })
+        env = {
+            "QBT_RPI_COOLING_BATCH_SUSPEND_ENABLED": "true",
+            "QBT_RPI_COOLING_BATCH_SUSPEND_TARGETS": (
+                "media/active-job,media/pre-suspended-job"
+            ),
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            suspender = self.guard.BatchWorkSuspender(kubernetes)
+
+        original = suspender.current_suspensions()["suspensions"]
+        suspend_result = suspender.reconcile(True, original)
+        restore_result = suspender.reconcile(False, original)
+
+        self.assertEqual(
+            [
+                {"namespace": "media", "name": "active-job", "suspend": False},
+                {"namespace": "media", "name": "pre-suspended-job", "suspend": True},
+            ],
+            original,
+        )
+        self.assertEqual(
+            [{"namespace": "media", "name": "active-job", "suspend": True}],
+            suspend_result["changed"],
+        )
+        self.assertEqual(
+            [{"namespace": "media", "name": "active-job", "suspend": False}],
+            restore_result["changed"],
+        )
+        self.assertEqual(
+            {
+                ("media", "active-job"): False,
+                ("media", "pre-suspended-job"): True,
+            },
+            kubernetes.suspensions,
+        )
+
+    def test_new_mitigation_persists_batch_work_originals_before_suspending(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_BATCH_SUSPEND_ENABLED": "true",
+                    "QBT_RPI_COOLING_BATCH_SUSPEND_TARGETS": "media/pre-suspended-job",
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 72.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 45.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.current_suspensions = mock.Mock(
+                return_value={
+                    "enabled": True,
+                    "suspensions": [
+                        {"namespace": "media", "name": "pre-suspended-job", "suspend": True}
+                    ],
+                    "errors": [],
+                }
+            )
+
+            def assert_state_saved_before_patch(suspended, original_suspensions):
+                self.assertTrue(suspended)
+                self.assertEqual(
+                    [{"namespace": "media", "name": "pre-suspended-job", "suspend": True}],
+                    original_suspensions,
+                )
+                with open(state_path, "r", encoding="utf-8") as state_file:
+                    state = json.load(state_file)
+                self.assertEqual(original_suspensions, state["batch_work_original_suspensions"])
+                return {"enabled": True, "changed": [], "errors": []}
+
+            manager.batch_work.reconcile = mock.Mock(side_effect=assert_state_saved_before_patch)
+
+            result = manager.reconcile()
+
+            self.assertEqual("throttle", result["action"])
+            manager.batch_work.current_suspensions.assert_called_once()
+            manager.batch_work.reconcile.assert_called_once()
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            self.assertEqual(
+                [{"namespace": "media", "name": "pre-suspended-job", "suspend": True}],
+                state["batch_work_original_suspensions"],
+            )
+
+    def test_cleared_mitigation_restores_persisted_batch_work_originals(self):
+        original_suspensions = [
+            {"namespace": "media", "name": "active-job", "suspend": False},
+            {"namespace": "media", "name": "pre-suspended-job", "suspend": True},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(
+                    {
+                        "node": "k8s-rpi2",
+                        "phase": "throttle",
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "clear_started_at": "2026-01-01T00:00:00Z",
+                        "reason": "CPU temperature 72.0C reached threshold 70.0C",
+                        "batch_work_original_suspensions": original_suspensions,
+                    },
+                    state_file,
+                )
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_RESUME_HOLD_SECONDS": "900",
+                    "QBT_RPI_COOLING_BATCH_SUSPEND_ENABLED": "true",
+                    "QBT_RPI_COOLING_BATCH_SUSPEND_TARGETS": (
+                        "media/active-job,media/pre-suspended-job"
+                    ),
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 60.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 45.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(
+                return_value={"enabled": True, "changed": [], "errors": []}
+            )
+
+            result = manager.reconcile()
+
+            self.assertEqual("clear", result["action"])
+            manager.batch_work.reconcile.assert_called_once_with(False, original_suspensions)
+            self.assertFalse(os.path.exists(state_path))
 
     def test_qbittorrent_throttle_action_limits_without_pausing(self):
         client = FakeQbtClient()
