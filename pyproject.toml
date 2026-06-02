@@ -1,6 +1,6 @@
 [project]
 name = "qbittorrent-smart-queues"
-version = "0.1.16"
+version = "0.1.17"
 description = "qBittorrent queue, quota, and health controller"
 requires-python = ">=3.13"
 readme = "README.md"

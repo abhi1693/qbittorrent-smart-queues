@@ -103,8 +103,6 @@ Optional Raspberry Pi cooling coordinator:
 | `QBT_RPI_COOLING_POWER_OFF_URLS` | unset | Newline/comma list of `node=url` endpoints called after the node becomes NotReady. |
 | `QBT_RPI_COOLING_POWER_ON_URLS` | unset | Newline/comma list of `node=url` endpoints called after the cooldown window. |
 | `QBT_RPI_COOLING_STATE_PATH` | `/state/rpi-cooling.json` | Persistent cooling lock file. |
-| `QBT_RPI_COOLING_DRAIN_IGNORE_NAMESPACES` | `cattle-fleet-local-system,cattle-monitoring-system,kube-system,longhorn-system` | Extra namespaces to ignore while draining; defaults are always ignored. |
-| `QBT_RPI_COOLING_DRAIN_ABORT_BACKOFF_SECONDS` | `900` | Backoff after a drain timeout before another shutdown attempt. |
 
 When enabled, the coordinator reads CPU and NVMe temperatures from Prometheus,
 requires every configured node to be Kubernetes `Ready`, and requests clean
@@ -112,9 +110,7 @@ shutdown for only the hottest node over threshold. A persisted lock prevents a
 second node from being shut down while the first node is leaving or rejoining
 the cluster. If power URLs are configured, the lock advances from shutdown to
 cooling to booting and the controller powers the node back on after the cooldown
-window. If a pre-shutdown drain cannot finish before its timeout, the controller
-uncordons the node, records a drain-aborted lock, and backs off before trying
-another shutdown.
+window. The coordinator does not cordon or drain nodes before shutdown.
 
 Logs default to plain text at `INFO` level. Set `QBT_LOG_FORMAT=json` for JSON
 lines and `QBT_LOG_LEVEL=debug` for detailed decision telemetry. Full decision

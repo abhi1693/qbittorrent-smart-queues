@@ -57,12 +57,6 @@ NVME_THERMAL_QUERY = (
     ')'
 )
 RPI_COOLING_DEFAULT_NODES = ["k8s-rpi1", "k8s-rpi2", "k8s-rpi3"]
-RPI_COOLING_DEFAULT_DRAIN_IGNORE_NAMESPACES = {
-    "cattle-fleet-local-system",
-    "cattle-monitoring-system",
-    "kube-system",
-    "longhorn-system",
-}
 RPI_COOLING_CPU_QUERY = (
     'max by (nodename) ('
     'node_hwmon_temp_celsius{chip=~"thermal_thermal_zone.*"} '
@@ -571,17 +565,6 @@ class KubernetesNodeClient:
         except urllib.error.URLError as exc:
             raise ApiError(f"{description} failed: {exc}") from exc
 
-    def set_node_unschedulable(self, node_name, unschedulable):
-        quoted_name = urllib.parse.quote(node_name, safe="")
-        body = json.dumps({"spec": {"unschedulable": bool(unschedulable)}}).encode("utf-8")
-        return self.request_path(
-            "PATCH",
-            f"/api/v1/nodes/{quoted_name}",
-            f"Kubernetes node {node_name} cordon",
-            headers={"Content-Type": "application/merge-patch+json"},
-            body=body,
-        )
-
     def node_ready(self, node_name):
         node = self.fetch_node(node_name)
         for condition in node.get("status", {}).get("conditions", []):
@@ -598,35 +581,6 @@ class KubernetesNodeClient:
             f"/apis/longhorn.io/v1beta2/namespaces/{quoted_namespace}/replicas",
             f"Longhorn replicas in namespace {namespace}",
         ).get("items", [])
-
-    def list_pods_on_node(self, node_name):
-        query = urllib.parse.urlencode({"fieldSelector": f"spec.nodeName={node_name}"})
-        return self.fetch_path(
-            f"/api/v1/pods?{query}",
-            f"Kubernetes pods on node {node_name}",
-        ).get("items", [])
-
-    def evict_pod(self, namespace, pod_name, grace_period_seconds):
-        quoted_namespace = urllib.parse.quote(namespace, safe="")
-        quoted_name = urllib.parse.quote(pod_name, safe="")
-        body = {
-            "apiVersion": "policy/v1",
-            "kind": "Eviction",
-            "metadata": {
-                "namespace": namespace,
-                "name": pod_name,
-            },
-            "deleteOptions": {
-                "gracePeriodSeconds": max(0, int(grace_period_seconds)),
-            },
-        }
-        return self.request_path(
-            "POST",
-            f"/api/v1/namespaces/{quoted_namespace}/pods/{quoted_name}/eviction",
-            f"Kubernetes pod {namespace}/{pod_name} eviction",
-            headers={"Content-Type": "application/json"},
-            body=json.dumps(body).encode("utf-8"),
-        )
 
 
 class LonghornReplicaSafetyCheck:
@@ -787,14 +741,6 @@ class RpiThermalCoolingManager:
         self.timeout = env_int("QBT_RPI_COOLING_PROMETHEUS_TIMEOUT", 5)
         self.shutdown_timeout_seconds = env_int("QBT_RPI_COOLING_SHUTDOWN_TIMEOUT_SECONDS", 300)
         self.cooldown_seconds = env_int("QBT_RPI_COOLING_COOLDOWN_SECONDS", 1200)
-        self.drain_enabled = env_bool("QBT_RPI_COOLING_DRAIN_ENABLED", True)
-        self.drain_timeout_seconds = env_int("QBT_RPI_COOLING_DRAIN_TIMEOUT_SECONDS", 300)
-        self.drain_abort_backoff_seconds = env_int("QBT_RPI_COOLING_DRAIN_ABORT_BACKOFF_SECONDS", 900)
-        self.drain_grace_period_seconds = env_int("QBT_RPI_COOLING_DRAIN_POD_GRACE_PERIOD_SECONDS", 30)
-        self.drain_ignore_namespaces = set(RPI_COOLING_DEFAULT_DRAIN_IGNORE_NAMESPACES)
-        self.drain_ignore_namespaces.update(
-            split_lines_or_csv(os.environ.get("QBT_RPI_COOLING_DRAIN_IGNORE_NAMESPACES"))
-        )
         self.require_all_ready = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_NODES_READY", True)
         self.require_all_temperatures = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_TEMPERATURES", True)
         self.shutdown_urls = split_key_value_lines(os.environ.get("QBT_RPI_COOLING_SHUTDOWN_URLS"))
@@ -908,66 +854,6 @@ class RpiThermalCoolingManager:
             "threshold": self.cpu_threshold if kind == "CPU" else self.nvme_threshold,
         }
 
-    def pod_ref(self, pod):
-        metadata = pod.get("metadata") or {}
-        namespace = metadata.get("namespace") or "default"
-        name = metadata.get("name") or ""
-        return f"{namespace}/{name}"
-
-    def pod_is_drain_ignored(self, pod, node_name):
-        metadata = pod.get("metadata") or {}
-        status = pod.get("status") or {}
-        namespace = metadata.get("namespace") or "default"
-        labels = metadata.get("labels") or {}
-        annotations = metadata.get("annotations") or {}
-        if namespace in self.drain_ignore_namespaces:
-            return True
-        if status.get("phase") in {"Succeeded", "Failed"}:
-            return True
-        if annotations.get("kubernetes.io/config.mirror"):
-            return True
-        for owner in metadata.get("ownerReferences") or []:
-            if owner.get("kind") == "DaemonSet":
-                return True
-        return (
-            labels.get("app.kubernetes.io/name") == "rpi-shutdown-controller"
-            and labels.get("app.kubernetes.io/instance") == node_name
-        )
-
-    def drain_node(self, node_name):
-        self.kubernetes.set_node_unschedulable(node_name, True)
-        pods = self.kubernetes.list_pods_on_node(node_name)
-        pending = []
-        evicted = []
-        ignored = []
-        blocked = []
-        for pod in pods:
-            metadata = pod.get("metadata") or {}
-            pod_name = metadata.get("name") or ""
-            namespace = metadata.get("namespace") or "default"
-            ref = self.pod_ref(pod)
-            if self.pod_is_drain_ignored(pod, node_name):
-                ignored.append(ref)
-                continue
-            pending.append(ref)
-            if metadata.get("deletionTimestamp"):
-                continue
-            try:
-                self.kubernetes.evict_pod(namespace, pod_name, self.drain_grace_period_seconds)
-                evicted.append(ref)
-            except ApiError as exc:
-                blocked.append({"pod": ref, "reason": str(exc)})
-                log_warning("RPi cooling pod eviction failed during node drain", node=node_name, pod=ref, reason=str(exc))
-        return {
-            "enabled": True,
-            "node": node_name,
-            "drained": not pending,
-            "pending_pods": pending,
-            "evicted_pods": evicted,
-            "ignored_pods": ignored,
-            "blocked_pods": blocked,
-        }
-
     def cooling_state_from_candidate(self, candidate, now, phase):
         return {
             "node": candidate["node"],
@@ -981,35 +867,6 @@ class RpiThermalCoolingManager:
             "temperature_celsius": candidate["temperature"],
             "threshold_celsius": candidate["threshold"],
         }
-
-    def uncordon_ready_node(self, node_name):
-        self.kubernetes.set_node_unschedulable(node_name, False)
-        log_info("RPi cooling node uncordoned after returning Ready", node=node_name)
-
-    def abort_drain(self, active, now, drain, elapsed_seconds):
-        node_name = active["node"]
-        try:
-            self.kubernetes.set_node_unschedulable(node_name, False)
-            active["uncordoned_after_drain_abort"] = True
-        except ApiError as exc:
-            active["uncordoned_after_drain_abort"] = False
-            active["uncordon_error"] = str(exc)
-            log_warning("RPi cooling drain abort could not uncordon node", node=node_name, reason=str(exc))
-        active["phase"] = "drain_aborted"
-        active["last_drain"] = drain
-        active["drain_aborted_at"] = format_utc(now)
-        active["drain_backoff_until"] = format_utc(
-            now + timedelta(seconds=max(0, self.drain_abort_backoff_seconds))
-        )
-        self.state.save(active)
-        log_warning(
-            "RPi cooling drain timed out; node uncordoned and shutdown backed off",
-            node=node_name,
-            elapsed_seconds=elapsed_seconds,
-            timeout_seconds=self.drain_timeout_seconds,
-            backoff_seconds=self.drain_abort_backoff_seconds,
-            pending_pods=drain.get("pending_pods", []),
-        )
 
     def active_state_reconciled(self, now, ready):
         active = self.state.load()
@@ -1025,54 +882,14 @@ class RpiThermalCoolingManager:
         started_at = parse_utc(active.get("started_at")) or now
         elapsed_seconds = max(0, int((now - started_at).total_seconds()))
 
-        if phase == "draining":
-            if node_ready is not True:
-                log_warning("RPi cooling drain paused because candidate is not Ready", node=node_name)
-                return True
-            drain = self.drain_node(node_name)
-            active["last_drain"] = drain
-            active["last_drain_at"] = format_utc(now)
-            if drain.get("drained"):
-                candidate = {
-                    "node": node_name,
-                    "kind": active.get("temperature_kind") or "temperature",
-                    "temperature": active.get("temperature_celsius") or 0,
-                    "threshold": active.get("threshold_celsius") or 0,
-                }
-                self.request_shutdown(candidate, now, existing_state=active)
-            else:
-                if elapsed_seconds >= self.drain_timeout_seconds:
-                    self.abort_drain(active, now, drain, elapsed_seconds)
-                else:
-                    self.state.save(active)
-                    log_info(
-                        "RPi cooling drain pending before shutdown",
-                        node=node_name,
-                        pending_pods=drain.get("pending_pods", []),
-                        evicted_pods=drain.get("evicted_pods", []),
-                    )
-            return True
-
-        if phase == "drain_aborted":
-            backoff_until = parse_utc(active.get("drain_backoff_until")) or started_at
-            if node_ready is True and not active.get("uncordoned_after_drain_abort"):
-                try:
-                    self.kubernetes.set_node_unschedulable(node_name, False)
-                    active["uncordoned_after_drain_abort"] = True
-                    self.state.save(active)
-                except ApiError as exc:
-                    log_warning("RPi cooling drain abort could not uncordon node", node=node_name, reason=str(exc))
-            if now < backoff_until:
-                remaining_seconds = max(0, int((backoff_until - now).total_seconds()))
-                log_warning(
-                    "RPi cooling drain abort backoff active",
-                    node=node_name,
-                    remaining_seconds=remaining_seconds,
-                )
-                return True
-            log_warning("RPi cooling drain abort backoff elapsed; lock released", node=node_name)
+        if phase in {"draining", "drain_aborted"}:
+            log_warning(
+                "Clearing legacy RPi cooling drain state; drain is disabled",
+                node=node_name,
+                phase=phase,
+            )
             self.state.clear()
-            return False
+            return True
 
         if phase == "shutdown_requested":
             if node_ready is False:
@@ -1097,7 +914,6 @@ class RpiThermalCoolingManager:
 
         if phase == "cooling":
             if node_ready is True:
-                self.uncordon_ready_node(node_name)
                 self.state.clear()
                 log_info("RPi cooling completed; node is Ready and lock is released", node=node_name)
             else:
@@ -1118,7 +934,6 @@ class RpiThermalCoolingManager:
 
         if phase == "booting":
             if node_ready is True:
-                self.uncordon_ready_node(node_name)
                 self.state.clear()
                 log_info("RPi cooling completed; node is Ready and lock is released", node=node_name)
             else:
@@ -1154,45 +969,6 @@ class RpiThermalCoolingManager:
             temperature_celsius=round(candidate["temperature"], 1),
             threshold_celsius=round(candidate["threshold"], 1),
         )
-
-    def request_drain_or_shutdown(self, candidate, now):
-        if not self.drain_enabled:
-            self.request_shutdown(candidate, now)
-            return {
-                "enabled": True,
-                "action": "shutdown_requested",
-                "candidate": candidate,
-                "drain": {"enabled": False, "drained": True, "reason": "drain disabled"},
-            }
-
-        state = self.cooling_state_from_candidate(candidate, now, "draining")
-        state["drain_started_at"] = format_utc(now)
-        self.state.save(state)
-        drain = self.drain_node(candidate["node"])
-        state["last_drain"] = drain
-        state["last_drain_at"] = format_utc(now)
-        if drain.get("drained"):
-            self.request_shutdown(candidate, now, existing_state=state)
-            return {
-                "enabled": True,
-                "action": "shutdown_requested",
-                "candidate": candidate,
-                "drain": drain,
-            }
-
-        self.state.save(state)
-        log_info(
-            "RPi cooling drain started before shutdown",
-            node=candidate["node"],
-            pending_pods=drain.get("pending_pods", []),
-            evicted_pods=drain.get("evicted_pods", []),
-        )
-        return {
-            "enabled": True,
-            "action": "drain_requested",
-            "candidate": candidate,
-            "drain": drain,
-        }
 
     def reconcile(self):
         if not self.enabled:
@@ -1253,10 +1029,14 @@ class RpiThermalCoolingManager:
                 "longhorn": longhorn_safety,
             }
 
-        result = self.request_drain_or_shutdown(candidate, now)
-        result["ready"] = ready
-        result["longhorn"] = longhorn_safety
-        return result
+        self.request_shutdown(candidate, now)
+        return {
+            "enabled": True,
+            "action": "shutdown_requested",
+            "candidate": candidate,
+            "ready": ready,
+            "longhorn": longhorn_safety,
+        }
 
 
 class DownloadStorageGuard:
@@ -1756,12 +1536,6 @@ def rpi_cooling_stop_reason(rpi_cooling_state):
     if rpi_cooling_state.get("action") == "error":
         reason = rpi_cooling_state.get("reason") or "unknown error"
         return f"RPi thermal cooling check failed: {reason}"
-    if rpi_cooling_state.get("action") == "drain_requested" and node_name:
-        return f"RPi thermal cooling drain requested for {node_name}"
-    if rpi_cooling_state.get("action") == "active" and active.get("phase") == "draining" and node_name:
-        return f"RPi thermal cooling drain active for {node_name}"
-    if rpi_cooling_state.get("action") == "active" and active.get("phase") == "drain_aborted" and node_name:
-        return f"RPi thermal cooling drain backed off for {node_name}"
     if rpi_cooling_state.get("action") == "active" and active.get("phase") in {"shutdown_requested", "cooling", "booting"} and node_name:
         return f"RPi thermal cooling active for {node_name}"
     if rpi_cooling_state.get("action") == "shutdown_requested" and node_name:
