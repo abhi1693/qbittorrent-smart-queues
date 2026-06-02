@@ -1486,6 +1486,35 @@ def apply_full_guard_thermal_stop(clients, thermal_state=None, decision_context=
     return True
 
 
+def rpi_cooling_stop_reason(rpi_cooling_state):
+    if not rpi_cooling_state or not rpi_cooling_state.get("enabled", True):
+        return ""
+    candidate = rpi_cooling_state.get("candidate") or {}
+    node_name = candidate.get("node")
+    longhorn = rpi_cooling_state.get("longhorn") or {}
+    if longhorn and not longhorn.get("safe", True):
+        reason = longhorn.get("reason") or rpi_cooling_state.get("reason") or "Longhorn replica safety check failed"
+        if node_name:
+            return f"RPi thermal cooling blocked for {node_name}: {reason}"
+        return f"RPi thermal cooling blocked: {reason}"
+    if rpi_cooling_state.get("action") == "shutdown_requested" and node_name:
+        return f"RPi thermal cooling shutdown requested for {node_name}"
+    return ""
+
+
+def apply_rpi_cooling_stop(clients, rpi_cooling_state, decision_context=None):
+    if not clients:
+        return False
+    reason = rpi_cooling_stop_reason(rpi_cooling_state)
+    if not reason:
+        return False
+    context = dict(decision_context or {})
+    context["rpi_cooling"] = rpi_cooling_state
+    apply_stop_limits(clients, reason, pause_torrents=True, decision_context=context)
+    cleanup_qbt_clients(clients)
+    return True
+
+
 def apply_rpi_thermal_cooling():
     try:
         return RpiThermalCoolingManager().reconcile()
@@ -4199,6 +4228,8 @@ def run_once():
             "thermal": thermal_decision_summary(thermal_state),
             "rpi_cooling": rpi_cooling_state,
         }
+        if apply_rpi_cooling_stop(clients, rpi_cooling_state, fallback_context):
+            return 0
         if apply_full_guard_thermal_stop(clients, thermal_state, fallback_context):
             return 0
         apply_single_download(
@@ -4261,6 +4292,9 @@ def run_once():
         "thermal": thermal_decision_summary(thermal_state),
         "rpi_cooling": rpi_cooling_state,
     }
+
+    if apply_rpi_cooling_stop(clients, rpi_cooling_state, base_decision_context):
+        return 0
 
     if apply_full_guard_thermal_stop(clients, thermal_state, base_decision_context):
         return 0

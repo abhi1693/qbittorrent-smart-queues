@@ -174,6 +174,36 @@ class RpiCoolingTests(unittest.TestCase):
             request_json.assert_not_called()
             self.assertFalse(os.path.exists(state_path))
 
+    def test_longhorn_blocked_cooling_requests_download_stop(self):
+        reason = self.guard.rpi_cooling_stop_reason(
+            {
+                "enabled": True,
+                "action": "skipped",
+                "candidate": {"node": "k8s-rpi2"},
+                "longhorn": {
+                    "safe": False,
+                    "reason": "node hosts sole active Longhorn replica(s): media-downloads",
+                },
+            }
+        )
+
+        self.assertEqual(
+            "RPi thermal cooling blocked for k8s-rpi2: "
+            "node hosts sole active Longhorn replica(s): media-downloads",
+            reason,
+        )
+
+    def test_shutdown_requested_cooling_requests_download_stop(self):
+        reason = self.guard.rpi_cooling_stop_reason(
+            {
+                "enabled": True,
+                "action": "shutdown_requested",
+                "candidate": {"node": "k8s-rpi2"},
+            }
+        )
+
+        self.assertEqual("RPi thermal cooling shutdown requested for k8s-rpi2", reason)
+
     def test_shutdown_allows_candidate_when_longhorn_replica_has_peer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "rpi-cooling.json")
