@@ -78,6 +78,8 @@ KUBERNETES_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 THERMAL_ACTION_CLEAR = "clear"
 THERMAL_ACTION_THROTTLE = "throttle"
 THERMAL_ACTION_PAUSE = "pause"
+_DECISION_SUMMARY_REPEAT_STATE = {}
+_DECISION_SUMMARY_REPEAT_LOCK = threading.Lock()
 
 
 class ApiError(RuntimeError):
@@ -366,7 +368,30 @@ def emit_decision_log(event, **fields):
     )
 
 
-def log_decision_info(action, message, **fields):
+def decision_summary_repeat_seconds():
+    return max(0, env_int("QBT_DECISION_SUMMARY_REPEAT_SECONDS", 900))
+
+
+def log_decision_info(action, message, summary_key=None, repeat_seconds=None, **fields):
+    if summary_key is not None:
+        if repeat_seconds is None:
+            repeat_seconds = decision_summary_repeat_seconds()
+        now = time.monotonic()
+        with _DECISION_SUMMARY_REPEAT_LOCK:
+            state = _DECISION_SUMMARY_REPEAT_STATE.get(summary_key)
+            if repeat_seconds > 0 and state is not None:
+                elapsed = now - state["last_logged_at"]
+                if elapsed < repeat_seconds:
+                    state["suppressed_count"] += 1
+                    return
+            suppressed_count = state["suppressed_count"] if state else 0
+            _DECISION_SUMMARY_REPEAT_STATE[summary_key] = {
+                "last_logged_at": now,
+                "suppressed_count": 0,
+            }
+        if suppressed_count:
+            fields = dict(fields)
+            fields["suppressed_decision_log_count"] = suppressed_count
     emit_log(
         "info",
         message,
@@ -1786,14 +1811,44 @@ def apply_fail_closed():
     return True
 
 
+def qbt_limit_decision_summary_key(action, pause_torrents, download_limit, upload_limit, decision_context):
+    context = decision_context or {}
+    rpi_cooling_state = context.get("rpi_cooling") or {}
+    rpi_action = rpi_cooling_qbt_action(rpi_cooling_state)
+    if not rpi_action:
+        return None
+    candidate = rpi_cooling_state.get("candidate") or {}
+    active = rpi_cooling_state.get("active") or {}
+    node_name = candidate.get("node") or active.get("node") or ""
+    phase = active.get("phase") or rpi_cooling_state.get("action") or ""
+    return (
+        "rpi_cooling_qbt_limits",
+        action,
+        rpi_action,
+        phase,
+        node_name,
+        bool(pause_torrents),
+        int_or_none(download_limit),
+        int_or_none(upload_limit),
+    )
+
+
 def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_limit, decision_context=None):
+    action = "pause_all" if pause_torrents else "throttle"
+    summary_key = qbt_limit_decision_summary_key(
+        action,
+        pause_torrents,
+        download_limit,
+        upload_limit,
+        decision_context,
+    )
     for client in clients:
         client.set_download_limit(download_limit)
         client.set_upload_limit(upload_limit)
         emit_decision_log(
             "qbt_guard_stop",
             **decision_base_context(decision_context, client),
-            action="pause_all" if pause_torrents else "throttle",
+            action=action,
             reason=reason,
             effective_cap={
                 "download_limit_bytes_per_sec": download_limit,
@@ -1802,12 +1857,18 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
         )
         if pause_torrents:
             client.stop_all()
-            log_decision_info("pause_all", f"Paused all torrents; {reason}", reason=reason)
+            log_decision_info(
+                "pause_all",
+                f"Paused all torrents; {reason}",
+                summary_key=summary_key,
+                reason=reason,
+            )
         else:
             log_decision_info(
                 "throttle",
                 f"Throttled qBittorrent to {human_rate(download_limit)} down "
                 f"and {human_rate(upload_limit)} up; {reason}",
+                summary_key=summary_key,
                 reason=reason,
             )
 

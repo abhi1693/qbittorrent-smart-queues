@@ -9,6 +9,7 @@ from unittest import mock
 class LoggingTests(unittest.TestCase):
     def setUp(self):
         self.guard = importlib.import_module("qbittorrent_smart_queues.guard")
+        self.guard._DECISION_SUMMARY_REPEAT_STATE.clear()
 
     def test_default_log_format_is_plain_text_at_info_level(self):
         stdout = io.StringIO()
@@ -90,6 +91,58 @@ class LoggingTests(unittest.TestCase):
             self.guard.emit_decision_log("qbt_guard_decision", action="hidden")
 
         self.assertEqual("", stdout.getvalue())
+
+    def test_repeated_decision_summary_is_suppressed_until_repeat_window(self):
+        stdout = io.StringIO()
+        env = {"QBT_LOG_FORMAT": "json", "QBT_DECISION_SUMMARY_REPEAT_SECONDS": "60"}
+
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(self.guard.time, "monotonic", side_effect=[100.0, 130.0, 161.0]), \
+                contextlib.redirect_stdout(stdout):
+            self.guard.log_decision_info(
+                "throttle",
+                "Throttled qBittorrent; first reason",
+                summary_key=("rpi", "throttle", "k8s-rpi2"),
+                reason="first reason",
+            )
+            self.guard.log_decision_info(
+                "throttle",
+                "Throttled qBittorrent; second reason",
+                summary_key=("rpi", "throttle", "k8s-rpi2"),
+                reason="second reason",
+            )
+            self.guard.log_decision_info(
+                "throttle",
+                "Throttled qBittorrent; latest reason",
+                summary_key=("rpi", "throttle", "k8s-rpi2"),
+                reason="latest reason",
+            )
+
+        records = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(2, len(records))
+        self.assertEqual("first reason", records[0]["reason"])
+        self.assertEqual("latest reason", records[1]["reason"])
+        self.assertEqual(1, records[1]["suppressed_decision_log_count"])
+
+    def test_decision_summary_repeat_window_can_be_disabled(self):
+        stdout = io.StringIO()
+        env = {"QBT_LOG_FORMAT": "json", "QBT_DECISION_SUMMARY_REPEAT_SECONDS": "0"}
+
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(self.guard.time, "monotonic", side_effect=[100.0, 101.0]), \
+                contextlib.redirect_stdout(stdout):
+            self.guard.log_decision_info(
+                "throttle",
+                "first",
+                summary_key=("same",),
+            )
+            self.guard.log_decision_info(
+                "throttle",
+                "second",
+                summary_key=("same",),
+            )
+
+        self.assertEqual(2, len(stdout.getvalue().splitlines()))
 
 
 if __name__ == "__main__":

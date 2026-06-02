@@ -130,9 +130,12 @@ the cooldown window. The coordinator does not cordon or drain nodes before
 shutdown.
 
 Logs default to plain text at `INFO` level. Set `QBT_LOG_FORMAT=json` for JSON
-lines and `QBT_LOG_LEVEL=debug` for detailed decision telemetry. Full decision
-payloads are emitted at `DEBUG` by default; set `QBT_DECISION_LOG_LEVEL=info`
-while tuning, or `QBT_DECISION_LOGS_ENABLED=false` to disable them.
+lines and `QBT_LOG_LEVEL=debug` for detailed decision telemetry. Repeated
+critical decision summaries for unchanged actions are emitted every
+`QBT_DECISION_SUMMARY_REPEAT_SECONDS` seconds, defaulting to `900`; set it to
+`0` to emit every loop. Full decision payloads are emitted at `DEBUG` by
+default; set `QBT_DECISION_LOG_LEVEL=info` while tuning, or
+`QBT_DECISION_LOGS_ENABLED=false` to disable them.
 
 ## Local Checks
 
