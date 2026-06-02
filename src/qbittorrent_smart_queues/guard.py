@@ -535,10 +535,13 @@ class KubernetesNodeClient:
             return token_file.read().strip()
 
     def fetch_node(self, node_name):
+        quoted_name = urllib.parse.quote(node_name, safe="")
+        return self.fetch_path(f"/api/v1/nodes/{quoted_name}", f"Kubernetes node {node_name}")
+
+    def fetch_path(self, path, description):
         if not self.api_base:
             raise ApiError("Kubernetes service host is unavailable")
-        quoted_name = urllib.parse.quote(node_name, safe="")
-        request = urllib.request.Request(f"{self.api_base}/api/v1/nodes/{quoted_name}")
+        request = urllib.request.Request(join_url(self.api_base, path))
         request.add_header("Authorization", f"Bearer {self.read_token()}")
         request.add_header("Accept", "application/json")
         context = ssl.create_default_context(cafile=self.ca_path)
@@ -547,9 +550,9 @@ class KubernetesNodeClient:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise ApiError(f"Kubernetes node {node_name} failed with HTTP {exc.code}: {detail}") from exc
+            raise ApiError(f"{description} failed with HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
-            raise ApiError(f"Kubernetes node {node_name} failed: {exc}") from exc
+            raise ApiError(f"{description} failed: {exc}") from exc
 
     def node_ready(self, node_name):
         node = self.fetch_node(node_name)
@@ -560,6 +563,108 @@ class KubernetesNodeClient:
 
     def ready_map(self, node_names):
         return {node_name: self.node_ready(node_name) for node_name in node_names}
+
+    def list_longhorn_replicas(self, namespace):
+        quoted_namespace = urllib.parse.quote(namespace, safe="")
+        return self.fetch_path(
+            f"/apis/longhorn.io/v1beta2/namespaces/{quoted_namespace}/replicas",
+            f"Longhorn replicas in namespace {namespace}",
+        ).get("items", [])
+
+
+class LonghornReplicaSafetyCheck:
+    def __init__(self, kubernetes):
+        self.enabled = env_bool("QBT_RPI_COOLING_LONGHORN_REPLICA_CHECK_ENABLED", False)
+        self.namespace = os.environ.get("QBT_RPI_COOLING_LONGHORN_NAMESPACE", "longhorn-system").strip()
+        self.fail_closed = env_bool("QBT_RPI_COOLING_LONGHORN_FAIL_CLOSED", True)
+        self.protected_volume_regex = os.environ.get(
+            "QBT_RPI_COOLING_LONGHORN_PROTECTED_VOLUME_REGEX",
+            "",
+        ).strip()
+        self.protected_volume_pattern = (
+            re.compile(self.protected_volume_regex)
+            if self.protected_volume_regex
+            else None
+        )
+        self.kubernetes = kubernetes
+
+    def volume_is_protected(self, volume_name):
+        if not self.protected_volume_pattern:
+            return True
+        return bool(self.protected_volume_pattern.search(volume_name or ""))
+
+    def evaluate(self, node_name):
+        if not self.enabled:
+            return {"enabled": False, "safe": True, "reason": "Longhorn replica check disabled"}
+        if not self.namespace:
+            return {"enabled": True, "safe": True, "reason": "Longhorn namespace is not configured"}
+
+        try:
+            replicas = self.kubernetes.list_longhorn_replicas(self.namespace)
+        except ApiError as exc:
+            if self.fail_closed:
+                return {
+                    "enabled": True,
+                    "safe": False,
+                    "reason": f"Longhorn replica check failed: {exc}",
+                }
+            log_warning(
+                f"Longhorn replica check failed: {exc}; continuing because "
+                "QBT_RPI_COOLING_LONGHORN_FAIL_CLOSED=false",
+            )
+            return {"enabled": True, "safe": True, "reason": f"Longhorn replica check failed: {exc}"}
+
+        protected_replicas = []
+        for replica in replicas:
+            spec = replica.get("spec") or {}
+            volume_name = spec.get("volumeName") or ""
+            if not spec.get("active", True) or not self.volume_is_protected(volume_name):
+                continue
+            protected_replicas.append(replica)
+
+        active_replicas_by_volume = {}
+        for replica in protected_replicas:
+            volume_name = (replica.get("spec") or {}).get("volumeName") or ""
+            if volume_name:
+                active_replicas_by_volume.setdefault(volume_name, []).append(replica)
+
+        blocked = []
+        for volume_name, volume_replicas in active_replicas_by_volume.items():
+            target_replicas = [
+                replica
+                for replica in volume_replicas
+                if (replica.get("spec") or {}).get("nodeID") == node_name
+            ]
+            if target_replicas and len(volume_replicas) <= 1:
+                replica = target_replicas[0]
+                spec = replica.get("spec") or {}
+                status = replica.get("status") or {}
+                blocked.append(
+                    {
+                        "volume": volume_name,
+                        "replica": replica.get("metadata", {}).get("name"),
+                        "state": status.get("currentState") or spec.get("desireState"),
+                        "failed_at": status.get("failedAt") or spec.get("failedAt") or "",
+                        "last_healthy_at": status.get("lastHealthyAt") or spec.get("lastHealthyAt") or "",
+                    }
+                )
+
+        if blocked:
+            volume_summary = ", ".join(item["volume"] for item in blocked[:5])
+            if len(blocked) > 5:
+                volume_summary += f", +{len(blocked) - 5} more"
+            return {
+                "enabled": True,
+                "safe": False,
+                "reason": f"node hosts sole active Longhorn replica(s): {volume_summary}",
+                "blocked_replicas": blocked,
+            }
+
+        return {
+            "enabled": True,
+            "safe": True,
+            "reason": "no sole active Longhorn replicas on candidate node",
+        }
 
 
 class RpiCoolingStateStore:
@@ -641,6 +746,7 @@ class RpiThermalCoolingManager:
         )
         self.opener = urllib.request.build_opener()
         self.kubernetes = KubernetesNodeClient()
+        self.longhorn_replicas = LonghornReplicaSafetyCheck(self.kubernetes)
 
     def shutdown_url(self, node_name):
         return self.shutdown_urls.get(node_name) or self.shutdown_url_template.format(node=node_name)
@@ -874,12 +980,29 @@ class RpiThermalCoolingManager:
                 "ready": ready,
             }
 
+        longhorn_safety = self.longhorn_replicas.evaluate(candidate["node"])
+        if not longhorn_safety.get("safe", True):
+            log_warning(
+                "RPi cooling candidate failed Longhorn replica safety check; shutdown skipped",
+                candidate=candidate,
+                reason=longhorn_safety.get("reason"),
+            )
+            return {
+                "enabled": True,
+                "action": "skipped",
+                "reason": longhorn_safety.get("reason") or "Longhorn replica safety check failed",
+                "candidate": candidate,
+                "ready": ready,
+                "longhorn": longhorn_safety,
+            }
+
         self.request_shutdown(candidate, now)
         return {
             "enabled": True,
             "action": "shutdown_requested",
             "candidate": candidate,
             "ready": ready,
+            "longhorn": longhorn_safety,
         }
 
 
