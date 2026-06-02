@@ -144,6 +144,67 @@ class LoggingTests(unittest.TestCase):
 
         self.assertEqual(2, len(stdout.getvalue().splitlines()))
 
+    def test_text_log_can_hide_fields_kept_in_json(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.guard.log_decision_info(
+                "throttle",
+                "Thermal throttle: limited qBittorrent",
+                text_omit_fields={"action", "reason"},
+                reason="same reason repeated elsewhere",
+            )
+
+        line = stdout.getvalue()
+        self.assertIn("Thermal throttle: limited qBittorrent", line)
+        self.assertNotIn("action=throttle", line)
+        self.assertNotIn("same reason repeated elsewhere", line)
+
+        stdout = io.StringIO()
+        env = {"QBT_LOG_FORMAT": "json"}
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            self.guard.log_decision_info(
+                "throttle",
+                "Thermal throttle: limited qBittorrent",
+                text_omit_fields={"action", "reason"},
+                reason="kept in json",
+            )
+
+        record = json.loads(stdout.getvalue())
+        self.assertEqual("throttle", record["action"])
+        self.assertEqual("kept in json", record["reason"])
+
+    def test_thermal_qbt_limit_text_summary_is_compact(self):
+        stdout = io.StringIO()
+        context = {
+            "rpi_cooling": {
+                "action": "throttle",
+                "candidate": {
+                    "node": "k8s-rpi2",
+                    "kind": "NVMe",
+                    "temperature": 73.85,
+                    "threshold": 70.0,
+                },
+            },
+        }
+
+        with contextlib.redirect_stdout(stdout):
+            self.guard.apply_qbt_limits(
+                [mock.Mock()],
+                "RPi thermal mitigation throttle active for k8s-rpi2: NVMe temperature 73.9C reached threshold 70.0C",
+                False,
+                2 * 1024 * 1024,
+                128 * 1024,
+                context,
+            )
+
+        line = stdout.getvalue()
+        self.assertIn(
+            "Thermal throttle: limited qBittorrent to 2.10 MB/s down / 131 KB/s up for k8s-rpi2; NVMe 73.8C >= 70.0C",
+            line,
+        )
+        self.assertNotIn("reason=", line)
+        self.assertNotIn("action=throttle", line)
+
 
 if __name__ == "__main__":
     unittest.main()

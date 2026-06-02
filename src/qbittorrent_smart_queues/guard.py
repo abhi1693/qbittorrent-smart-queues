@@ -285,7 +285,8 @@ def text_log_value(value):
     return json.dumps(safe_value, sort_keys=True, separators=(",", ":"))
 
 
-def text_log_line(record):
+def text_log_line(record, omit_fields=None):
+    omit_fields = set(omit_fields or ())
     prefix = f"{record['timestamp']} {record['level']}"
     if record.get("event"):
         prefix = f"{prefix} {record['event']}"
@@ -295,6 +296,7 @@ def text_log_line(record):
         f"{key}={text_log_value(value)}"
         for key, value in record.items()
         if key not in {"timestamp", "level", "event", "message"}
+        and key not in omit_fields
     ]
     parts = [prefix]
     if message:
@@ -303,7 +305,7 @@ def text_log_line(record):
     return " ".join(parts)
 
 
-def emit_log(level, message="", event="qbt_guard", **fields):
+def emit_log(level, message="", event="qbt_guard", text_omit_fields=None, **fields):
     level = normalize_log_level(level)
     if not log_level_enabled(level):
         return
@@ -318,7 +320,7 @@ def emit_log(level, message="", event="qbt_guard", **fields):
     if configured_log_format() == "json":
         line = json.dumps(json_safe(record), sort_keys=True, separators=(",", ":"))
     else:
-        line = text_log_line(record)
+        line = text_log_line(record, text_omit_fields)
 
     stream = sys.stderr if LOG_LEVELS[level] >= LOG_LEVELS["warning"] else sys.stdout
     stream.write(line + "\n")
@@ -372,7 +374,14 @@ def decision_summary_repeat_seconds():
     return max(0, env_int("QBT_DECISION_SUMMARY_REPEAT_SECONDS", 900))
 
 
-def log_decision_info(action, message, summary_key=None, repeat_seconds=None, **fields):
+def log_decision_info(
+    action,
+    message,
+    summary_key=None,
+    repeat_seconds=None,
+    text_omit_fields=None,
+    **fields,
+):
     if summary_key is not None:
         if repeat_seconds is None:
             repeat_seconds = decision_summary_repeat_seconds()
@@ -397,6 +406,7 @@ def log_decision_info(action, message, summary_key=None, repeat_seconds=None, **
         message,
         event="qbt_guard_decision",
         action=action,
+        text_omit_fields=text_omit_fields,
         **fields,
     )
 
@@ -1833,6 +1843,59 @@ def qbt_limit_decision_summary_key(action, pause_torrents, download_limit, uploa
     )
 
 
+def rpi_cooling_decision_fields(decision_context):
+    context = decision_context or {}
+    rpi_cooling_state = context.get("rpi_cooling") or {}
+    if not rpi_cooling_qbt_action(rpi_cooling_state):
+        return {}
+
+    candidate = rpi_cooling_state.get("candidate") or {}
+    active = rpi_cooling_state.get("active") or {}
+    fields = {
+        "thermal_action": rpi_cooling_qbt_action(rpi_cooling_state),
+        "thermal_node": candidate.get("node") or active.get("node") or "",
+        "thermal_sensor": candidate.get("kind") or active.get("temperature_kind") or "",
+        "temperature_celsius": candidate.get("temperature") or active.get("temperature_celsius"),
+        "threshold_celsius": candidate.get("threshold") or active.get("threshold_celsius"),
+    }
+    return {key: value for key, value in fields.items() if value not in {"", None}}
+
+
+def thermal_qbt_limit_message(pause_torrents, download_limit, upload_limit, decision_context, reason):
+    fields = rpi_cooling_decision_fields(decision_context)
+    if not fields:
+        if pause_torrents:
+            return f"Paused all torrents; {reason}", {}
+        return (
+            f"Throttled qBittorrent to {human_rate(download_limit)} down "
+            f"and {human_rate(upload_limit)} up; {reason}"
+        ), {}
+
+    node = fields.get("thermal_node", "unknown-node")
+    sensor = fields.get("thermal_sensor", "temperature")
+    try:
+        temperature = f"{float(fields['temperature_celsius']):.1f}C"
+    except (KeyError, TypeError, ValueError):
+        temperature = "unknown"
+    try:
+        threshold = f"{float(fields['threshold_celsius']):.1f}C"
+    except (KeyError, TypeError, ValueError):
+        threshold = "configured threshold"
+
+    if pause_torrents:
+        message = (
+            f"Thermal pause: paused qBittorrent for {node}; "
+            f"{sensor} {temperature} >= {threshold}"
+        )
+    else:
+        message = (
+            f"Thermal throttle: limited qBittorrent to "
+            f"{human_rate(download_limit)} down / {human_rate(upload_limit)} up for {node}; "
+            f"{sensor} {temperature} >= {threshold}"
+        )
+    return message, fields
+
+
 def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_limit, decision_context=None):
     action = "pause_all" if pause_torrents else "throttle"
     summary_key = qbt_limit_decision_summary_key(
@@ -1857,19 +1920,36 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
         )
         if pause_torrents:
             client.stop_all()
+            message, thermal_fields = thermal_qbt_limit_message(
+                True,
+                download_limit,
+                upload_limit,
+                decision_context,
+                reason,
+            )
             log_decision_info(
                 "pause_all",
-                f"Paused all torrents; {reason}",
+                message,
                 summary_key=summary_key,
+                text_omit_fields={"action", "reason", *thermal_fields.keys()},
                 reason=reason,
+                **thermal_fields,
             )
         else:
+            message, thermal_fields = thermal_qbt_limit_message(
+                False,
+                download_limit,
+                upload_limit,
+                decision_context,
+                reason,
+            )
             log_decision_info(
                 "throttle",
-                f"Throttled qBittorrent to {human_rate(download_limit)} down "
-                f"and {human_rate(upload_limit)} up; {reason}",
+                message,
                 summary_key=summary_key,
+                text_omit_fields={"action", "reason", *thermal_fields.keys()},
                 reason=reason,
+                **thermal_fields,
             )
 
 
