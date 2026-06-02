@@ -2039,6 +2039,26 @@ def apply_fail_closed():
     return True
 
 
+def torrent_is_active_download(torrent):
+    if is_stopped_torrent(torrent):
+        return False
+    if torrent_progress(torrent) >= 1.0:
+        return False
+    return torrent_amount_left(torrent) > 0 or torrent_state(torrent).lower().endswith("dl")
+
+
+def client_active_download_summary(client):
+    torrents = client.torrents_info()
+    if not isinstance(torrents, list):
+        raise ApiError(f"qBittorrent torrents info has unexpected shape: {type(torrents).__name__}")
+    active = [torrent for torrent in torrents if torrent_is_active_download(torrent)]
+    return {
+        "active": bool(active),
+        "active_count": len(active),
+        "total_count": len(torrents),
+    }
+
+
 def qbt_limit_decision_summary_key(action, pause_torrents, download_limit, upload_limit, decision_context):
     context = decision_context or {}
     rpi_cooling_state = context.get("rpi_cooling") or {}
@@ -2124,6 +2144,25 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
         decision_context,
     )
     for client in clients:
+        try:
+            active_summary = client_active_download_summary(client)
+        except (ApiError, AttributeError) as exc:
+            log_warning(
+                "Failed to inspect qBittorrent active downloads before applying thermal limits; applying limits",
+                qbt_url=getattr(client, "base_url", ""),
+                reason=str(exc),
+            )
+            active_summary = {"active": True, "active_count": None, "total_count": None}
+        if not active_summary["active"]:
+            log_debug(
+                "Skipped qBittorrent thermal limit update because no active downloads are running",
+                qbt_url=getattr(client, "base_url", ""),
+                active_download_count=active_summary["active_count"],
+                torrent_count=active_summary["total_count"],
+                action=action,
+                reason=reason,
+            )
+            continue
         client.set_download_limit(download_limit)
         client.set_upload_limit(upload_limit)
         emit_decision_log(

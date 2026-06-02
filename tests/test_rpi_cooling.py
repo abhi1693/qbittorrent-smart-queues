@@ -9,10 +9,13 @@ from unittest import mock
 class FakeQbtClient:
     base_url = "http://qbittorrent.test"
 
-    def __init__(self):
+    def __init__(self, torrents=None):
         self.download_limits = []
         self.upload_limits = []
         self.stop_all_calls = 0
+        self.torrents = torrents if torrents is not None else [
+            {"hash": "active", "name": "active", "state": "downloading", "progress": 0.5, "amount_left": 1000}
+        ]
 
     def set_download_limit(self, limit):
         self.download_limits.append(limit)
@@ -22,6 +25,9 @@ class FakeQbtClient:
 
     def stop_all(self):
         self.stop_all_calls += 1
+
+    def torrents_info(self, filter_name=None):
+        return list(self.torrents)
 
 
 class RpiCoolingTests(unittest.TestCase):
@@ -234,6 +240,37 @@ class RpiCoolingTests(unittest.TestCase):
         self.assertEqual([2097152], client.download_limits)
         self.assertEqual([131072], client.upload_limits)
         self.assertEqual(0, client.stop_all_calls)
+
+    def test_qbittorrent_thermal_action_skips_limits_when_no_active_downloads(self):
+        client = FakeQbtClient(
+            torrents=[
+                {"hash": "done", "name": "done", "state": "uploading", "progress": 1.0, "amount_left": 0},
+                {"hash": "paused", "name": "paused", "state": "pausedDL", "progress": 0.5, "amount_left": 1000},
+            ]
+        )
+        env = {
+            "QBT_RPI_COOLING_THROTTLE_DOWNLOAD_LIMIT_BYTES_PER_SEC": "2097152",
+            "QBT_RPI_COOLING_THROTTLE_UPLOAD_LIMIT_BYTES_PER_SEC": "131072",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(self.guard, "cleanup_qbt_clients"), \
+                mock.patch.object(self.guard, "log_debug") as log_debug:
+            result = self.guard.apply_rpi_cooling_stop(
+                [client],
+                {
+                    "enabled": True,
+                    "action": "throttle",
+                    "candidate": {"node": "k8s-rpi2"},
+                    "reason": "CPU temperature 72.0C reached threshold 70.0C",
+                },
+            )
+
+        self.assertTrue(result)
+        self.assertEqual([], client.download_limits)
+        self.assertEqual([], client.upload_limits)
+        self.assertEqual(0, client.stop_all_calls)
+        log_debug.assert_called_once()
 
     def test_unrelated_hot_node_does_not_throttle_qbittorrent_when_topology_enabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
