@@ -91,6 +91,27 @@ Optional storage and thermal guards:
 | `QBT_NVME_THERMAL_STOP_ENABLED` | enabled only when `PROMETHEUS_URL` is set | Enable NVMe thermal stop checks. |
 | `QBT_NVME_THERMAL_QUERY` | generic node-exporter NVMe composite-temperature query | PromQL query returning temperature samples. |
 
+Optional Raspberry Pi cooling coordinator:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `QBT_RPI_COOLING_ENABLED` | `false` | Enable guarded Raspberry Pi node shutdowns for thermal cooling. |
+| `QBT_RPI_COOLING_NODES` | `k8s-rpi1,k8s-rpi2,k8s-rpi3` | Nodes eligible for cooling shutdown. |
+| `QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS` | `75` | CPU temperature threshold. |
+| `QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS` | `70` | NVMe temperature threshold. |
+| `QBT_RPI_COOLING_SHUTDOWN_URL_TEMPLATE` | `http://rpi-shutdown-{node}:8000/shutdown` | Per-node shutdown endpoint template. |
+| `QBT_RPI_COOLING_POWER_OFF_URLS` | unset | Newline/comma list of `node=url` endpoints called after the node becomes NotReady. |
+| `QBT_RPI_COOLING_POWER_ON_URLS` | unset | Newline/comma list of `node=url` endpoints called after the cooldown window. |
+| `QBT_RPI_COOLING_STATE_PATH` | `/state/rpi-cooling.json` | Persistent cooling lock file. |
+
+When enabled, the coordinator reads CPU and NVMe temperatures from Prometheus,
+requires every configured node to be Kubernetes `Ready`, and requests clean
+shutdown for only the hottest node over threshold. A persisted lock prevents a
+second node from being shut down while the first node is leaving or rejoining
+the cluster. If power URLs are configured, the lock advances from shutdown to
+cooling to booting and the controller powers the node back on after the cooldown
+window.
+
 Logs default to plain text at `INFO` level. Set `QBT_LOG_FORMAT=json` for JSON
 lines and `QBT_LOG_LEVEL=debug` for detailed decision telemetry. Full decision
 payloads are emitted at `DEBUG` by default; set `QBT_DECISION_LOG_LEVEL=info`

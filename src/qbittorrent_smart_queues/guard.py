@@ -56,6 +56,25 @@ NVME_THERMAL_QUERY = (
     'node_hwmon_sensor_label{chip=~"nvme_.*", label=~"Composite.*"}'
     ')'
 )
+RPI_COOLING_DEFAULT_NODES = ["k8s-rpi1", "k8s-rpi2", "k8s-rpi3"]
+RPI_COOLING_CPU_QUERY = (
+    'max by (nodename) ('
+    'node_hwmon_temp_celsius{chip=~"thermal_thermal_zone.*"} '
+    '* on(instance) group_left(nodename) '
+    'node_uname_info{machine="aarch64", nodename=~"k8s-rpi[123]"}'
+    ')'
+)
+RPI_COOLING_NVME_QUERY = (
+    'max by (nodename) ('
+    'node_hwmon_temp_celsius{chip=~"nvme_.*"} '
+    '* on(instance, chip, sensor) group_left(label) '
+    'node_hwmon_sensor_label{chip=~"nvme_.*", label="Composite"} '
+    '* on(instance) group_left(nodename) '
+    'node_uname_info{machine="aarch64", nodename=~"k8s-rpi[123]"}'
+    ')'
+)
+KUBERNETES_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+KUBERNETES_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 
 class ApiError(RuntimeError):
@@ -107,6 +126,19 @@ def split_lines_or_csv(value):
         if item:
             parts.append(item)
     return parts
+
+
+def split_key_value_lines(value):
+    items = {}
+    for item in split_lines_or_csv(value):
+        if "=" not in item:
+            continue
+        key, item_value = item.split("=", 1)
+        key = key.strip()
+        item_value = item_value.strip()
+        if key and item_value:
+            items[key] = item_value
+    return items
 
 
 def human_size(value):
@@ -485,6 +517,369 @@ class NvmeThermalGuard:
             "stop": True,
             "reason": f"NVMe thermal stop threshold {self.threshold:.1f}C reached: {hot_summary}",
             "readings": readings,
+        }
+
+
+class KubernetesNodeClient:
+    def __init__(self):
+        api_host = os.environ.get("KUBERNETES_SERVICE_HOST", "").strip()
+        api_port = os.environ.get("KUBERNETES_SERVICE_PORT", "443").strip() or "443"
+        self.api_base = f"https://{api_host}:{api_port}" if api_host else ""
+        self.token_path = os.environ.get("KUBERNETES_TOKEN_PATH", KUBERNETES_TOKEN_PATH)
+        self.ca_path = os.environ.get("KUBERNETES_CA_PATH", KUBERNETES_CA_PATH)
+        self.timeout = env_int("QBT_RPI_COOLING_K8S_TIMEOUT", 5)
+        self.opener = urllib.request.build_opener()
+
+    def read_token(self):
+        with open(self.token_path, "r", encoding="utf-8") as token_file:
+            return token_file.read().strip()
+
+    def fetch_node(self, node_name):
+        if not self.api_base:
+            raise ApiError("Kubernetes service host is unavailable")
+        quoted_name = urllib.parse.quote(node_name, safe="")
+        request = urllib.request.Request(f"{self.api_base}/api/v1/nodes/{quoted_name}")
+        request.add_header("Authorization", f"Bearer {self.read_token()}")
+        request.add_header("Accept", "application/json")
+        context = ssl.create_default_context(cafile=self.ca_path)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=context) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise ApiError(f"Kubernetes node {node_name} failed with HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise ApiError(f"Kubernetes node {node_name} failed: {exc}") from exc
+
+    def node_ready(self, node_name):
+        node = self.fetch_node(node_name)
+        for condition in node.get("status", {}).get("conditions", []):
+            if condition.get("type") == "Ready":
+                return condition.get("status") == "True"
+        return False
+
+    def ready_map(self, node_names):
+        return {node_name: self.node_ready(node_name) for node_name in node_names}
+
+
+class RpiCoolingStateStore:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        if not self.path:
+            return {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as state_file:
+                payload = json.load(state_file)
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as exc:
+            log_warning(f"Failed to read RPi cooling state: {exc}")
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def save(self, state):
+        if not self.path:
+            return
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{self.path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as state_file:
+            json.dump(json_safe(state), state_file, sort_keys=True, separators=(",", ":"))
+            state_file.write("\n")
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(tmp_path, self.path)
+        if directory:
+            try:
+                directory_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError as exc:
+                log_warning(f"Failed to fsync RPi cooling state directory: {exc}")
+
+    def clear(self):
+        if not self.path:
+            return
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            log_warning(f"Failed to clear RPi cooling state: {exc}")
+
+
+class RpiThermalCoolingManager:
+    def __init__(self):
+        self.enabled = env_bool("QBT_RPI_COOLING_ENABLED", False)
+        self.prometheus_url = os.environ.get("PROMETHEUS_URL", PROMETHEUS_DEFAULT_URL).strip().rstrip("/")
+        self.nodes = split_lines_or_csv(os.environ.get("QBT_RPI_COOLING_NODES")) or list(RPI_COOLING_DEFAULT_NODES)
+        self.cpu_query = os.environ.get("QBT_RPI_COOLING_CPU_QUERY", RPI_COOLING_CPU_QUERY).strip()
+        self.nvme_query = os.environ.get("QBT_RPI_COOLING_NVME_QUERY", RPI_COOLING_NVME_QUERY).strip()
+        self.cpu_threshold = env_float("QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS", 75.0)
+        self.nvme_threshold = env_float("QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS", 70.0)
+        self.timeout = env_int("QBT_RPI_COOLING_PROMETHEUS_TIMEOUT", 5)
+        self.shutdown_timeout_seconds = env_int("QBT_RPI_COOLING_SHUTDOWN_TIMEOUT_SECONDS", 300)
+        self.cooldown_seconds = env_int("QBT_RPI_COOLING_COOLDOWN_SECONDS", 1200)
+        self.require_all_ready = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_NODES_READY", True)
+        self.require_all_temperatures = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_TEMPERATURES", True)
+        self.shutdown_urls = split_key_value_lines(os.environ.get("QBT_RPI_COOLING_SHUTDOWN_URLS"))
+        self.shutdown_url_template = os.environ.get(
+            "QBT_RPI_COOLING_SHUTDOWN_URL_TEMPLATE",
+            "http://rpi-shutdown-{node}:8000/shutdown",
+        ).strip()
+        self.power_off_urls = split_key_value_lines(os.environ.get("QBT_RPI_COOLING_POWER_OFF_URLS"))
+        self.power_on_urls = split_key_value_lines(os.environ.get("QBT_RPI_COOLING_POWER_ON_URLS"))
+        self.shutdown_request_timeout = env_int("QBT_RPI_COOLING_SHUTDOWN_REQUEST_TIMEOUT", 10)
+        self.power_request_timeout = env_int("QBT_RPI_COOLING_POWER_REQUEST_TIMEOUT", 10)
+        self.state = RpiCoolingStateStore(
+            os.environ.get("QBT_RPI_COOLING_STATE_PATH", "/state/rpi-cooling.json").strip()
+        )
+        self.opener = urllib.request.build_opener()
+        self.kubernetes = KubernetesNodeClient()
+
+    def shutdown_url(self, node_name):
+        return self.shutdown_urls.get(node_name) or self.shutdown_url_template.format(node=node_name)
+
+    def power_url(self, action, node_name):
+        urls = self.power_on_urls if action == "on" else self.power_off_urls
+        return urls.get(node_name, "")
+
+    def request_plain_http(self, method, url, timeout):
+        request = urllib.request.Request(url, method=method)
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                response.read()
+                return response.status
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise ApiError(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise ApiError(f"{method} {url} failed: {exc}") from exc
+
+    def request_power(self, action, node_name):
+        url = self.power_url(action, node_name)
+        if not url:
+            log_warning(
+                "RPi cooling power action URL is not configured",
+                node=node_name,
+                action=action,
+            )
+            return False
+        self.request_plain_http("POST", url, self.power_request_timeout)
+        log_info("Requested RPi power action", node=node_name, action=action)
+        return True
+
+    def prometheus_temperature_readings(self, query, label):
+        if not self.prometheus_url:
+            raise ApiError("PROMETHEUS_URL is required when RPi cooling is enabled")
+        url = join_url(self.prometheus_url, "/api/v1/query")
+        url += "?" + urllib.parse.urlencode({"query": query})
+        data, _ = request_json(self.opener, "GET", url, timeout=self.timeout)
+        if data.get("status") != "success":
+            raise ApiError(f"Prometheus {label} query returned status {data.get('status')!r}")
+        readings = {}
+        for sample in data.get("data", {}).get("result", []):
+            metric = sample.get("metric") or {}
+            value = sample.get("value") or []
+            node_name = (
+                metric.get("nodename")
+                or metric.get("node")
+                or metric.get("instance")
+                or ""
+            )
+            if not node_name:
+                continue
+            readings[str(node_name)] = float(value[1])
+        if not readings:
+            raise ApiError(f"Prometheus returned no RPi {label} temperature samples")
+        return readings
+
+    def temperature_snapshot(self):
+        cpu = self.prometheus_temperature_readings(self.cpu_query, "CPU")
+        nvme = self.prometheus_temperature_readings(self.nvme_query, "NVMe")
+        if self.require_all_temperatures:
+            missing = [
+                node_name
+                for node_name in self.nodes
+                if node_name not in cpu or node_name not in nvme
+            ]
+            if missing:
+                raise ApiError(f"missing RPi temperature samples for {', '.join(missing)}")
+        return {
+            node_name: {
+                "cpu": cpu.get(node_name),
+                "nvme": nvme.get(node_name),
+            }
+            for node_name in self.nodes
+        }
+
+    def hot_candidate(self, temperatures):
+        candidates = []
+        for node_name, readings in temperatures.items():
+            cpu_temp = readings.get("cpu")
+            nvme_temp = readings.get("nvme")
+            if cpu_temp is not None and cpu_temp >= self.cpu_threshold:
+                candidates.append((cpu_temp - self.cpu_threshold, node_name, "CPU", cpu_temp))
+            if nvme_temp is not None and nvme_temp >= self.nvme_threshold:
+                candidates.append((nvme_temp - self.nvme_threshold, node_name, "NVMe", nvme_temp))
+        if not candidates:
+            return None
+        _, node_name, kind, temperature = max(candidates, key=lambda item: (item[0], item[3]))
+        return {
+            "node": node_name,
+            "kind": kind,
+            "temperature": temperature,
+            "threshold": self.cpu_threshold if kind == "CPU" else self.nvme_threshold,
+        }
+
+    def active_state_reconciled(self, now, ready):
+        active = self.state.load()
+        node_name = active.get("node")
+        phase = active.get("phase")
+        if not node_name or node_name not in self.nodes:
+            if active:
+                log_warning("Clearing invalid RPi cooling state", state=active)
+                self.state.clear()
+            return False
+
+        node_ready = ready.get(node_name)
+        started_at = parse_utc(active.get("started_at")) or now
+        elapsed_seconds = max(0, int((now - started_at).total_seconds()))
+
+        if phase == "shutdown_requested":
+            if node_ready is False:
+                power_off_requested = self.request_power("off", node_name)
+                active["phase"] = "cooling"
+                active["cooling_started_at"] = format_utc(now)
+                active["power_off_requested"] = power_off_requested
+                self.state.save(active)
+                log_info(
+                    "RPi cooling shutdown completed; cooling window started",
+                    node=node_name,
+                    cooldown_seconds=self.cooldown_seconds,
+                )
+            elif elapsed_seconds >= self.shutdown_timeout_seconds:
+                log_warning(
+                    "RPi cooling shutdown still pending; keeping lock active",
+                    node=node_name,
+                    elapsed_seconds=elapsed_seconds,
+                    timeout_seconds=self.shutdown_timeout_seconds,
+                )
+            return True
+
+        if phase == "cooling":
+            if node_ready is True:
+                self.state.clear()
+                log_info("RPi cooling completed; node is Ready and lock is released", node=node_name)
+            else:
+                cooling_started_at = parse_utc(active.get("cooling_started_at")) or started_at
+                cooling_elapsed = max(0, int((now - cooling_started_at).total_seconds()))
+                if cooling_elapsed >= self.cooldown_seconds:
+                    power_on_requested = self.request_power("on", node_name)
+                    active["phase"] = "booting"
+                    active["boot_started_at"] = format_utc(now)
+                    active["power_on_requested"] = power_on_requested
+                    self.state.save(active)
+                    log_info(
+                        "RPi cooling cooldown elapsed; boot window started",
+                        node=node_name,
+                        elapsed_seconds=cooling_elapsed,
+                    )
+            return True
+
+        if phase == "booting":
+            if node_ready is True:
+                self.state.clear()
+                log_info("RPi cooling completed; node is Ready and lock is released", node=node_name)
+            else:
+                boot_started_at = parse_utc(active.get("boot_started_at")) or started_at
+                boot_elapsed = max(0, int((now - boot_started_at).total_seconds()))
+                log_warning(
+                    "RPi cooling boot still pending; keeping lock active",
+                    node=node_name,
+                    elapsed_seconds=boot_elapsed,
+                )
+            return True
+
+        log_warning("Clearing unknown RPi cooling phase", node=node_name, phase=phase)
+        self.state.clear()
+        return False
+
+    def request_shutdown(self, candidate, now):
+        node_name = candidate["node"]
+        url = self.shutdown_url(node_name)
+        state = {
+            "node": node_name,
+            "phase": "shutdown_requested",
+            "started_at": format_utc(now),
+            "reason": (
+                f"{candidate['kind']} temperature {candidate['temperature']:.1f}C "
+                f"reached threshold {candidate['threshold']:.1f}C"
+            ),
+            "temperature_kind": candidate["kind"],
+            "temperature_celsius": candidate["temperature"],
+            "threshold_celsius": candidate["threshold"],
+        }
+        self.state.save(state)
+        try:
+            request_json(self.opener, "POST", url, body=b"", timeout=self.shutdown_request_timeout)
+        except Exception:
+            self.state.clear()
+            raise
+        log_warning(
+            "Requested RPi clean shutdown for thermal cooling",
+            node=node_name,
+            kind=candidate["kind"],
+            temperature_celsius=round(candidate["temperature"], 1),
+            threshold_celsius=round(candidate["threshold"], 1),
+        )
+
+    def reconcile(self):
+        if not self.enabled:
+            return {"enabled": False, "action": "disabled"}
+        if not self.nodes:
+            return {"enabled": True, "action": "skipped", "reason": "no RPi cooling nodes configured"}
+
+        now = datetime.now(timezone.utc)
+        ready = self.kubernetes.ready_map(self.nodes)
+        if self.active_state_reconciled(now, ready):
+            return {"enabled": True, "action": "active", "ready": ready}
+
+        if self.require_all_ready and not all(ready.values()):
+            log_debug("RPi cooling skipped because not all nodes are Ready", ready=ready)
+            return {"enabled": True, "action": "skipped", "reason": "not all nodes are Ready", "ready": ready}
+
+        temperatures = self.temperature_snapshot()
+        candidate = self.hot_candidate(temperatures)
+        if not candidate:
+            return {
+                "enabled": True,
+                "action": "clear",
+                "temperatures": temperatures,
+                "ready": ready,
+            }
+
+        if ready.get(candidate["node"]) is not True:
+            log_warning("RPi cooling candidate is not Ready; shutdown skipped", candidate=candidate, ready=ready)
+            return {
+                "enabled": True,
+                "action": "skipped",
+                "reason": "candidate node is not Ready",
+                "candidate": candidate,
+                "ready": ready,
+            }
+
+        self.request_shutdown(candidate, now)
+        return {
+            "enabled": True,
+            "action": "shutdown_requested",
+            "candidate": candidate,
+            "ready": ready,
         }
 
 
@@ -966,6 +1361,14 @@ def apply_full_guard_thermal_stop(clients, thermal_state=None, decision_context=
     apply_stop_limits(clients, thermal_state["reason"], pause_torrents=True, decision_context=context)
     cleanup_qbt_clients(clients)
     return True
+
+
+def apply_rpi_thermal_cooling():
+    try:
+        return RpiThermalCoolingManager().reconcile()
+    except Exception as exc:
+        log_error(f"RPi thermal cooling check failed: {exc}")
+        return {"enabled": True, "action": "error", "reason": str(exc)}
 
 
 def human_download_limit(value):
@@ -3649,6 +4052,7 @@ def run_once():
         max_download_limit,
     )
 
+    rpi_cooling_state = apply_rpi_thermal_cooling()
     storage_guard = DownloadStorageGuard()
     try:
         udm_client = UdmClient()
@@ -3670,6 +4074,7 @@ def run_once():
             },
             "udm": udm_decision_summary(None, now, error=exc),
             "thermal": thermal_decision_summary(thermal_state),
+            "rpi_cooling": rpi_cooling_state,
         }
         if apply_full_guard_thermal_stop(clients, thermal_state, fallback_context):
             return 0
@@ -3731,6 +4136,7 @@ def run_once():
         },
         "udm": udm_decision_summary(udm_client, now),
         "thermal": thermal_decision_summary(thermal_state),
+        "rpi_cooling": rpi_cooling_state,
     }
 
     if apply_full_guard_thermal_stop(clients, thermal_state, base_decision_context):
