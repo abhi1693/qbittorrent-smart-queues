@@ -201,6 +201,72 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             )
         )
 
+    def test_tv_queue_order_blocks_priority_later_episode(self):
+        client = FakeQbtClient([
+            {
+                "hash": "old",
+                "name": "Alpha.S01E02.1080p",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 1000,
+                "downloaded": 100,
+                "progress": 0.5,
+                "tags": "",
+            },
+            {
+                "hash": "later",
+                "name": "Alpha.S01E03.1080p",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 1000,
+                "downloaded": 100,
+                "progress": 0.5,
+                "tags": "priority",
+            },
+        ])
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+            "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                )
+
+        decision_logs = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{")
+        ]
+        try_event = next(
+            item for item in decision_logs
+            if item.get("event") == "qbt_guard_decision"
+            and item.get("action") == "try_candidate"
+        )
+
+        self.assertEqual("old", try_event["selected_torrent"]["hash"])
+        self.assertEqual(1, try_event["rejected_counts"]["tv_queue_order_blocked"])
+        self.assertIn(["old"], client.started)
+        self.assertTrue(any("later" in hashes for hashes in client.stopped))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -101,6 +101,78 @@ class TvOrderingTests(unittest.TestCase):
 
         self.assertEqual(["b1", "b2", "a1", "a2"], [item["hash"] for item in ordered])
 
+    def test_later_season_is_blocked_until_older_season_finishes(self):
+        queue = self.guard.SonarrQueueMetadata()
+        torrents = [
+            {
+                "hash": "s1",
+                "name": "Alpha.S01.1080p",
+                "category": "tv",
+                "progress": 0.75,
+            },
+            {
+                "hash": "s2",
+                "name": "Alpha.S02.1080p",
+                "category": "tv",
+                "progress": 0.0,
+            },
+        ]
+
+        state = self.guard.build_tv_order_state(torrents, {"tv"}, queue)
+
+        self.assertEqual("", self.guard.tv_queue_order_block_reason(torrents[0], {"tv"}, state))
+        self.assertIn("S01", self.guard.tv_queue_order_block_reason(torrents[1], {"tv"}, state))
+
+    def test_later_episode_is_blocked_until_older_episode_finishes(self):
+        queue = self.guard.SonarrQueueMetadata()
+        torrents = [
+            {
+                "hash": "e2",
+                "name": "Alpha.S01E02.1080p",
+                "category": "tv",
+                "progress": 0.25,
+            },
+            {
+                "hash": "e3",
+                "name": "Alpha.S01E03.1080p",
+                "category": "tv",
+                "progress": 0.0,
+            },
+            {
+                "hash": "e4",
+                "name": "Alpha.S01E04.1080p",
+                "category": "tv",
+                "progress": 0.0,
+            },
+        ]
+
+        state = self.guard.build_tv_order_state(torrents, {"tv"}, queue)
+
+        self.assertEqual("", self.guard.tv_queue_order_block_reason(torrents[0], {"tv"}, state))
+        self.assertIn("S01E02", self.guard.tv_queue_order_block_reason(torrents[1], {"tv"}, state))
+        self.assertIn("S01E02", self.guard.tv_queue_order_block_reason(torrents[2], {"tv"}, state))
+
+    def test_completed_older_episode_does_not_block_later_episode(self):
+        queue = self.guard.SonarrQueueMetadata()
+        torrents = [
+            {
+                "hash": "e2",
+                "name": "Alpha.S01E02.1080p",
+                "category": "tv",
+                "progress": 1.0,
+            },
+            {
+                "hash": "e3",
+                "name": "Alpha.S01E03.1080p",
+                "category": "tv",
+                "progress": 0.0,
+            },
+        ]
+
+        state = self.guard.build_tv_order_state(torrents, {"tv"}, queue)
+
+        self.assertEqual("", self.guard.tv_queue_order_block_reason(torrents[1], {"tv"}, state))
+
     def test_radarr_queue_position_orders_movies(self):
         queue = self.guard.RadarrQueueMetadata()
         queue.by_download_id["b1"] = {

@@ -80,6 +80,11 @@ Optional media integrations only load when both URL(s) and an API key are set:
 | Radarr movie queue | `QBT_MOVIE_QUEUE_RADARR_URLS`, `RADARR_URLS`, `RADARR_URL` | `QBT_MOVIE_QUEUE_RADARR_API_KEY`, `RADARR_API_KEY` |
 | Jellyfin watch state | `QBT_TV_WATCH_JELLYFIN_URLS`, `JELLYFIN_URLS`, `JELLYFIN_URL` | `QBT_TV_WATCH_JELLYFIN_API_KEY`, `JELLYFIN_API_KEY` |
 
+When Sonarr TV queue metadata is available, TV torrents are constrained by a
+hard per-series order. A later season or episode for the same show cannot be
+selected while an older incomplete queued item for that show remains in
+qBittorrent; priority tags and Jellyfin watch boosts do not bypass this rule.
+
 Optional storage and thermal guards:
 
 | Variable | Default | Purpose |

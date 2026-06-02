@@ -2879,9 +2879,28 @@ def tv_order_is_single_episode_torrent(torrent, order):
     return tv_order_single_episode_torrent_order(torrent, order) is not None
 
 
+def tv_order_sequence(order):
+    return (
+        int(order.get("season") or 0),
+        int(order.get("episode") or 0),
+    )
+
+
+def tv_order_label(order):
+    season, episode = tv_order_sequence(order)
+    if order.get("season_pack") or episode <= 0:
+        return f"S{season:02d}"
+    return f"S{season:02d}E{episode:02d}"
+
+
+def tv_order_is_incomplete(torrent):
+    return torrent_progress(torrent) < 1.0
+
+
 def build_tv_order_state(torrents, tv_order_categories, sonarr_queue, watch_metadata=None):
     orders = {}
     series_ranks = {}
+    series_heads = {}
     watch_priorities = {}
 
     for torrent in torrents:
@@ -2907,12 +2926,53 @@ def build_tv_order_state(torrents, tv_order_categories, sonarr_queue, watch_meta
         )
         if series not in series_ranks or rank < series_ranks[series]:
             series_ranks[series] = rank
+        head_rank = (
+            tv_order_sequence(order),
+            int(order.get("queue_position", 999999)),
+            torrent_name(torrent).lower(),
+            item_hash,
+        )
+        if tv_order_is_incomplete(torrent) and (
+            series not in series_heads or head_rank < series_heads[series]["rank"]
+        ):
+            series_heads[series] = {
+                "hash": item_hash,
+                "name": torrent_name(torrent),
+                "order": order,
+                "rank": head_rank,
+            }
 
     return {
         "orders": orders,
         "series_ranks": series_ranks,
+        "series_heads": series_heads,
         "watch_priorities": watch_priorities,
     }
+
+
+def tv_queue_order_block_reason(torrent, tv_order_categories, tv_order_state):
+    category = torrent_category(torrent).lower()
+    if category not in tv_order_categories:
+        return ""
+
+    item_hash = torrent_hash(torrent)
+    order = tv_order_state.get("orders", {}).get(item_hash)
+    if not order:
+        return ""
+
+    head = tv_order_state.get("series_heads", {}).get(order["series"])
+    if not head or head.get("hash") == item_hash:
+        return ""
+
+    head_order = head.get("order") or {}
+    if tv_order_sequence(order) <= tv_order_sequence(head_order):
+        return ""
+
+    return (
+        f"waiting for older queued TV item in {order['series']}: "
+        f"{tv_order_label(head_order)} {head.get('name') or head.get('hash')} "
+        f"before {tv_order_label(order)}"
+    )
 
 
 def tv_episode_order_key(torrent, tv_order_categories, tv_order_state):
@@ -4069,6 +4129,8 @@ def apply_single_download(
             candidates = []
             storage_blocked_count = 0
             storage_blocked_examples = []
+            tv_order_blocked_count = 0
+            tv_order_blocked_examples = []
             for torrent in all_candidates:
                 storage_reason = storage_torrent_block_reason(client, torrent, storage_guard, storage_state)
                 if storage_reason:
@@ -4076,6 +4138,17 @@ def apply_single_download(
                     storage_blocked_count += 1
                     if len(storage_blocked_examples) < 3:
                         storage_blocked_examples.append(f"{torrent_name(torrent)}: {storage_reason}")
+                    continue
+                tv_order_reason = tv_queue_order_block_reason(
+                    torrent,
+                    tv_order_categories,
+                    tv_order_state,
+                )
+                if tv_order_reason:
+                    rejected_counts["tv_queue_order_blocked"] += 1
+                    tv_order_blocked_count += 1
+                    if len(tv_order_blocked_examples) < 3:
+                        tv_order_blocked_examples.append(f"{torrent_name(torrent)}: {tv_order_reason}")
                     continue
                 candidates.append(torrent)
 
@@ -4146,6 +4219,7 @@ def apply_single_download(
                 "total": len(torrents),
                 "eligible": len(all_candidates),
                 "after_storage": len(candidates),
+                "tv_queue_order_blocked": tv_order_blocked_count,
                 "available": len(available_candidates),
                 "selection_pool": len(selection_candidates),
                 "priority": len(priority_candidates),
@@ -4412,6 +4486,8 @@ def apply_single_download(
                     no_available_reason = "all candidates cooling down or already attempted"
                 elif storage_blocked_count:
                     no_available_reason = "candidates blocked by storage headroom"
+                elif tv_order_blocked_count:
+                    no_available_reason = "later TV candidates blocked by older queued items"
                 elif all_candidates:
                     no_available_reason = "all candidates already attempted"
                 emit_decision_log(
@@ -4423,6 +4499,7 @@ def apply_single_download(
                     candidate_counts=candidate_counts,
                     selected_torrent=None,
                     storage_blocked_examples=storage_blocked_examples,
+                    tv_order_blocked_examples=tv_order_blocked_examples,
                 )
                 if candidates:
                     log_decision_info(
@@ -4443,6 +4520,17 @@ def apply_single_download(
                         storage_blocked_count=storage_blocked_count,
                     )
                     for example in storage_blocked_examples:
+                        log_info(f"- {example}")
+                elif tv_order_blocked_count:
+                    log_decision_info(
+                        "stop_no_available_candidates",
+                        "No torrents available for single-download policy; "
+                        f"{tv_order_blocked_count} later TV candidate(s) are waiting "
+                        "for older queued Sonarr item(s)",
+                        reason=no_available_reason,
+                        tv_queue_order_blocked_count=tv_order_blocked_count,
+                    )
+                    for example in tv_order_blocked_examples:
                         log_info(f"- {example}")
                 elif all_candidates:
                     log_decision_info(
