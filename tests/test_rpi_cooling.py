@@ -204,6 +204,17 @@ class RpiCoolingTests(unittest.TestCase):
 
         self.assertEqual("RPi thermal cooling shutdown requested for k8s-rpi2", reason)
 
+    def test_cooling_check_error_requests_download_stop(self):
+        reason = self.guard.rpi_cooling_stop_reason(
+            {
+                "enabled": True,
+                "action": "error",
+                "reason": "The read operation timed out",
+            }
+        )
+
+        self.assertEqual("RPi thermal cooling check failed: The read operation timed out", reason)
+
     def test_shutdown_allows_candidate_when_longhorn_replica_has_peer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "rpi-cooling.json")

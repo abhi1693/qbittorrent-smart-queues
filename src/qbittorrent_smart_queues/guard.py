@@ -1497,6 +1497,9 @@ def rpi_cooling_stop_reason(rpi_cooling_state):
         if node_name:
             return f"RPi thermal cooling blocked for {node_name}: {reason}"
         return f"RPi thermal cooling blocked: {reason}"
+    if rpi_cooling_state.get("action") == "error":
+        reason = rpi_cooling_state.get("reason") or "unknown error"
+        return f"RPi thermal cooling check failed: {reason}"
     if rpi_cooling_state.get("action") == "shutdown_requested" and node_name:
         return f"RPi thermal cooling shutdown requested for {node_name}"
     return ""
