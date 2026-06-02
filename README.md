@@ -91,26 +91,43 @@ Optional storage and thermal guards:
 | `QBT_NVME_THERMAL_STOP_ENABLED` | enabled only when `PROMETHEUS_URL` is set | Enable NVMe thermal stop checks. |
 | `QBT_NVME_THERMAL_QUERY` | generic node-exporter NVMe composite-temperature query | PromQL query returning temperature samples. |
 
-Optional Raspberry Pi cooling coordinator:
+Optional Raspberry Pi thermal coordinator:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `QBT_RPI_COOLING_ENABLED` | `false` | Enable guarded Raspberry Pi node shutdowns for thermal cooling. |
-| `QBT_RPI_COOLING_NODES` | `k8s-rpi1,k8s-rpi2,k8s-rpi3` | Nodes eligible for cooling shutdown. |
-| `QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS` | `75` | CPU temperature threshold. |
-| `QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS` | `70` | NVMe temperature threshold. |
+| `QBT_RPI_COOLING_ENABLED` | `false` | Enable Raspberry Pi thermal mitigation. |
+| `QBT_RPI_COOLING_NODES` | `k8s-rpi1,k8s-rpi2,k8s-rpi3` | Nodes monitored for thermal mitigation. |
+| `QBT_RPI_COOLING_CPU_THROTTLE_CELSIUS` | `70` | CPU threshold that applies qBittorrent throttle limits. |
+| `QBT_RPI_COOLING_NVME_THROTTLE_CELSIUS` | `65` | NVMe threshold that applies qBittorrent throttle limits. |
+| `QBT_RPI_COOLING_CPU_PAUSE_CELSIUS` | `74` | CPU threshold that pauses qBittorrent torrents. |
+| `QBT_RPI_COOLING_NVME_PAUSE_CELSIUS` | `68` | NVMe threshold that pauses qBittorrent torrents. |
+| `QBT_RPI_COOLING_CPU_RESUME_CELSIUS` | `65` | CPU temperature required before clearing mitigation. |
+| `QBT_RPI_COOLING_NVME_RESUME_CELSIUS` | `60` | NVMe temperature required before clearing mitigation. |
+| `QBT_RPI_COOLING_RESUME_HOLD_SECONDS` | `900` | Time all readings must remain below resume thresholds. |
+| `QBT_RPI_COOLING_THROTTLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `2097152` | Download limit used for RPi thermal throttle. |
+| `QBT_RPI_COOLING_THROTTLE_UPLOAD_LIMIT_BYTES_PER_SEC` | `131072` | Upload limit used for RPi thermal throttle. |
+| `QBT_RPI_COOLING_BATCH_SUSPEND_ENABLED` | `false` | Suspend configured Kubernetes CronJobs during mitigation. |
+| `QBT_RPI_COOLING_BATCH_SUSPEND_TARGETS` | unset | Newline/comma list of `namespace/name` CronJobs to suspend. |
+| `QBT_RPI_COOLING_SHUTDOWN_ENABLED` | `false` | Allow immediate clean shutdown when shutdown thresholds are reached. |
+| `QBT_RPI_COOLING_LAST_RESORT_SHUTDOWN_ENABLED` | `false` | Allow clean shutdown only after sustained thermal pressure. |
+| `QBT_RPI_COOLING_LAST_RESORT_MIN_ACTIVE_SECONDS` | `1800` | Minimum active mitigation time before last-resort shutdown. |
+| `QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS` | `85` | CPU last-resort shutdown threshold. |
+| `QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS` | `80` | NVMe last-resort shutdown threshold. |
 | `QBT_RPI_COOLING_SHUTDOWN_URL_TEMPLATE` | `http://rpi-shutdown-{node}:8000/shutdown` | Per-node shutdown endpoint template. |
 | `QBT_RPI_COOLING_POWER_OFF_URLS` | unset | Newline/comma list of `node=url` endpoints called after the node becomes NotReady. |
 | `QBT_RPI_COOLING_POWER_ON_URLS` | unset | Newline/comma list of `node=url` endpoints called after the cooldown window. |
 | `QBT_RPI_COOLING_STATE_PATH` | `/state/rpi-cooling.json` | Persistent cooling lock file. |
 
 When enabled, the coordinator reads CPU and NVMe temperatures from Prometheus,
-requires every configured node to be Kubernetes `Ready`, and requests clean
-shutdown for only the hottest node over threshold. A persisted lock prevents a
-second node from being shut down while the first node is leaving or rejoining
-the cluster. If power URLs are configured, the lock advances from shutdown to
-cooling to booting and the controller powers the node back on after the cooldown
-window. The coordinator does not cordon or drain nodes before shutdown.
+requires every configured node to be Kubernetes `Ready`, and starts with
+service-preserving mitigations: qBittorrent throttle, qBittorrent pause, and
+optional CronJob suspension. A persisted state file keeps the same mitigation
+active until all temperatures remain below the resume thresholds for the hold
+window. Clean shutdown is disabled by default and is intended as last-resort
+protection; if enabled and power URLs are configured, the lock advances from
+shutdown to cooling to booting and the controller powers the node back on after
+the cooldown window. The coordinator does not cordon or drain nodes before
+shutdown.
 
 Logs default to plain text at `INFO` level. Set `QBT_LOG_FORMAT=json` for JSON
 lines and `QBT_LOG_LEVEL=debug` for detailed decision telemetry. Full decision

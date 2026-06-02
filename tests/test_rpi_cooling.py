@@ -6,36 +6,253 @@ import unittest
 from unittest import mock
 
 
+class FakeQbtClient:
+    base_url = "http://qbittorrent.test"
+
+    def __init__(self):
+        self.download_limits = []
+        self.upload_limits = []
+        self.stop_all_calls = 0
+
+    def set_download_limit(self, limit):
+        self.download_limits.append(limit)
+
+    def set_upload_limit(self, limit):
+        self.upload_limits.append(limit)
+
+    def stop_all(self):
+        self.stop_all_calls += 1
+
+
 class RpiCoolingTests(unittest.TestCase):
     def setUp(self):
         self.guard = importlib.import_module("qbittorrent_smart_queues.guard")
 
-    def manager(self, state_path):
+    def manager(self, state_path, extra_env=None):
         env = {
             "QBT_RPI_COOLING_ENABLED": "true",
             "PROMETHEUS_URL": "http://prometheus.test",
             "QBT_RPI_COOLING_STATE_PATH": state_path,
             "QBT_RPI_COOLING_NODES": "k8s-rpi1,k8s-rpi2,k8s-rpi3",
             "QBT_RPI_COOLING_SHUTDOWN_URL_TEMPLATE": "http://shutdown.test/{node}/shutdown",
+            "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "true",
             "QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS": "75",
             "QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS": "70",
         }
+        if extra_env:
+            env.update(extra_env)
         with mock.patch.dict("os.environ", env, clear=True):
             return self.guard.RpiThermalCoolingManager()
 
-    def manager_with_longhorn_check(self, state_path):
+    def manager_with_longhorn_check(self, state_path, extra_env=None):
         env = {
             "QBT_RPI_COOLING_ENABLED": "true",
             "PROMETHEUS_URL": "http://prometheus.test",
             "QBT_RPI_COOLING_STATE_PATH": state_path,
             "QBT_RPI_COOLING_NODES": "k8s-rpi1,k8s-rpi2,k8s-rpi3",
             "QBT_RPI_COOLING_SHUTDOWN_URL_TEMPLATE": "http://shutdown.test/{node}/shutdown",
+            "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "true",
             "QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS": "75",
             "QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS": "70",
             "QBT_RPI_COOLING_LONGHORN_REPLICA_CHECK_ENABLED": "true",
         }
+        if extra_env:
+            env.update(extra_env)
         with mock.patch.dict("os.environ", env, clear=True):
             return self.guard.RpiThermalCoolingManager()
+
+    def test_hot_node_throttles_qbittorrent_without_shutdown_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS": "85",
+                    "QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS": "80",
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 72.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 45.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(return_value={"enabled": True, "changed": [], "errors": []})
+
+            with mock.patch.object(self.guard, "request_json") as request_json:
+                result = manager.reconcile()
+
+            self.assertEqual("throttle", result["action"])
+            self.assertEqual("k8s-rpi2", result["candidate"]["node"])
+            manager.batch_work.reconcile.assert_called_once_with(True)
+            request_json.assert_not_called()
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            self.assertEqual("throttle", state["phase"])
+
+    def test_pause_mitigation_does_not_shutdown_until_last_resort_window_elapsed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(
+                    {
+                        "node": "k8s-rpi2",
+                        "phase": "pause",
+                        "started_at": "2099-01-01T00:00:00Z",
+                        "reason": "CPU temperature 86.0C reached threshold 74.0C",
+                    },
+                    state_file,
+                )
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_LAST_RESORT_SHUTDOWN_ENABLED": "true",
+                    "QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS": "85",
+                    "QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS": "80",
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 86.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 45.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(return_value={"enabled": True, "changed": [], "errors": []})
+
+            with mock.patch.object(self.guard, "request_json") as request_json:
+                result = manager.reconcile()
+
+            self.assertEqual("pause", result["action"])
+            request_json.assert_not_called()
+
+    def test_last_resort_shutdown_only_after_sustained_thermal_pressure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(
+                    {
+                        "node": "k8s-rpi2",
+                        "phase": "pause",
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "reason": "CPU temperature 86.0C reached threshold 74.0C",
+                    },
+                    state_file,
+                )
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_LAST_RESORT_SHUTDOWN_ENABLED": "true",
+                    "QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS": "85",
+                    "QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS": "80",
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 86.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 45.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(return_value={"enabled": True, "changed": [], "errors": []})
+
+            with mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
+                result = manager.reconcile()
+
+            self.assertEqual("shutdown_requested", result["action"])
+            request_json.assert_called_once()
+
+    def test_batch_work_stays_suspended_until_resume_hold_completes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(
+                    {
+                        "node": "k8s-rpi2",
+                        "phase": "throttle",
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "reason": "CPU temperature 72.0C reached threshold 70.0C",
+                    },
+                    state_file,
+                )
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_RESUME_HOLD_SECONDS": "900",
+                },
+            )
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 60.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 45.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(return_value={"enabled": True, "changed": [], "errors": []})
+
+            result = manager.reconcile()
+
+            self.assertEqual("throttle", result["action"])
+            manager.batch_work.reconcile.assert_called_once_with(True)
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            self.assertIn("clear_started_at", state)
+
+    def test_qbittorrent_throttle_action_limits_without_pausing(self):
+        client = FakeQbtClient()
+        env = {
+            "QBT_RPI_COOLING_THROTTLE_DOWNLOAD_LIMIT_BYTES_PER_SEC": "2097152",
+            "QBT_RPI_COOLING_THROTTLE_UPLOAD_LIMIT_BYTES_PER_SEC": "131072",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(self.guard, "cleanup_qbt_clients"):
+            result = self.guard.apply_rpi_cooling_stop(
+                [client],
+                {
+                    "enabled": True,
+                    "action": "throttle",
+                    "candidate": {"node": "k8s-rpi2"},
+                    "reason": "CPU temperature 72.0C reached threshold 70.0C",
+                },
+            )
+
+        self.assertTrue(result)
+        self.assertEqual([2097152], client.download_limits)
+        self.assertEqual([131072], client.upload_limits)
+        self.assertEqual(0, client.stop_all_calls)
+
+    def test_qbittorrent_pause_action_pauses_torrents(self):
+        client = FakeQbtClient()
+
+        with mock.patch.object(self.guard, "cleanup_qbt_clients"):
+            result = self.guard.apply_rpi_cooling_stop(
+                [client],
+                {
+                    "enabled": True,
+                    "action": "pause",
+                    "candidate": {"node": "k8s-rpi2"},
+                    "reason": "CPU temperature 75.0C reached threshold 74.0C",
+                },
+            )
+
+        self.assertTrue(result)
+        self.assertEqual([1], client.download_limits)
+        self.assertEqual([1], client.upload_limits)
+        self.assertEqual(1, client.stop_all_calls)
 
     def test_hot_node_requests_one_shutdown_and_persists_lock(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -222,11 +439,13 @@ class RpiCoolingTests(unittest.TestCase):
             with mock.patch.object(self.guard, "request_json") as request_json:
                 result = manager.reconcile()
 
-            self.assertEqual("skipped", result["action"])
+            self.assertEqual("pause", result["action"])
             self.assertIn("sole active Longhorn replica", result["reason"])
             self.assertEqual("media-downloads", result["longhorn"]["blocked_replicas"][0]["volume"])
             request_json.assert_not_called()
-            self.assertFalse(os.path.exists(state_path))
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            self.assertEqual("pause", state["phase"])
 
     def test_longhorn_blocked_cooling_requests_download_stop(self):
         reason = self.guard.rpi_cooling_stop_reason(

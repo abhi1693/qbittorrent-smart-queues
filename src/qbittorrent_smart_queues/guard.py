@@ -75,6 +75,9 @@ RPI_COOLING_NVME_QUERY = (
 )
 KUBERNETES_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBERNETES_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+THERMAL_ACTION_CLEAR = "clear"
+THERMAL_ACTION_THROTTLE = "throttle"
+THERMAL_ACTION_PAUSE = "pause"
 
 
 class ApiError(RuntimeError):
@@ -582,6 +585,81 @@ class KubernetesNodeClient:
             f"Longhorn replicas in namespace {namespace}",
         ).get("items", [])
 
+    def fetch_cronjob(self, namespace, name):
+        quoted_namespace = urllib.parse.quote(namespace, safe="")
+        quoted_name = urllib.parse.quote(name, safe="")
+        return self.fetch_path(
+            f"/apis/batch/v1/namespaces/{quoted_namespace}/cronjobs/{quoted_name}",
+            f"CronJob {namespace}/{name}",
+        )
+
+    def set_cronjob_suspended(self, namespace, name, suspended):
+        current = self.fetch_cronjob(namespace, name)
+        if bool((current.get("spec") or {}).get("suspend", False)) == bool(suspended):
+            return False
+        quoted_namespace = urllib.parse.quote(namespace, safe="")
+        quoted_name = urllib.parse.quote(name, safe="")
+        body = json.dumps({"spec": {"suspend": bool(suspended)}}).encode("utf-8")
+        self.request_path(
+            "PATCH",
+            f"/apis/batch/v1/namespaces/{quoted_namespace}/cronjobs/{quoted_name}",
+            f"CronJob {namespace}/{name}",
+            headers={"Content-Type": "application/merge-patch+json"},
+            body=body,
+        )
+        return True
+
+
+def parse_namespaced_names(value):
+    targets = []
+    for item in split_lines_or_csv(value):
+        if "/" not in item:
+            log_warning("Ignoring invalid namespaced target", target=item)
+            continue
+        namespace, name = item.split("/", 1)
+        namespace = namespace.strip()
+        name = name.strip()
+        if namespace and name:
+            targets.append((namespace, name))
+    return targets
+
+
+class BatchWorkSuspender:
+    def __init__(self, kubernetes):
+        self.enabled = env_bool("QBT_RPI_COOLING_BATCH_SUSPEND_ENABLED", False)
+        self.targets = parse_namespaced_names(os.environ.get("QBT_RPI_COOLING_BATCH_SUSPEND_TARGETS"))
+        self.fail_closed = env_bool("QBT_RPI_COOLING_BATCH_SUSPEND_FAIL_CLOSED", False)
+        self.kubernetes = kubernetes
+
+    def reconcile(self, suspended):
+        if not self.enabled:
+            return {"enabled": False, "changed": [], "errors": []}
+        changed = []
+        errors = []
+        for namespace, name in self.targets:
+            try:
+                if self.kubernetes.set_cronjob_suspended(namespace, name, suspended):
+                    changed.append({"namespace": namespace, "name": name, "suspend": bool(suspended)})
+                    log_info(
+                        "Updated thermal batch-work suspension",
+                        namespace=namespace,
+                        name=name,
+                        suspend=bool(suspended),
+                    )
+            except ApiError as exc:
+                error = {"namespace": namespace, "name": name, "error": str(exc)}
+                errors.append(error)
+                log_warning(
+                    "Failed to update thermal batch-work suspension",
+                    namespace=namespace,
+                    name=name,
+                    suspend=bool(suspended),
+                    error=str(exc),
+                )
+        if errors and self.fail_closed:
+            raise ApiError(f"failed to update thermal batch-work suspension for {len(errors)} CronJob(s)")
+        return {"enabled": True, "changed": changed, "errors": errors}
+
 
 class LonghornReplicaSafetyCheck:
     def __init__(self, kubernetes):
@@ -736,8 +814,18 @@ class RpiThermalCoolingManager:
         self.nodes = split_lines_or_csv(os.environ.get("QBT_RPI_COOLING_NODES")) or list(RPI_COOLING_DEFAULT_NODES)
         self.cpu_query = os.environ.get("QBT_RPI_COOLING_CPU_QUERY", RPI_COOLING_CPU_QUERY).strip()
         self.nvme_query = os.environ.get("QBT_RPI_COOLING_NVME_QUERY", RPI_COOLING_NVME_QUERY).strip()
-        self.cpu_threshold = env_float("QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS", 75.0)
-        self.nvme_threshold = env_float("QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS", 70.0)
+        self.cpu_throttle_threshold = env_float("QBT_RPI_COOLING_CPU_THROTTLE_CELSIUS", 70.0)
+        self.nvme_throttle_threshold = env_float("QBT_RPI_COOLING_NVME_THROTTLE_CELSIUS", 65.0)
+        self.cpu_pause_threshold = env_float("QBT_RPI_COOLING_CPU_PAUSE_CELSIUS", 74.0)
+        self.nvme_pause_threshold = env_float("QBT_RPI_COOLING_NVME_PAUSE_CELSIUS", 68.0)
+        self.cpu_resume_threshold = env_float("QBT_RPI_COOLING_CPU_RESUME_CELSIUS", 65.0)
+        self.nvme_resume_threshold = env_float("QBT_RPI_COOLING_NVME_RESUME_CELSIUS", 60.0)
+        self.resume_hold_seconds = env_int("QBT_RPI_COOLING_RESUME_HOLD_SECONDS", 900)
+        self.shutdown_enabled = env_bool("QBT_RPI_COOLING_SHUTDOWN_ENABLED", False)
+        self.last_resort_shutdown_enabled = env_bool("QBT_RPI_COOLING_LAST_RESORT_SHUTDOWN_ENABLED", False)
+        self.cpu_threshold = env_float("QBT_RPI_COOLING_CPU_SHUTDOWN_CELSIUS", 85.0)
+        self.nvme_threshold = env_float("QBT_RPI_COOLING_NVME_SHUTDOWN_CELSIUS", 80.0)
+        self.last_resort_min_active_seconds = env_int("QBT_RPI_COOLING_LAST_RESORT_MIN_ACTIVE_SECONDS", 1800)
         self.timeout = env_int("QBT_RPI_COOLING_PROMETHEUS_TIMEOUT", 5)
         self.shutdown_timeout_seconds = env_int("QBT_RPI_COOLING_SHUTDOWN_TIMEOUT_SECONDS", 300)
         self.cooldown_seconds = env_int("QBT_RPI_COOLING_COOLDOWN_SECONDS", 1200)
@@ -758,6 +846,7 @@ class RpiThermalCoolingManager:
         self.opener = urllib.request.build_opener()
         self.kubernetes = KubernetesNodeClient()
         self.longhorn_replicas = LonghornReplicaSafetyCheck(self.kubernetes)
+        self.batch_work = BatchWorkSuspender(self.kubernetes)
 
     def shutdown_url(self, node_name):
         return self.shutdown_urls.get(node_name) or self.shutdown_url_template.format(node=node_name)
@@ -835,24 +924,54 @@ class RpiThermalCoolingManager:
             for node_name in self.nodes
         }
 
-    def hot_candidate(self, temperatures):
+    def hot_candidate_for(self, temperatures, cpu_threshold, nvme_threshold):
         candidates = []
         for node_name, readings in temperatures.items():
             cpu_temp = readings.get("cpu")
             nvme_temp = readings.get("nvme")
-            if cpu_temp is not None and cpu_temp >= self.cpu_threshold:
-                candidates.append((cpu_temp - self.cpu_threshold, node_name, "CPU", cpu_temp))
-            if nvme_temp is not None and nvme_temp >= self.nvme_threshold:
-                candidates.append((nvme_temp - self.nvme_threshold, node_name, "NVMe", nvme_temp))
+            if cpu_temp is not None and cpu_temp >= cpu_threshold:
+                candidates.append((cpu_temp - cpu_threshold, node_name, "CPU", cpu_temp, cpu_threshold))
+            if nvme_temp is not None and nvme_temp >= nvme_threshold:
+                candidates.append((nvme_temp - nvme_threshold, node_name, "NVMe", nvme_temp, nvme_threshold))
         if not candidates:
             return None
-        _, node_name, kind, temperature = max(candidates, key=lambda item: (item[0], item[3]))
+        _, node_name, kind, temperature, threshold = max(candidates, key=lambda item: (item[0], item[3]))
         return {
             "node": node_name,
             "kind": kind,
             "temperature": temperature,
-            "threshold": self.cpu_threshold if kind == "CPU" else self.nvme_threshold,
+            "threshold": threshold,
         }
+
+    def hot_candidate(self, temperatures):
+        return self.hot_candidate_for(temperatures, self.cpu_threshold, self.nvme_threshold)
+
+    def thermal_action_candidate(self, temperatures):
+        pause_candidate = self.hot_candidate_for(
+            temperatures,
+            self.cpu_pause_threshold,
+            self.nvme_pause_threshold,
+        )
+        if pause_candidate:
+            return THERMAL_ACTION_PAUSE, pause_candidate
+        throttle_candidate = self.hot_candidate_for(
+            temperatures,
+            self.cpu_throttle_threshold,
+            self.nvme_throttle_threshold,
+        )
+        if throttle_candidate:
+            return THERMAL_ACTION_THROTTLE, throttle_candidate
+        return THERMAL_ACTION_CLEAR, None
+
+    def all_temperatures_below_resume(self, temperatures):
+        for readings in temperatures.values():
+            cpu_temp = readings.get("cpu")
+            nvme_temp = readings.get("nvme")
+            if cpu_temp is not None and cpu_temp >= self.cpu_resume_threshold:
+                return False
+            if nvme_temp is not None and nvme_temp >= self.nvme_resume_threshold:
+                return False
+        return True
 
     def cooling_state_from_candidate(self, candidate, now, phase):
         return {
@@ -866,6 +985,138 @@ class RpiThermalCoolingManager:
             "temperature_kind": candidate["kind"],
             "temperature_celsius": candidate["temperature"],
             "threshold_celsius": candidate["threshold"],
+        }
+
+    def thermal_state_from_candidate(self, action, candidate, now):
+        state = self.cooling_state_from_candidate(candidate, now, action)
+        state["thermal_action"] = action
+        state["last_active_at"] = format_utc(now)
+        state["shutdown_eligible_after"] = format_utc(now + timedelta(seconds=self.last_resort_min_active_seconds))
+        return state
+
+    def reconcile_batch_work(self, suspended):
+        return self.batch_work.reconcile(suspended)
+
+    def thermal_state_reconciled(self, active, now, ready):
+        node_name = active.get("node")
+        phase = active.get("phase")
+        if phase not in {THERMAL_ACTION_THROTTLE, THERMAL_ACTION_PAUSE}:
+            return None
+
+        temperatures = self.temperature_snapshot()
+        action, candidate = self.thermal_action_candidate(temperatures)
+        shutdown_candidate = self.hot_candidate(temperatures)
+        batch = self.reconcile_batch_work(True)
+
+        if action == THERMAL_ACTION_CLEAR and self.all_temperatures_below_resume(temperatures):
+            clear_started_at = parse_utc(active.get("clear_started_at"))
+            if clear_started_at is None:
+                active["clear_started_at"] = format_utc(now)
+                active["temperatures"] = temperatures
+                self.state.save(active)
+                log_info(
+                    "RPi thermal mitigation clear window started",
+                    node=node_name,
+                    resume_hold_seconds=self.resume_hold_seconds,
+                )
+                return {
+                    "enabled": True,
+                    "action": phase,
+                    "active": active,
+                    "candidate": {"node": node_name},
+                    "temperatures": temperatures,
+                    "ready": ready,
+                    "batch": batch,
+                    "reason": active.get("reason") or "",
+                }
+            clear_elapsed = max(0, int((now - clear_started_at).total_seconds()))
+            if clear_elapsed >= self.resume_hold_seconds:
+                self.state.clear()
+                batch = self.reconcile_batch_work(False)
+                log_info("RPi thermal mitigation cleared after resume hold", elapsed_seconds=clear_elapsed)
+                return {
+                    "enabled": True,
+                    "action": THERMAL_ACTION_CLEAR,
+                    "temperatures": temperatures,
+                    "ready": ready,
+                    "batch": batch,
+                }
+            active["temperatures"] = temperatures
+            self.state.save(active)
+            return {
+                "enabled": True,
+                "action": phase,
+                "active": active,
+                "candidate": {"node": node_name},
+                "temperatures": temperatures,
+                "ready": ready,
+                "batch": batch,
+                "reason": active.get("reason") or "",
+            }
+
+        if candidate:
+            if action != phase:
+                original_started_at = active.get("started_at")
+                active.update(self.thermal_state_from_candidate(action, candidate, now))
+                if original_started_at:
+                    active["started_at"] = original_started_at
+                log_warning(
+                    "RPi thermal mitigation changed state",
+                    node=candidate["node"],
+                    action=action,
+                    kind=candidate["kind"],
+                    temperature_celsius=round(candidate["temperature"], 1),
+                    threshold_celsius=round(candidate["threshold"], 1),
+                )
+            else:
+                active["last_active_at"] = format_utc(now)
+                active["clear_started_at"] = ""
+                active["temperatures"] = temperatures
+                active["reason"] = (
+                    f"{candidate['kind']} temperature {candidate['temperature']:.1f}C "
+                    f"reached threshold {candidate['threshold']:.1f}C"
+                )
+                active["temperature_kind"] = candidate["kind"]
+                active["temperature_celsius"] = candidate["temperature"]
+                active["threshold_celsius"] = candidate["threshold"]
+            self.state.save(active)
+
+        if (
+            shutdown_candidate
+            and (self.shutdown_enabled or self.last_resort_shutdown_enabled)
+            and ready.get(shutdown_candidate["node"]) is True
+        ):
+            started_at = parse_utc(active.get("started_at")) or now
+            active_elapsed = max(0, int((now - started_at).total_seconds()))
+            if self.shutdown_enabled or active_elapsed >= self.last_resort_min_active_seconds:
+                longhorn_safety = self.longhorn_replicas.evaluate(shutdown_candidate["node"])
+                if not longhorn_safety.get("safe", True):
+                    log_warning(
+                        "RPi last-resort shutdown skipped by Longhorn safety check",
+                        candidate=shutdown_candidate,
+                        reason=longhorn_safety.get("reason"),
+                    )
+                else:
+                    self.request_shutdown(shutdown_candidate, now, existing_state=active)
+                    return {
+                        "enabled": True,
+                        "action": "shutdown_requested",
+                        "candidate": shutdown_candidate,
+                        "ready": ready,
+                        "temperatures": temperatures,
+                        "longhorn": longhorn_safety,
+                        "batch": batch,
+                    }
+
+        return {
+            "enabled": True,
+            "action": active.get("phase") or action,
+            "active": active,
+            "candidate": candidate or {"node": node_name},
+            "temperatures": temperatures,
+            "ready": ready,
+            "batch": batch,
+            "reason": active.get("reason") or "",
         }
 
     def active_state_reconciled(self, now, ready):
@@ -890,6 +1141,10 @@ class RpiThermalCoolingManager:
             )
             self.state.clear()
             return True
+
+        thermal_reconcile = self.thermal_state_reconciled(active, now, ready)
+        if thermal_reconcile is not None:
+            return thermal_reconcile
 
         if phase == "shutdown_requested":
             if node_ready is False:
@@ -954,6 +1209,10 @@ class RpiThermalCoolingManager:
         node_name = candidate["node"]
         url = self.shutdown_url(node_name)
         state = dict(existing_state or self.cooling_state_from_candidate(candidate, now, "shutdown_requested"))
+        original_started_at = state.get("started_at")
+        state.update(self.cooling_state_from_candidate(candidate, now, "shutdown_requested"))
+        if original_started_at:
+            state["started_at"] = original_started_at
         state["phase"] = "shutdown_requested"
         state["shutdown_requested_at"] = format_utc(now)
         self.state.save(state)
@@ -978,7 +1237,10 @@ class RpiThermalCoolingManager:
 
         now = datetime.now(timezone.utc)
         ready = self.kubernetes.ready_map(self.nodes)
-        if self.active_state_reconciled(now, ready):
+        active_reconcile = self.active_state_reconciled(now, ready)
+        if active_reconcile:
+            if isinstance(active_reconcile, dict):
+                return active_reconcile
             active = self.state.load()
             return {
                 "enabled": True,
@@ -994,48 +1256,106 @@ class RpiThermalCoolingManager:
             return {"enabled": True, "action": "skipped", "reason": "not all nodes are Ready", "ready": ready}
 
         temperatures = self.temperature_snapshot()
-        candidate = self.hot_candidate(temperatures)
+        action, candidate = self.thermal_action_candidate(temperatures)
         if not candidate:
+            batch = self.reconcile_batch_work(False)
             return {
                 "enabled": True,
-                "action": "clear",
+                "action": THERMAL_ACTION_CLEAR,
                 "temperatures": temperatures,
                 "ready": ready,
+                "batch": batch,
             }
 
-        if ready.get(candidate["node"]) is not True:
-            log_warning("RPi cooling candidate is not Ready; shutdown skipped", candidate=candidate, ready=ready)
+        batch = self.reconcile_batch_work(True)
+        state = self.thermal_state_from_candidate(action, candidate, now)
+        state["temperatures"] = temperatures
+        self.state.save(state)
+        log_warning(
+            "RPi thermal mitigation started",
+            node=candidate["node"],
+            action=action,
+            kind=candidate["kind"],
+            temperature_celsius=round(candidate["temperature"], 1),
+            threshold_celsius=round(candidate["threshold"], 1),
+        )
+
+        shutdown_candidate = self.hot_candidate(temperatures)
+        if not shutdown_candidate:
             return {
                 "enabled": True,
-                "action": "skipped",
-                "reason": "candidate node is not Ready",
+                "action": action,
                 "candidate": candidate,
+                "active": state,
+                "temperatures": temperatures,
                 "ready": ready,
+                "batch": batch,
             }
 
-        longhorn_safety = self.longhorn_replicas.evaluate(candidate["node"])
+        if not (self.shutdown_enabled or self.last_resort_shutdown_enabled):
+            return {
+                "enabled": True,
+                "action": action,
+                "candidate": candidate,
+                "active": state,
+                "temperatures": temperatures,
+                "ready": ready,
+                "batch": batch,
+            }
+
+        if ready.get(shutdown_candidate["node"]) is not True:
+            log_warning("RPi cooling candidate is not Ready; shutdown skipped", candidate=shutdown_candidate, ready=ready)
+            return {
+                "enabled": True,
+                "action": action,
+                "reason": "shutdown candidate node is not Ready",
+                "candidate": candidate,
+                "active": state,
+                "temperatures": temperatures,
+                "ready": ready,
+                "batch": batch,
+            }
+
+        if self.last_resort_shutdown_enabled and not self.shutdown_enabled:
+            return {
+                "enabled": True,
+                "action": action,
+                "candidate": candidate,
+                "active": state,
+                "temperatures": temperatures,
+                "ready": ready,
+                "batch": batch,
+            }
+
+        longhorn_safety = self.longhorn_replicas.evaluate(shutdown_candidate["node"])
         if not longhorn_safety.get("safe", True):
             log_warning(
                 "RPi cooling candidate failed Longhorn replica safety check; shutdown skipped",
-                candidate=candidate,
+                candidate=shutdown_candidate,
                 reason=longhorn_safety.get("reason"),
             )
             return {
                 "enabled": True,
-                "action": "skipped",
+                "action": action,
                 "reason": longhorn_safety.get("reason") or "Longhorn replica safety check failed",
                 "candidate": candidate,
+                "shutdown_candidate": shutdown_candidate,
+                "active": state,
+                "temperatures": temperatures,
                 "ready": ready,
                 "longhorn": longhorn_safety,
+                "batch": batch,
             }
 
-        self.request_shutdown(candidate, now)
+        self.request_shutdown(shutdown_candidate, now, existing_state=state)
         return {
             "enabled": True,
             "action": "shutdown_requested",
-            "candidate": candidate,
+            "candidate": shutdown_candidate,
             "ready": ready,
+            "temperatures": temperatures,
             "longhorn": longhorn_safety,
+            "batch": batch,
         }
 
 
@@ -1466,20 +1786,18 @@ def apply_fail_closed():
     return True
 
 
-def apply_stop_limits(clients, reason, pause_torrents, decision_context=None):
-    stop_limit = env_int("QBT_STOP_DOWNLOAD_LIMIT_BYTES_PER_SEC", 1)
-    stop_upload_limit = env_int("QBT_STOP_UPLOAD_LIMIT_BYTES_PER_SEC", 1)
+def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_limit, decision_context=None):
     for client in clients:
-        client.set_download_limit(stop_limit)
-        client.set_upload_limit(stop_upload_limit)
+        client.set_download_limit(download_limit)
+        client.set_upload_limit(upload_limit)
         emit_decision_log(
             "qbt_guard_stop",
             **decision_base_context(decision_context, client),
             action="pause_all" if pause_torrents else "throttle",
             reason=reason,
             effective_cap={
-                "download_limit_bytes_per_sec": stop_limit,
-                "upload_limit_bytes_per_sec": stop_upload_limit,
+                "download_limit_bytes_per_sec": download_limit,
+                "upload_limit_bytes_per_sec": upload_limit,
             },
         )
         if pause_torrents:
@@ -1488,10 +1806,22 @@ def apply_stop_limits(clients, reason, pause_torrents, decision_context=None):
         else:
             log_decision_info(
                 "throttle",
-                f"Throttled qBittorrent to {human_rate(stop_limit)} down "
-                f"and {human_rate(stop_upload_limit)} up; {reason}",
+                f"Throttled qBittorrent to {human_rate(download_limit)} down "
+                f"and {human_rate(upload_limit)} up; {reason}",
                 reason=reason,
             )
+
+
+def apply_stop_limits(clients, reason, pause_torrents, decision_context=None):
+    stop_limit = env_int("QBT_STOP_DOWNLOAD_LIMIT_BYTES_PER_SEC", 1)
+    stop_upload_limit = env_int("QBT_STOP_UPLOAD_LIMIT_BYTES_PER_SEC", 1)
+    apply_qbt_limits(clients, reason, pause_torrents, stop_limit, stop_upload_limit, decision_context)
+
+
+def apply_thermal_throttle_limits(clients, reason, decision_context=None):
+    download_limit = env_int("QBT_RPI_COOLING_THROTTLE_DOWNLOAD_LIMIT_BYTES_PER_SEC", 2 * 1024 * 1024)
+    upload_limit = env_int("QBT_RPI_COOLING_THROTTLE_UPLOAD_LIMIT_BYTES_PER_SEC", 128 * 1024)
+    apply_qbt_limits(clients, reason, False, download_limit, upload_limit, decision_context)
 
 
 def full_guard_thermal_state():
@@ -1540,6 +1870,25 @@ def rpi_cooling_stop_reason(rpi_cooling_state):
         return f"RPi thermal cooling active for {node_name}"
     if rpi_cooling_state.get("action") == "shutdown_requested" and node_name:
         return f"RPi thermal cooling shutdown requested for {node_name}"
+    thermal_action = rpi_cooling_qbt_action(rpi_cooling_state)
+    if thermal_action in {THERMAL_ACTION_THROTTLE, THERMAL_ACTION_PAUSE}:
+        reason = rpi_cooling_state.get("reason") or active.get("reason") or "RPi thermal mitigation active"
+        if node_name:
+            return f"RPi thermal mitigation {thermal_action} active for {node_name}: {reason}"
+        return f"RPi thermal mitigation {thermal_action} active: {reason}"
+    return ""
+
+
+def rpi_cooling_qbt_action(rpi_cooling_state):
+    if not rpi_cooling_state or not rpi_cooling_state.get("enabled", True):
+        return ""
+    action = rpi_cooling_state.get("action")
+    active = rpi_cooling_state.get("active") or {}
+    phase = active.get("phase")
+    if action in {THERMAL_ACTION_THROTTLE, THERMAL_ACTION_PAUSE}:
+        return action
+    if action == "active" and phase in {THERMAL_ACTION_THROTTLE, THERMAL_ACTION_PAUSE}:
+        return phase
     return ""
 
 
@@ -1551,7 +1900,11 @@ def apply_rpi_cooling_stop(clients, rpi_cooling_state, decision_context=None):
         return False
     context = dict(decision_context or {})
     context["rpi_cooling"] = rpi_cooling_state
-    apply_stop_limits(clients, reason, pause_torrents=True, decision_context=context)
+    qbt_action = rpi_cooling_qbt_action(rpi_cooling_state)
+    if qbt_action == THERMAL_ACTION_THROTTLE:
+        apply_thermal_throttle_limits(clients, reason, decision_context=context)
+    else:
+        apply_stop_limits(clients, reason, pause_torrents=True, decision_context=context)
     cleanup_qbt_clients(clients)
     return True
 
