@@ -380,6 +380,40 @@ class RpiCoolingTests(unittest.TestCase):
             manager.batch_work.reconcile.assert_called_once_with(False, original_suspensions)
             self.assertFalse(os.path.exists(state_path))
 
+    def test_clear_without_active_state_restores_batch_work(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_BATCH_SUSPEND_ENABLED": "true",
+                    "QBT_RPI_COOLING_BATCH_SUSPEND_TARGETS": "media/active-job",
+                },
+            )
+            manager.kubernetes = FakeKubernetesCronJobClient({
+                ("media", "active-job"): True,
+            })
+            manager.batch_work.kubernetes = manager.kubernetes
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 60.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 45.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+
+            result = manager.reconcile()
+
+            self.assertEqual("clear", result["action"])
+            self.assertEqual(
+                [{"namespace": "media", "name": "active-job", "suspend": False}],
+                result["batch"]["changed"],
+            )
+            self.assertFalse(manager.kubernetes.suspensions[("media", "active-job")])
+
     def test_qbittorrent_throttle_action_limits_without_pausing(self):
         client = FakeQbtClient()
         env = {

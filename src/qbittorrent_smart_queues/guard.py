@@ -1298,12 +1298,7 @@ class RpiThermalCoolingManager:
         if active_state is None:
             if suspended:
                 return self.batch_work.reconcile(True)
-            return {
-                "enabled": self.batch_work.enabled,
-                "changed": [],
-                "errors": [],
-                "reason": "no active thermal batch-work state to restore",
-            }
+            return self.batch_work.reconcile(False)
 
         if (
             suspended
