@@ -438,6 +438,29 @@ class RpiCoolingTests(unittest.TestCase):
         self.assertEqual([131072], client.upload_limits)
         self.assertEqual(0, client.stop_all_calls)
 
+    def test_shutdown_stop_all_downloads_pauses_torrents(self):
+        client = FakeQbtClient()
+        env = {
+            "QBT_STOP_DOWNLOAD_LIMIT_BYTES_PER_SEC": "1",
+            "QBT_STOP_UPLOAD_LIMIT_BYTES_PER_SEC": "1",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(self.guard, "reachable_qbt_clients", return_value=[client]):
+            result = self.guard.stop_all_downloads_for_shutdown("test shutdown")
+
+        self.assertEqual(0, result)
+        self.assertEqual([1], client.download_limits)
+        self.assertEqual([1], client.upload_limits)
+        self.assertEqual(1, client.stop_all_calls)
+
+    def test_stop_all_downloads_cli_uses_shutdown_guard(self):
+        with mock.patch.object(self.guard, "stop_all_downloads_for_shutdown", return_value=0) as stop_all:
+            result = self.guard.main(["--stop-all-downloads"])
+
+        self.assertEqual(0, result)
+        stop_all.assert_called_once_with("smart queues lifecycle hook")
+
     def test_qbittorrent_thermal_action_skips_limits_when_no_active_downloads(self):
         client = FakeQbtClient(
             torrents=[

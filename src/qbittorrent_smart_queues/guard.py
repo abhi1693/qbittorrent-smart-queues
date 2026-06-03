@@ -2289,6 +2289,37 @@ def apply_stop_limits(clients, reason, pause_torrents, decision_context=None):
     apply_qbt_limits(clients, reason, pause_torrents, stop_limit, stop_upload_limit, decision_context)
 
 
+def stop_all_downloads_for_shutdown(reason="smart queues controller stopping"):
+    clients = reachable_qbt_clients()
+    if not clients:
+        log_error("No qBittorrent clients reachable while stopping downloads for shutdown")
+        return 1
+
+    stop_limit = env_int("QBT_STOP_DOWNLOAD_LIMIT_BYTES_PER_SEC", 1)
+    stop_upload_limit = env_int("QBT_STOP_UPLOAD_LIMIT_BYTES_PER_SEC", 1)
+    failed = 0
+    for client in clients:
+        try:
+            client.set_download_limit(stop_limit)
+            client.set_upload_limit(stop_upload_limit)
+            client.stop_all()
+            log_decision_info(
+                "pause_all",
+                "Paused all torrents because smart queues controller is stopping",
+                reason=reason,
+                qbt_url=getattr(client, "base_url", ""),
+            )
+        except ApiError as exc:
+            failed += 1
+            log_error(
+                "Failed to stop qBittorrent downloads before smart queues shutdown",
+                qbt_url=getattr(client, "base_url", ""),
+                error=str(exc),
+            )
+
+    return 1 if failed == len(clients) else 0
+
+
 def apply_thermal_throttle_limits(clients, reason, decision_context=None):
     download_limit = env_int("QBT_RPI_COOLING_THROTTLE_DOWNLOAD_LIMIT_BYTES_PER_SEC", 2 * 1024 * 1024)
     upload_limit = env_int("QBT_RPI_COOLING_THROTTLE_UPLOAD_LIMIT_BYTES_PER_SEC", 128 * 1024)
@@ -5360,13 +5391,23 @@ def run_loop():
         if sleep_seconds > 0 and stop_event.wait(sleep_seconds):
             break
 
+    result = 0
+    if env_bool("QBT_STOP_DOWNLOADS_ON_SHUTDOWN", False):
+        result = stop_all_downloads_for_shutdown()
+
     log_info("Continuous qBittorrent guard loop stopped")
-    return 0
+    return result
 
 
-def main():
+def main(argv=None):
+    args = list(argv or [])
+    if args == ["--stop-all-downloads"]:
+        return stop_all_downloads_for_shutdown("smart queues lifecycle hook")
+    if args:
+        log_error(f"Unknown argument(s): {' '.join(args)}")
+        return 2
     return run_loop()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
