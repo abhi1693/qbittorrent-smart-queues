@@ -49,6 +49,25 @@ class CandidateSortingTests(unittest.TestCase):
             ),
         )
 
+    def sort_balanced(self, torrents, health_store):
+        return sorted(
+            torrents,
+            key=lambda torrent: self.guard.candidate_sort_key(
+                torrent,
+                set(),
+                set(),
+                set(),
+                {},
+                set(),
+                {},
+                3,
+                1.05,
+                health_store,
+                self.now,
+                "balanced",
+            ),
+        )
+
     def sort_with_movie_queue(self, torrents, health_store, movie_state):
         return sorted(
             torrents,
@@ -104,6 +123,66 @@ class CandidateSortingTests(unittest.TestCase):
         ordered = self.sort([unhealthy, healthy], store)
 
         self.assertEqual(["healthy", "unhealthy"], [item["hash"] for item in ordered])
+
+    def test_balanced_strategy_prefers_near_complete_candidate(self):
+        early = self.torrent("early", progress=0.25, amount_left=80 * 1024 * 1024 * 1024)
+        almost_done = self.torrent("almost-done", progress=0.94, amount_left=5 * 1024 * 1024 * 1024)
+        store = FakeHealthStore({"early": 40.0, "almost-done": 0.0})
+
+        ordered = self.sort_balanced([early, almost_done], store)
+
+        self.assertEqual(["almost-done", "early"], [item["hash"] for item in ordered])
+
+    def test_balanced_strategy_still_keeps_priority_tier_first(self):
+        priority = self.torrent("priority", tags="priority", progress=0.05, amount_left=90 * 1024 * 1024 * 1024)
+        almost_done = self.torrent("almost-done", progress=0.99, amount_left=1024 * 1024 * 1024)
+        store = FakeHealthStore({"priority": -50.0, "almost-done": 100.0})
+
+        ordered = sorted(
+            [almost_done, priority],
+            key=lambda torrent: self.guard.candidate_sort_key(
+                torrent,
+                {"priority"},
+                set(),
+                set(),
+                {},
+                set(),
+                {},
+                3,
+                1.05,
+                store,
+                self.now,
+                "balanced",
+            ),
+        )
+
+        self.assertEqual(["priority", "almost-done"], [item["hash"] for item in ordered])
+
+    def test_preemption_uses_balanced_score_margin(self):
+        current = self.torrent(
+            "current",
+            state="downloading",
+            dlspeed=900_000,
+            progress=0.25,
+            amount_left=60 * 1024 * 1024 * 1024,
+        )
+        challenger = self.torrent(
+            "challenger",
+            state="stoppedDL",
+            progress=0.95,
+            amount_left=4 * 1024 * 1024 * 1024,
+        )
+        store = FakeHealthStore({"current": 20.0, "challenger": 0.0})
+
+        should_preempt = self.guard.should_preempt_productive_torrent(
+            current,
+            challenger,
+            store,
+            self.now,
+            20.0,
+        )
+
+        self.assertTrue(should_preempt)
 
     def test_radarr_movie_queue_position_breaks_before_health_score(self):
         first_in_radarr = self.torrent("first")

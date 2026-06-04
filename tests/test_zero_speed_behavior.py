@@ -201,6 +201,84 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             )
         )
 
+    def test_apply_single_download_preempts_productive_for_better_balanced_candidate(self):
+        client = FakeQbtClient([
+            {
+                "hash": "current",
+                "name": "Current.Movie.1080p",
+                "category": "movies",
+                "state": "downloading",
+                "dlspeed": 900_000,
+                "amount_left": 60 * 1024 * 1024 * 1024,
+                "downloaded": 100,
+                "progress": 0.25,
+                "availability": 1.0,
+                "num_seeds": 1,
+                "num_complete": 1,
+                "tags": "",
+            },
+            {
+                "hash": "challenger",
+                "name": "Challenger.Movie.1080p",
+                "category": "movies",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 4 * 1024 * 1024 * 1024,
+                "downloaded": 100,
+                "progress": 0.95,
+                "availability": 1.0,
+                "num_seeds": 1,
+                "num_complete": 1,
+                "tags": "",
+            },
+        ])
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_SELECTION_STRATEGY": "balanced",
+            "QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED": "true",
+            "QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN": "20",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+            "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                )
+
+        decision_logs = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{")
+        ]
+        decision_events = [
+            item for item in decision_logs
+            if item.get("event") == "qbt_guard_decision"
+        ]
+        preempt_event = next(item for item in decision_events if item.get("action") == "preempt_productive")
+        try_event = next(item for item in decision_events if item.get("action") == "try_candidate")
+
+        self.assertEqual("challenger", preempt_event["selected_torrent"]["hash"])
+        self.assertEqual(1, preempt_event["rejected_counts"]["preempted_productive"])
+        self.assertEqual("challenger", try_event["selected_torrent"]["hash"])
+        self.assertIn(["current"], client.stopped)
+        self.assertIn(["challenger"], client.started)
+        self.assertNotIn(["current"], client.started)
+
     def test_tv_queue_order_blocks_priority_later_episode(self):
         client = FakeQbtClient([
             {

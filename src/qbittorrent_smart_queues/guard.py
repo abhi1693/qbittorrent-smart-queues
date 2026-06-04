@@ -3881,6 +3881,55 @@ def candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability)
     return 2
 
 
+def selection_strategy():
+    strategy = os.environ.get("QBT_SINGLE_DOWNLOAD_SELECTION_STRATEGY", "tiered").strip().lower()
+    if strategy in {"balanced", "score", "scored"}:
+        return "balanced"
+    return "tiered"
+
+
+def candidate_balanced_score(torrent, health_store, now):
+    score = health_store.score(torrent, now)
+
+    progress = torrent_progress(torrent)
+    score += min(40.0, progress * 40.0)
+    if progress >= 0.90:
+        score += 30.0
+    elif progress >= 0.75:
+        score += 18.0
+    elif progress >= 0.50:
+        score += 8.0
+
+    remaining = torrent_amount_left(torrent)
+    gib = 1024 * 1024 * 1024
+    if remaining > 0:
+        if remaining <= 2 * gib:
+            score += 25.0
+        elif remaining <= 5 * gib:
+            score += 18.0
+        elif remaining <= 15 * gib:
+            score += 10.0
+        elif remaining >= 75 * gib:
+            score -= 10.0
+
+    eta = torrent_eta_seconds(torrent)
+    if eta is not None and eta > 0:
+        if eta <= 6 * 3600:
+            score += 20.0
+        elif eta <= 24 * 3600:
+            score += 12.0
+        elif eta <= 2 * 24 * 3600:
+            score += 6.0
+        elif eta >= 7 * 24 * 3600:
+            score -= 12.0
+
+    sources = max(torrent_connected_seeds(torrent), torrent_reported_seeds(torrent))
+    score += min(20.0, sources * 2.0)
+    score += min(15.0, torrent_availability(torrent) * 5.0)
+
+    return max(-150.0, min(200.0, score))
+
+
 class TorrentHealthStore:
     def __init__(self):
         self.enabled = env_bool("QBT_TORRENT_HEALTH_SCORING_ENABLED", True)
@@ -4141,9 +4190,15 @@ def candidate_sort_key(
     healthy_min_availability,
     health_store,
     now,
+    strategy=None,
 ):
+    strategy = strategy or selection_strategy()
     is_priority = bool(torrent_priority_reason(torrent, priority_tags, priority_categories))
     reported_sources = max(torrent_connected_seeds(torrent), torrent_reported_seeds(torrent))
+    if strategy == "balanced":
+        score = candidate_balanced_score(torrent, health_store, now)
+    else:
+        score = health_store.score(torrent, now)
     return (
         0 if is_priority else 1,
         media_queue_order_key(
@@ -4153,7 +4208,7 @@ def candidate_sort_key(
             movie_order_categories,
             movie_order_state,
         ),
-        -health_store.score(torrent, now),
+        -score,
         candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
         -min(torrent_availability(torrent), 100.0),
         -reported_sources,
@@ -4162,6 +4217,18 @@ def candidate_sort_key(
         torrent_amount_left(torrent),
         torrent_name(torrent).lower(),
     )
+
+
+def should_preempt_productive_torrent(current, challenger, health_store, now, score_margin):
+    if not current or not challenger:
+        return False
+    if torrent_hash(current) == torrent_hash(challenger):
+        return False
+    if is_running_torrent(challenger):
+        return False
+    current_score = candidate_balanced_score(current, health_store, now)
+    challenger_score = candidate_balanced_score(challenger, health_store, now)
+    return challenger_score >= current_score + max(0.0, float(score_margin))
 
 
 def selected_storage_remaining_state(client, torrent):
@@ -4413,6 +4480,9 @@ def apply_single_download(
     slow_max_eta_seconds = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MAX_ETA_SECONDS", 172_800)
     healthy_min_seeds = env_int("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_SEEDS", 3)
     healthy_min_availability = env_float("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_AVAILABILITY", 1.05)
+    selection_strategy_name = selection_strategy()
+    preempt_productive_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED", False)
+    preempt_productive_score_margin = env_float("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN", 25.0)
     tv_file_priority_enabled = env_bool("QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED", True)
     tv_file_priority_lookahead = env_int("QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_LOOKAHEAD_EPISODES", 2)
     categories = {
@@ -4572,6 +4642,7 @@ def apply_single_download(
                     healthy_min_availability,
                     health_store,
                     now,
+                    selection_strategy_name,
                 ),
             )
             candidates = []
@@ -4675,7 +4746,58 @@ def apply_single_download(
                 "watched_tv_episode_torrents": len(tv_order_state.get("watch_priorities", {})),
                 "productive": len(productive_candidates),
                 "slow": len(slow_candidates),
+                "selection_strategy": selection_strategy_name,
             }
+
+            if productive_candidates and preempt_productive_enabled and selection_candidates:
+                keep = productive_candidates[0]
+                challenger = selection_candidates[0]
+                if should_preempt_productive_torrent(
+                    keep,
+                    challenger,
+                    health_store,
+                    now,
+                    preempt_productive_score_margin,
+                ):
+                    keep_hash = torrent_hash(keep)
+                    challenger_score = candidate_balanced_score(challenger, health_store, now)
+                    keep_score = candidate_balanced_score(keep, health_store, now)
+                    reason = (
+                        f"candidate balanced score {challenger_score:.1f} beats "
+                        f"productive torrent score {keep_score:.1f} by at least "
+                        f"{preempt_productive_score_margin:.1f}"
+                    )
+                    client.stop_hashes([keep_hash])
+                    attempted_hashes.add(keep_hash)
+                    rejected_counts["preempted_productive"] += 1
+                    candidate_counts["preempted_productive"] = 1
+                    productive_candidates = [
+                        torrent for torrent in productive_candidates
+                        if torrent_hash(torrent) != keep_hash
+                    ]
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action="preempt_productive",
+                        reason=reason,
+                        selected_torrent=torrent_decision_summary(challenger),
+                        rejected_counts=dict(rejected_counts),
+                        candidate_counts=candidate_counts,
+                        rejected_torrents=[
+                            {
+                                "torrent": torrent_decision_summary(keep),
+                                "reason": reason,
+                            },
+                        ],
+                    )
+                    log_decision_info(
+                        "preempt_productive",
+                        f"Preempting productive torrent {torrent_name(keep)} for "
+                        f"{torrent_name(challenger)}; {reason}",
+                        selected=torrent_name(challenger),
+                        reason=reason,
+                    )
+                    continue
 
             if productive_candidates:
                 keep = productive_candidates[0]
