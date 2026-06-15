@@ -3565,7 +3565,7 @@ def selected_file_remaining_state(files):
 
     if selected_count <= 0:
         return {
-            "remaining_bytes": 0,
+            "remaining_bytes": None,
             "selected_count": 0,
             "selected_size": 0,
             "present_bytes": 0,
@@ -4260,18 +4260,72 @@ def selected_storage_remaining_state(client, torrent):
     return file_state
 
 
+def storage_state_is_reserve_constrained(storage_guard, storage_state):
+    if not storage_guard or not storage_guard.require_torrent_fit:
+        return False
+    if not storage_state or not storage_state.get("enabled"):
+        return False
+    if storage_state.get("free_bytes") is None or storage_state.get("reserve_bytes") is None:
+        return False
+    return int(storage_state.get("free_bytes") or 0) <= int(storage_state.get("reserve_bytes") or 0)
+
+
+def storage_fit_headroom_bytes(storage_guard, storage_state):
+    if storage_state_is_reserve_constrained(storage_guard, storage_state):
+        return max(0, int(storage_state.get("free_bytes") or 0))
+    return max(0, int((storage_state or {}).get("headroom_bytes") or 0))
+
+
+def storage_hard_stop_required(storage_guard, storage_state):
+    if not storage_state or not storage_state.get("enabled") or not storage_state.get("stop"):
+        return False
+    return not storage_state_is_reserve_constrained(storage_guard, storage_state)
+
+
+def storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state):
+    if not storage_guard or not storage_guard.require_torrent_fit:
+        return torrent_amount_left(torrent)
+    if not storage_state or not storage_state.get("enabled"):
+        return torrent_amount_left(torrent)
+
+    remaining_state = selected_storage_remaining_state(client, torrent)
+    if remaining_state.get("selected_count") == 0:
+        return None
+
+    remaining_raw = remaining_state.get("remaining_bytes")
+    if remaining_raw is None:
+        return None
+
+    remaining_bytes = int(remaining_raw or 0)
+    if remaining_bytes <= 0 and torrent_progress(torrent) < 1.0:
+        return None
+
+    return max(0, remaining_bytes)
+
+
 def storage_torrent_block_reason(client, torrent, storage_guard, storage_state):
     if not storage_guard or not storage_guard.require_torrent_fit:
         return ""
-    if not storage_state or not storage_state.get("enabled") or storage_state.get("stop"):
+    if not storage_state or not storage_state.get("enabled"):
         return ""
+    if storage_state.get("stop") and storage_hard_stop_required(storage_guard, storage_state):
+        return storage_state.get("reason") or "download storage guard requires stopping all torrents"
 
     remaining_state = selected_storage_remaining_state(client, torrent)
-    remaining_bytes = int(remaining_state.get("remaining_bytes") or 0)
+    if remaining_state.get("selected_count") == 0:
+        return "no selected files are available to verify download storage fit"
+
+    remaining_raw = remaining_state.get("remaining_bytes")
+    if remaining_raw is None:
+        return "remaining download size is unknown; cannot verify download storage fit"
+
+    remaining_bytes = int(remaining_raw or 0)
     if remaining_bytes <= 0:
+        if torrent_progress(torrent) < 1.0:
+            return "remaining download size is unknown for incomplete torrent; cannot verify download storage fit"
         return ""
 
-    headroom_bytes = max(0, int(storage_state.get("headroom_bytes") or 0))
+    headroom_bytes = storage_fit_headroom_bytes(storage_guard, storage_state)
     if remaining_bytes <= headroom_bytes:
         return ""
 
@@ -4527,21 +4581,29 @@ def apply_single_download(
         )
         if storage_guard:
             if storage_state.get("stop"):
-                emit_decision_log(
-                    "qbt_guard_decision",
-                    **decision_base_context(run_decision_context, client, storage_state),
-                    action="stop_for_storage",
-                    reason=storage_state["reason"],
-                    rejected_counts={"storage_stop": 1},
-                    selected_torrent=None,
-                )
-                client.stop_all()
+                if storage_hard_stop_required(storage_guard, storage_state):
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action="stop_for_storage",
+                        reason=storage_state["reason"],
+                        rejected_counts={"storage_stop": 1},
+                        selected_torrent=None,
+                    )
+                    client.stop_all()
+                    log_decision_info(
+                        "stop_for_storage",
+                        f"Paused all torrents; {storage_state['reason']}",
+                        reason=storage_state["reason"],
+                    )
+                    continue
                 log_decision_info(
-                    "stop_for_storage",
-                    f"Paused all torrents; {storage_state['reason']}",
+                    "storage_constrained_fit_only",
+                    f"{storage_state['reason']}; only torrents that fit in "
+                    f"{human_size(storage_fit_headroom_bytes(storage_guard, storage_state))} free space "
+                    "will be considered",
                     reason=storage_state["reason"],
                 )
-                continue
         attempted_hashes = set()
         attempt = 0
         deadline = time.monotonic() + max_run_seconds
@@ -4589,23 +4651,25 @@ def apply_single_download(
             if storage_guard:
                 storage_state = storage_guard.snapshot()
                 if storage_state.get("stop"):
-                    client.stop_all()
-                    emit_decision_log(
-                        "qbt_guard_decision",
-                        **decision_base_context(run_decision_context, client, storage_state),
-                        action="stop_for_storage",
-                        reason=storage_state["reason"],
-                        rejected_counts={"storage_stop": 1},
-                        selected_torrent=None,
-                    )
-                    log_decision_info(
-                        "stop_for_storage",
-                        f"Paused all torrents; {storage_state['reason']}",
-                        reason=storage_state["reason"],
-                    )
-                    break
+                    if storage_hard_stop_required(storage_guard, storage_state):
+                        client.stop_all()
+                        emit_decision_log(
+                            "qbt_guard_decision",
+                            **decision_base_context(run_decision_context, client, storage_state),
+                            action="stop_for_storage",
+                            reason=storage_state["reason"],
+                            rejected_counts={"storage_stop": 1},
+                            selected_torrent=None,
+                        )
+                        log_decision_info(
+                            "stop_for_storage",
+                            f"Paused all torrents; {storage_state['reason']}",
+                            reason=storage_state["reason"],
+                        )
+                        break
             else:
                 storage_state = None
+            storage_constrained_mode = storage_state_is_reserve_constrained(storage_guard, storage_state)
 
             rejected_counts = Counter()
             eligible_torrents = []
@@ -4671,6 +4735,14 @@ def apply_single_download(
                     continue
                 candidates.append(torrent)
 
+            if storage_constrained_mode:
+                candidates.sort(
+                    key=lambda torrent: (
+                        storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state),
+                        torrent_name(torrent).lower(),
+                    )
+                )
+
             available_candidates = []
             cooldown_count = 0
             for torrent in candidates:
@@ -4705,12 +4777,16 @@ def apply_single_download(
                 torrent for torrent in available_candidates
                 if torrent_priority_reason(torrent, priority_tags, priority_categories)
             ]
-            selection_candidates = watch_priority_candidates or priority_candidates or available_candidates
-            if watch_priority_candidates:
+            if storage_constrained_mode:
+                selection_candidates = available_candidates[:1]
+                rejected_counts["deferred_by_storage_smallest_fit"] += max(0, len(available_candidates) - 1)
+            else:
+                selection_candidates = watch_priority_candidates or priority_candidates or available_candidates
+            if not storage_constrained_mode and watch_priority_candidates:
                 rejected_counts["deferred_by_watch_activity"] += (
                     len(available_candidates) - len(watch_priority_candidates)
                 )
-            elif priority_candidates:
+            elif not storage_constrained_mode and priority_candidates:
                 rejected_counts["deferred_by_priority"] += len(available_candidates) - len(priority_candidates)
 
             productive_candidates = []
@@ -4729,6 +4805,8 @@ def apply_single_download(
                     slow_min_rate_bytes,
                     slow_max_eta_seconds,
                 )
+                if storage_constrained_mode:
+                    slow_reason = ""
                 if slow_reason:
                     rejected_counts["too_slow"] += 1
                     slow_candidates.append((torrent, slow_reason))
@@ -4747,9 +4825,22 @@ def apply_single_download(
                 "productive": len(productive_candidates),
                 "slow": len(slow_candidates),
                 "selection_strategy": selection_strategy_name,
+                "storage_constrained": storage_constrained_mode,
             }
 
-            if productive_candidates and preempt_productive_enabled and selection_candidates:
+            if productive_candidates and storage_constrained_mode and selection_candidates:
+                selected_hash = torrent_hash(selection_candidates[0])
+                productive_candidates = [
+                    torrent for torrent in productive_candidates
+                    if torrent_hash(torrent) == selected_hash
+                ]
+
+            if (
+                productive_candidates
+                and preempt_productive_enabled
+                and selection_candidates
+                and not storage_constrained_mode
+            ):
                 keep = productive_candidates[0]
                 challenger = selection_candidates[0]
                 if should_preempt_productive_torrent(
@@ -4848,25 +4939,26 @@ def apply_single_download(
                 if storage_guard:
                     storage_state = storage_guard.snapshot()
                     if storage_state.get("stop"):
-                        client.stop_hashes([keep_hash])
-                        emit_decision_log(
-                            "qbt_guard_decision",
-                            **decision_base_context(run_decision_context, client, storage_state),
-                            action="stop_kept_for_storage",
-                            reason=storage_state["reason"],
-                            selected_torrent=torrent_decision_summary(keep_refreshed or keep),
-                            rejected_counts={"storage_stop": 1},
-                            candidate_counts=candidate_counts,
-                        )
-                        log_decision_info(
-                            "stop_kept_for_storage",
-                            f"Stopped kept torrent after storage check: "
-                            f"{torrent_name(keep_refreshed or keep)}; "
-                            f"{storage_state['reason']}",
-                            selected=torrent_name(keep_refreshed or keep),
-                            reason=storage_state["reason"],
-                        )
-                        break
+                        if storage_hard_stop_required(storage_guard, storage_state):
+                            client.stop_hashes([keep_hash])
+                            emit_decision_log(
+                                "qbt_guard_decision",
+                                **decision_base_context(run_decision_context, client, storage_state),
+                                action="stop_kept_for_storage",
+                                reason=storage_state["reason"],
+                                selected_torrent=torrent_decision_summary(keep_refreshed or keep),
+                                rejected_counts={"storage_stop": 1},
+                                candidate_counts=candidate_counts,
+                            )
+                            log_decision_info(
+                                "stop_kept_for_storage",
+                                f"Stopped kept torrent after storage check: "
+                                f"{torrent_name(keep_refreshed or keep)}; "
+                                f"{storage_state['reason']}",
+                                selected=torrent_name(keep_refreshed or keep),
+                                reason=storage_state["reason"],
+                            )
+                            break
                 if keep_refreshed:
                     slow_reason = slow_torrent_reason(
                         keep_refreshed,
@@ -4875,6 +4967,8 @@ def apply_single_download(
                         slow_min_rate_bytes,
                         slow_max_eta_seconds,
                     )
+                    if storage_constrained_mode:
+                        slow_reason = ""
                     if slow_reason:
                         client.stop_hashes([keep_hash])
                         attempted_hashes.add(keep_hash)
@@ -4932,6 +5026,28 @@ def apply_single_download(
                         keep_refreshed,
                         datetime.now(timezone.utc),
                         stall_check_seconds,
+                    )
+                    break
+
+                if storage_constrained_mode and keep_refreshed and not is_stalled_torrent(keep_refreshed):
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action="keep_storage_constrained_until_stalled",
+                        reason="storage-constrained candidate has not stalled",
+                        selected_torrent=torrent_decision_summary(keep_refreshed),
+                        rejected_counts=dict(rejected_counts),
+                        candidate_counts=candidate_counts,
+                    )
+                    log_decision_info(
+                        "keep_storage_constrained_until_stalled",
+                        f"Keeping smallest-fitting torrent until it completes or stalls: "
+                        f"{torrent_name(keep_refreshed)} "
+                        f"({torrent_progress(keep_refreshed) * 100:.2f}% complete, "
+                        f"{human_size(torrent_amount_left(keep_refreshed))} left, "
+                        f"{human_rate(torrent_download_speed(keep_refreshed))} down)",
+                        selected=torrent_name(keep_refreshed),
+                        reason="storage-constrained candidate has not stalled",
                     )
                     break
 
@@ -5180,25 +5296,26 @@ def apply_single_download(
             if storage_guard:
                 storage_state = storage_guard.snapshot()
                 if storage_state.get("stop"):
-                    client.stop_hashes([selected_hash])
-                    emit_decision_log(
-                        "qbt_guard_decision",
-                        **decision_base_context(run_decision_context, client, storage_state),
-                        action="stop_selected_for_storage",
-                        reason=storage_state["reason"],
-                        selected_torrent=torrent_decision_summary(selected_refreshed or selected),
-                        rejected_counts={"storage_stop": 1},
-                        candidate_counts=candidate_counts,
-                    )
-                    log_decision_info(
-                        "stop_selected_for_storage",
-                        f"Stopped selected torrent after storage check: "
-                        f"{torrent_name(selected_refreshed or selected)}; "
-                        f"{storage_state['reason']}",
-                        selected=torrent_name(selected_refreshed or selected),
-                        reason=storage_state["reason"],
-                    )
-                    break
+                    if storage_hard_stop_required(storage_guard, storage_state):
+                        client.stop_hashes([selected_hash])
+                        emit_decision_log(
+                            "qbt_guard_decision",
+                            **decision_base_context(run_decision_context, client, storage_state),
+                            action="stop_selected_for_storage",
+                            reason=storage_state["reason"],
+                            selected_torrent=torrent_decision_summary(selected_refreshed or selected),
+                            rejected_counts={"storage_stop": 1},
+                            candidate_counts=candidate_counts,
+                        )
+                        log_decision_info(
+                            "stop_selected_for_storage",
+                            f"Stopped selected torrent after storage check: "
+                            f"{torrent_name(selected_refreshed or selected)}; "
+                            f"{storage_state['reason']}",
+                            selected=torrent_name(selected_refreshed or selected),
+                            reason=storage_state["reason"],
+                        )
+                        break
             if selected_refreshed:
                 slow_reason = slow_torrent_reason(
                     selected_refreshed,
@@ -5207,6 +5324,8 @@ def apply_single_download(
                     slow_min_rate_bytes,
                     slow_max_eta_seconds,
                 )
+                if storage_constrained_mode:
+                    slow_reason = ""
                 if slow_reason:
                     client.stop_hashes([selected_hash])
                     health_store.record_failure(selected_refreshed, datetime.now(timezone.utc), slow_reason)
@@ -5266,6 +5385,28 @@ def apply_single_download(
                     selected_refreshed,
                     datetime.now(timezone.utc),
                     stall_check_seconds,
+                )
+                break
+
+            if storage_constrained_mode and selected_refreshed and not is_stalled_torrent(selected_refreshed):
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="keep_storage_constrained_until_stalled",
+                    reason="storage-constrained candidate has not stalled",
+                    selected_torrent=torrent_decision_summary(selected_refreshed),
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                )
+                log_decision_info(
+                    "keep_storage_constrained_until_stalled",
+                    f"Keeping smallest-fitting torrent until it completes or stalls: "
+                    f"{torrent_name(selected_refreshed)} "
+                    f"({torrent_progress(selected_refreshed) * 100:.2f}% complete, "
+                    f"{human_size(torrent_amount_left(selected_refreshed))} left, "
+                    f"{human_rate(torrent_download_speed(selected_refreshed))} down)",
+                    selected=torrent_name(selected_refreshed),
+                    reason="storage-constrained candidate has not stalled",
                 )
                 break
 

@@ -150,6 +150,14 @@ critical decision summaries for unchanged actions are emitted every
 default; set `QBT_DECISION_LOG_LEVEL=info` while tuning, or
 `QBT_DECISION_LOGS_ENABLED=false` to disable them.
 
+When download storage is at or below the configured reserve and torrent-fit
+checks are enabled, the controller enters a constrained recovery mode instead of
+pausing every torrent. It only considers torrents whose selected remaining bytes
+can fit in the currently free space, tries the smallest verified remaining
+download first, and keeps that torrent selected until it completes or
+qBittorrent reports it stalled. Torrents with unknown remaining size or no
+selected files are blocked while storage is constrained.
+
 ## Local Checks
 
 ```bash
