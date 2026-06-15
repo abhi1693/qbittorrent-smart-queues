@@ -20,12 +20,16 @@ class FakeQbtClient:
         self.top_priority_calls = []
         self.reannounced = []
         self.added_tags = []
+        self.queue_limits = []
 
     def set_download_limit(self, limit):
         self.download_limits.append(limit)
 
     def set_upload_limit(self, limit):
         self.upload_limits.append(limit)
+
+    def set_active_queue_limits(self, max_active_downloads, max_active_torrents=None):
+        self.queue_limits.append((max_active_downloads, max_active_torrents))
 
     def stop_all(self):
         self.stop_all_calls += 1
@@ -298,13 +302,17 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         ]
         try_event = next(
             item for item in decision_logs
-            if item.get("event") == "qbt_guard_decision" and item.get("action") == "try_candidate"
+            if item.get("event") == "qbt_guard_decision" and item.get("action") == "storage_recovery_batch"
         )
 
-        self.assertEqual([["small"]], client.started)
+        self.assertEqual([["small", "large"]], client.started)
+        self.assertEqual([(5, None)], client.queue_limits)
         self.assertEqual("small", try_event["selected_torrent"]["hash"])
+        self.assertEqual(["small", "large"], [
+            item["hash"] for item in try_event["selected_torrents"]
+        ])
         self.assertTrue(try_event["candidate_counts"]["storage_constrained"])
-        self.assertEqual(1, try_event["rejected_counts"]["deferred_by_storage_smallest_fit"])
+        self.assertEqual(0, try_event["rejected_counts"].get("deferred_by_storage_recovery_batch", 0))
 
     def test_storage_constrained_mode_ignores_legacy_quota_cooldown_tags(self):
         client = FakeQbtClient(
@@ -354,6 +362,111 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 )
 
         self.assertEqual([["small"]], client.started)
+
+    def test_storage_constrained_mode_retries_storage_stalled_cooldown_tags(self):
+        client = FakeQbtClient(
+            [
+                {
+                    "hash": "small",
+                    "name": "Small.Left",
+                    "category": "tv",
+                    "state": "stalledDL",
+                    "dlspeed": 0,
+                    "amount_left": 4 * 1024 * 1024,
+                    "downloaded": 0,
+                    "progress": 0.99,
+                    "availability": 1.0,
+                    "num_seeds": 1,
+                    "num_complete": 1,
+                    "tags": "storage-stalled-29990101T000000Z",
+                },
+            ],
+            files={
+                "small": [
+                    {"name": "small.mkv", "size": 400 * 1024 * 1024, "progress": 0.99, "priority": 1},
+                ],
+            },
+        )
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=ConstrainedStorageGuard(),
+                )
+
+        self.assertEqual([["small"]], client.started)
+        self.assertEqual([], client.added_tags)
+
+    def test_storage_constrained_mode_caps_recovery_batch_at_five(self):
+        torrents = []
+        files = {}
+        for index in range(6):
+            item_hash = f"small-{index}"
+            torrents.append(
+                {
+                    "hash": item_hash,
+                    "name": f"Small.Left.{index}",
+                    "category": "tv",
+                    "state": "stoppedDL",
+                    "dlspeed": 0,
+                    "amount_left": (index + 1) * 1024 * 1024,
+                    "downloaded": 0,
+                    "progress": 0.99,
+                    "availability": 1.0,
+                    "num_seeds": 1,
+                    "num_complete": 1,
+                    "tags": "",
+                }
+            )
+            files[item_hash] = [
+                {
+                    "name": f"small-{index}.mkv",
+                    "size": 100 * 1024 * 1024,
+                    "progress": 0.99 - (index * 0.001),
+                    "priority": 1,
+                },
+            ]
+        client = FakeQbtClient(torrents, files=files)
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=ConstrainedStorageGuard(),
+                )
+
+        self.assertEqual([["small-0", "small-1", "small-2", "small-3", "small-4"]], client.started)
 
     def test_apply_single_download_preempts_productive_for_better_balanced_candidate(self):
         client = FakeQbtClient([

@@ -153,13 +153,15 @@ default; set `QBT_DECISION_LOG_LEVEL=info` while tuning, or
 When download storage is at or below the configured reserve and torrent-fit
 checks are enabled, the controller enters a constrained recovery mode instead of
 pausing every torrent. It only considers torrents whose selected remaining bytes
-can fit in the currently free space, tries the smallest verified remaining
-download first, and keeps that torrent selected until it completes or
-qBittorrent reports it stalled. Torrents with unknown remaining size or no
-selected files are blocked while storage is constrained. Storage-constrained
-stall cooldowns use `QBT_SINGLE_DOWNLOAD_STORAGE_STALL_TAG_PREFIX`, defaulting
-to `storage-stalled`, so older normal queue cooldown tags do not block
-near-complete storage-recovery candidates.
+can fit in the currently free space, selects the smallest verified remaining
+downloads first, temporarily raises qBittorrent's active queue limit up to
+`QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_ACTIVE` downloads, defaulting to `5`, and
+keeps the recovery batch selected for the next poll even if individual torrents
+are stalled or make no measured progress. Once storage is back above reserve,
+the next controller pass restores the normal active download limit from
+`QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS`, defaulting to `1`. Torrents
+with unknown remaining size or no selected files are blocked while storage is
+constrained.
 
 ## Local Checks
 
