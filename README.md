@@ -156,7 +156,10 @@ pausing every torrent. It only considers torrents whose selected remaining bytes
 can fit in the currently free space, tries the smallest verified remaining
 download first, and keeps that torrent selected until it completes or
 qBittorrent reports it stalled. Torrents with unknown remaining size or no
-selected files are blocked while storage is constrained.
+selected files are blocked while storage is constrained. Storage-constrained
+stall cooldowns use `QBT_SINGLE_DOWNLOAD_STORAGE_STALL_TAG_PREFIX`, defaulting
+to `storage-stalled`, so older normal queue cooldown tags do not block
+near-complete storage-recovery candidates.
 
 ## Local Checks
 

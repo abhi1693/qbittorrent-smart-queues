@@ -4529,6 +4529,10 @@ def apply_single_download(
     max_run_seconds = max(1, env_int("QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS", 900))
     stall_cooldown_seconds = env_int("QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS", 3600)
     stall_tag_prefix = os.environ.get("QBT_SINGLE_DOWNLOAD_STALL_TAG_PREFIX", "quota-stalled").strip()
+    storage_stall_tag_prefix = os.environ.get(
+        "QBT_SINGLE_DOWNLOAD_STORAGE_STALL_TAG_PREFIX",
+        "storage-stalled",
+    ).strip()
     slow_min_rate_fraction = env_float("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_FRACTION", 0.10)
     slow_min_rate_bytes = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC", 65_536)
     slow_max_eta_seconds = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MAX_ETA_SECONDS", 172_800)
@@ -4750,12 +4754,13 @@ def apply_single_download(
                 if candidate_hash in attempted_hashes:
                     rejected_counts["attempted_this_run"] += 1
                     continue
+                active_stall_tag_prefix = storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix
                 active_tags = []
-                if stall_tag_prefix:
+                if active_stall_tag_prefix:
                     active_tags = clear_expired_stall_tags(
                         client,
                         torrent,
-                        stall_tag_prefix,
+                        active_stall_tag_prefix,
                         now,
                         stall_cooldown_seconds,
                     )
@@ -4975,11 +4980,11 @@ def apply_single_download(
                         health_store.record_failure(keep_refreshed, datetime.now(timezone.utc), slow_reason)
                         add_stall_cooldown_tag(
                             client,
-                            keep_refreshed,
-                            stall_tag_prefix,
-                            now,
-                            stall_cooldown_seconds,
-                        )
+                        keep_refreshed,
+                        storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
+                        now,
+                        stall_cooldown_seconds,
+                    )
                         emit_decision_log(
                             "qbt_guard_decision",
                             **decision_base_context(run_decision_context, client, storage_state),
@@ -5061,7 +5066,7 @@ def apply_single_download(
                 add_stall_cooldown_tag(
                     client,
                     keep_refreshed or keep,
-                    stall_tag_prefix,
+                    storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
                     now,
                     stall_cooldown_seconds,
                 )
@@ -5109,7 +5114,7 @@ def apply_single_download(
                     add_stall_cooldown_tag(
                         client,
                         torrent,
-                        stall_tag_prefix,
+                        storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
                         now,
                         stall_cooldown_seconds,
                     )
@@ -5153,7 +5158,7 @@ def apply_single_download(
                     add_stall_cooldown_tag(
                         client,
                         torrent,
-                        stall_tag_prefix,
+                        storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
                         now,
                         stall_cooldown_seconds,
                     )
@@ -5332,7 +5337,7 @@ def apply_single_download(
                     add_stall_cooldown_tag(
                         client,
                         selected_refreshed,
-                        stall_tag_prefix,
+                        storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
                         now,
                         stall_cooldown_seconds,
                     )
@@ -5419,7 +5424,7 @@ def apply_single_download(
             add_stall_cooldown_tag(
                 client,
                 selected_refreshed or selected,
-                stall_tag_prefix,
+                storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
                 now,
                 stall_cooldown_seconds,
             )

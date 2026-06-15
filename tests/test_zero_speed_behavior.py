@@ -306,6 +306,55 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertTrue(try_event["candidate_counts"]["storage_constrained"])
         self.assertEqual(1, try_event["rejected_counts"]["deferred_by_storage_smallest_fit"])
 
+    def test_storage_constrained_mode_ignores_legacy_quota_cooldown_tags(self):
+        client = FakeQbtClient(
+            [
+                {
+                    "hash": "small",
+                    "name": "Small.Left",
+                    "category": "tv",
+                    "state": "stoppedDL",
+                    "dlspeed": 0,
+                    "amount_left": 4 * 1024 * 1024,
+                    "downloaded": 0,
+                    "progress": 0.99,
+                    "availability": 1.0,
+                    "num_seeds": 1,
+                    "num_complete": 1,
+                    "tags": "quota-stalled-29990101T000000Z",
+                },
+            ],
+            files={
+                "small": [
+                    {"name": "small.mkv", "size": 400 * 1024 * 1024, "progress": 0.99, "priority": 1},
+                ],
+            },
+        )
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=ConstrainedStorageGuard(),
+                )
+
+        self.assertEqual([["small"]], client.started)
+
     def test_apply_single_download_preempts_productive_for_better_balanced_candidate(self):
         client = FakeQbtClient([
             {
