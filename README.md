@@ -63,6 +63,12 @@ Quota control from UniFi Network / UDM is optional. When quota data is
 unavailable and `UDM_FAIL_CLOSED=false`, the controller uses
 `QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC`.
 
+Download-rate limits are integer bytes per second. Use binary examples when
+translating ISP speed into qBittorrent caps: `10485760` = `10 MiB/s`,
+`8388608` = `8 MiB/s`, `2097152` = `2 MiB/s`, and `524288` = `512 KiB/s`.
+Set ISP usable caps no higher than the real sustained throughput available
+after router/VPN/protocol overhead.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `UDM_URL` | unset | UniFi Network / UDM base URL, for example `https://unifi.example`. |
@@ -71,8 +77,9 @@ unavailable and `UDM_FAIL_CLOSED=false`, the controller uses
 | `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
 | `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
 | `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
+| `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `10485760` | Hard ISP usable download cap in bytes/s. This caps smoothed quota rates, burst mode, and single-download mode. Example: `10485760` = `10 MiB/s`. Replaces `QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC` and `QBT_SINGLE_DOWNLOAD_DOWNLOAD_LIMIT_BYTES_PER_SEC`, which remain accepted as fallback aliases. |
 | `QBT_QUOTA_BURST_ENABLED` | `false` | Allow faster downloads above the smoothed quota-safe rate while daily and monthly reserves remain. |
-| `QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | Burst cap; set this no higher than the usable ISP download speed. |
+| `QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | Burst-mode ISP usable cap in bytes/s. Example: `10485760` = `10 MiB/s`. Replaces `QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC`, which remains accepted as a fallback alias. |
 | `QBT_QUOTA_BURST_MIN_MONTHLY_REMAINING_FRACTION` | `0.10` | Minimum monthly guardrail reserve required before burst mode is allowed. |
 | `QBT_QUOTA_BURST_MIN_DAILY_REMAINING_FRACTION` | `0.20` | Minimum daily guardrail reserve required before burst mode is allowed. |
 

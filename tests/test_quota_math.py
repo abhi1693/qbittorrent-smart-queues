@@ -1,6 +1,8 @@
 import importlib
+import os
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 
 class QuotaMathTests(unittest.TestCase):
@@ -82,6 +84,38 @@ class QuotaMathTests(unittest.TestCase):
 
         self.assertFalse(state["burst_active"])
         self.assertLess(state["smart_download_limit"], 250)
+
+    def test_isp_usable_cap_aliases_prefer_clear_names(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC": "123",
+                "QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC": "999",
+                "QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC": "234",
+                "QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC": "888",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                123,
+                self.guard.env_int_first(
+                    [
+                        "QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+                        "QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+                    ],
+                    10,
+                ),
+            )
+            self.assertEqual(
+                234,
+                self.guard.env_int_first(
+                    [
+                        "QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+                        "QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+                    ],
+                    10,
+                ),
+            )
 
     def test_rate_state_reports_monthly_guardrail_before_daily_guardrail(self):
         now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)

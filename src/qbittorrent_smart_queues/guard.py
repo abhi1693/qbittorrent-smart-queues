@@ -288,6 +288,13 @@ def env_int(name, default):
     return int(raw)
 
 
+def env_int_first(names, default):
+    raw = first_env(names)
+    if raw is None:
+        return default
+    return int(raw)
+
+
 def env_float(name, default):
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
@@ -5925,7 +5932,13 @@ def apply_single_download(
 ):
     min_progress = env_float("QBT_SINGLE_DOWNLOAD_MIN_PROGRESS", 0.0)
     max_remaining_bytes = env_int("QBT_SINGLE_DOWNLOAD_MAX_REMAINING_BYTES", 0)
-    configured_download_limit = env_int("QBT_SINGLE_DOWNLOAD_DOWNLOAD_LIMIT_BYTES_PER_SEC", 10_485_760)
+    configured_download_limit = env_int_first(
+        [
+            "QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+            "QBT_SINGLE_DOWNLOAD_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+        ],
+        10_485_760,
+    )
     if download_limit_ceiling is not None:
         configured_download_limit = max(1, int(download_limit_ceiling))
     requested_download_limit = int(download_limit)
@@ -5941,6 +5954,7 @@ def apply_single_download(
         "download_limit_bytes_per_sec": download_limit,
         "upload_limit_bytes_per_sec": upload_limit,
         "configured_download_ceiling_bytes_per_sec": configured_download_limit,
+        "isp_usable_download_limit_bytes_per_sec": configured_download_limit,
         "slow_reference_limit_bytes_per_sec": slow_reference_limit,
         "reason": limit_reason,
     }
@@ -7145,13 +7159,25 @@ def run_once():
     days_in_month = calendar.monthrange(now.year, now.month)[1]
     daily_cap_bytes = max(1, math.floor(cap_bytes / days_in_month))
     headroom = env_float("QBT_RATE_HEADROOM_FRACTION", 0.95)
-    max_download_limit = env_int("QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC", 10_485_760)
+    max_download_limit = env_int_first(
+        [
+            "QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+            "QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+        ],
+        10_485_760,
+    )
     fallback_download_limit = env_int(
         "QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC",
         max_download_limit,
     )
     quota_burst_enabled = env_bool("QBT_QUOTA_BURST_ENABLED", False)
-    quota_burst_download_limit = env_int("QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC", max_download_limit)
+    quota_burst_download_limit = env_int_first(
+        [
+            "QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+            "QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+        ],
+        max_download_limit,
+    )
     quota_burst_min_monthly_remaining_fraction = env_float(
         "QBT_QUOTA_BURST_MIN_MONTHLY_REMAINING_FRACTION",
         0.10,
@@ -7274,8 +7300,11 @@ def run_once():
         "daily_limit_bytes_per_sec": quota_state.get("daily_limit"),
         "smart_download_limit_bytes_per_sec": quota_state.get("smart_download_limit"),
         "max_download_limit_bytes_per_sec": max_download_limit,
+        "isp_usable_download_limit_bytes_per_sec": max_download_limit,
         "quota_burst_active": quota_state.get("burst_active", False),
         "quota_burst_limit_bytes_per_sec": quota_state.get("burst_limit", 0),
+        "isp_usable_burst_download_limit_bytes_per_sec": quota_state.get("burst_limit", 0),
+        "configured_isp_usable_burst_download_limit_bytes_per_sec": quota_burst_download_limit,
         "quota_burst_min_monthly_remaining_fraction": quota_burst_min_monthly_remaining_fraction,
         "quota_burst_min_daily_remaining_fraction": quota_burst_min_daily_remaining_fraction,
     })
