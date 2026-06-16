@@ -213,7 +213,11 @@ When `QBT_STATUS_HTTP_ENABLED=true`, the controller exposes:
 
 - `/healthz`: plain `ok` health response.
 - `/status`: JSON snapshot of the latest queue decision, loop result, selected torrent, rejection counts, and candidate counts.
-- `/metrics`: Prometheus text metrics for the latest decision, including `qbt_guard_last_decision_info`, `qbt_guard_candidate_count`, and `qbt_guard_rejected_count`.
+- `/metrics`: Prometheus text metrics for the latest decision. The endpoint
+  includes controller freshness, latest action labels, selected torrent
+  progress/speed/ETA, selected and parked torrent info rows, queue funnel
+  counts, rejection reasons, effective transfer caps, budget bytes, and
+  storage headroom.
 
 Single-download mode keeps an active torrent only when selected bytes or
 downloaded bytes move by at least `QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES`

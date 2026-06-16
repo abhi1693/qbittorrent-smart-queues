@@ -121,6 +121,31 @@ def numeric_metric_value(value):
         return 0.0
 
 
+def bool_metric_value(value):
+    return 1 if bool(value) else 0
+
+
+def append_gauge_family(lines, name, help_text, samples):
+    rendered = []
+    for labels, value in samples:
+        rendered.append(prometheus_metric_line(name, labels, numeric_metric_value(value)))
+    if not rendered:
+        return
+    lines.extend([
+        f"# HELP {name} {help_text}",
+        f"# TYPE {name} gauge",
+        *rendered,
+    ])
+
+
+def status_metric_torrent(summary):
+    if isinstance(summary, dict) and isinstance(summary.get("torrent"), dict):
+        return summary.get("torrent")
+    if isinstance(summary, dict):
+        return summary
+    return {}
+
+
 class QueueStatusStore:
     def __init__(self):
         self.lock = threading.Lock()
@@ -157,8 +182,11 @@ class QueueStatusStore:
                         "budget",
                         "candidate_counts",
                         "effective_cap",
+                        "parked_torrents",
+                        "progress_torrents",
                         "rejected_counts",
                         "selected_torrent",
+                        "selected_torrents",
                         "storage",
                     ):
                         if key not in next_event and key in previous_event:
@@ -210,6 +238,18 @@ class QueueStatusStore:
                 "# HELP qbt_guard_last_decision_timestamp_seconds Unix timestamp of the latest queue decision.",
                 "# TYPE qbt_guard_last_decision_timestamp_seconds gauge",
                 f"qbt_guard_last_decision_timestamp_seconds {self.last_decision_at.timestamp():.0f}",
+                "# HELP qbt_guard_decision_age_seconds Age of the latest queue decision.",
+                "# TYPE qbt_guard_decision_age_seconds gauge",
+                f"qbt_guard_decision_age_seconds {max(0, (datetime.now(timezone.utc) - self.last_decision_at).total_seconds()):.0f}",
+            ])
+        if self.last_loop_at:
+            lines.extend([
+                "# HELP qbt_guard_last_loop_timestamp_seconds Unix timestamp of the latest guard loop completion.",
+                "# TYPE qbt_guard_last_loop_timestamp_seconds gauge",
+                f"qbt_guard_last_loop_timestamp_seconds {self.last_loop_at.timestamp():.0f}",
+                "# HELP qbt_guard_loop_age_seconds Age of the latest completed guard loop.",
+                "# TYPE qbt_guard_loop_age_seconds gauge",
+                f"qbt_guard_loop_age_seconds {max(0, (datetime.now(timezone.utc) - self.last_loop_at).total_seconds()):.0f}",
             ])
 
         action = str(last_event.get("action") or "")
@@ -232,6 +272,195 @@ class QueueStatusStore:
                         "reason": reason,
                         "selected_hash": selected_hash,
                         "selected_name": selected_name,
+                    },
+                    1,
+                ),
+            ])
+
+        action_class = "other"
+        if action.startswith("try_") or action in {"storage_recovery_batch", "preempt_productive"}:
+            action_class = "selecting"
+        elif action.startswith("keep_") or action.startswith("confirm_"):
+            action_class = "keeping"
+        elif action.startswith("park_"):
+            action_class = "parking"
+        elif action.startswith("stop_"):
+            action_class = "stopping"
+        append_gauge_family(lines, "qbt_guard_last_action_class", "Classification of the latest queue action.", [
+            ({"class": action_class}, 1),
+        ])
+
+        append_gauge_family(lines, "qbt_guard_selected_torrent_progress_ratio", "Latest selected torrent progress ratio.", [
+            ({}, selected.get("progress"))
+        ] if selected else [])
+        append_gauge_family(lines, "qbt_guard_selected_torrent_amount_left_bytes", "Latest selected torrent bytes left.", [
+            ({}, selected.get("amount_left_bytes"))
+        ] if selected else [])
+        append_gauge_family(
+            lines,
+            "qbt_guard_selected_torrent_download_speed_bytes_per_sec",
+            "Latest selected torrent download speed.",
+            [({}, selected.get("download_speed_bytes_per_sec"))] if selected else [],
+        )
+        append_gauge_family(lines, "qbt_guard_selected_torrent_eta_seconds", "Latest selected torrent ETA seconds.", [
+            ({}, selected.get("eta_seconds"))
+        ] if selected and selected.get("eta_seconds") is not None else [])
+        append_gauge_family(lines, "qbt_guard_selected_torrent_availability", "Latest selected torrent availability.", [
+            ({}, selected.get("availability"))
+        ] if selected else [])
+        append_gauge_family(
+            lines,
+            "qbt_guard_selected_torrent_seeds",
+            "Latest selected torrent seed counts.",
+            [
+                ({"type": "connected"}, selected.get("connected_seeds")),
+                ({"type": "reported"}, selected.get("reported_seeds")),
+            ] if selected else [],
+        )
+
+        selected_torrents = last_event.get("selected_torrents")
+        if not isinstance(selected_torrents, list):
+            selected_torrents = [selected] if selected else []
+        parked_torrents = last_event.get("parked_torrents")
+        if not isinstance(parked_torrents, list):
+            parked_torrents = []
+        progress_torrents = last_event.get("progress_torrents")
+        if not isinstance(progress_torrents, list):
+            progress_torrents = []
+        max_torrent_metrics = max(1, env_int("QBT_STATUS_METRICS_MAX_TORRENTS", 12))
+        torrent_info_samples = []
+        torrent_numeric_samples = {
+            "qbt_guard_torrent_progress_ratio": [],
+            "qbt_guard_torrent_amount_left_bytes": [],
+            "qbt_guard_torrent_download_speed_bytes_per_sec": [],
+            "qbt_guard_torrent_availability": [],
+        }
+        for role, torrent_items in (
+            ("selected", selected_torrents),
+            ("parked", parked_torrents),
+            ("progress", progress_torrents),
+        ):
+            for index, item in enumerate(torrent_items[:max_torrent_metrics], start=1):
+                torrent = status_metric_torrent(item)
+                if not torrent:
+                    continue
+                labels = {
+                    "role": role,
+                    "index": str(index),
+                    "hash": torrent.get("hash") or "",
+                    "name": torrent.get("name") or "",
+                    "category": torrent.get("category") or "",
+                    "state": torrent.get("state") or "",
+                }
+                torrent_info_samples.append((labels, 1))
+                numeric_labels = {"role": role, "index": str(index)}
+                torrent_numeric_samples["qbt_guard_torrent_progress_ratio"].append(
+                    (numeric_labels, torrent.get("progress"))
+                )
+                torrent_numeric_samples["qbt_guard_torrent_amount_left_bytes"].append(
+                    (numeric_labels, torrent.get("amount_left_bytes"))
+                )
+                torrent_numeric_samples["qbt_guard_torrent_download_speed_bytes_per_sec"].append(
+                    (numeric_labels, torrent.get("download_speed_bytes_per_sec"))
+                )
+                torrent_numeric_samples["qbt_guard_torrent_availability"].append(
+                    (numeric_labels, torrent.get("availability"))
+                )
+        append_gauge_family(lines, "qbt_guard_torrent_info", "Recent decision torrent labels by role.", torrent_info_samples)
+        append_gauge_family(
+            lines,
+            "qbt_guard_torrent_progress_ratio",
+            "Recent decision torrent progress ratio by role and index.",
+            torrent_numeric_samples["qbt_guard_torrent_progress_ratio"],
+        )
+        append_gauge_family(
+            lines,
+            "qbt_guard_torrent_amount_left_bytes",
+            "Recent decision torrent bytes left by role and index.",
+            torrent_numeric_samples["qbt_guard_torrent_amount_left_bytes"],
+        )
+        append_gauge_family(
+            lines,
+            "qbt_guard_torrent_download_speed_bytes_per_sec",
+            "Recent decision torrent download speed by role and index.",
+            torrent_numeric_samples["qbt_guard_torrent_download_speed_bytes_per_sec"],
+        )
+        append_gauge_family(
+            lines,
+            "qbt_guard_torrent_availability",
+            "Recent decision torrent availability by role and index.",
+            torrent_numeric_samples["qbt_guard_torrent_availability"],
+        )
+        append_gauge_family(
+            lines,
+            "qbt_guard_decision_torrent_count",
+            "Recent decision torrent counts by role.",
+            [
+                ({"role": "selected"}, len(selected_torrents)),
+                ({"role": "parked"}, len(parked_torrents)),
+                ({"role": "progress"}, len(progress_torrents)),
+            ],
+        )
+
+        effective_cap = last_event.get("effective_cap")
+        if isinstance(effective_cap, dict):
+            append_gauge_family(
+                lines,
+                "qbt_guard_effective_cap_bytes_per_sec",
+                "Latest effective transfer caps in bytes per second. Zero download means unlimited.",
+                [
+                    ({"type": "requested_download"}, effective_cap.get("requested_download_limit_bytes_per_sec")),
+                    ({"type": "download"}, effective_cap.get("download_limit_bytes_per_sec")),
+                    ({"type": "upload"}, effective_cap.get("upload_limit_bytes_per_sec")),
+                    ({"type": "configured_download_ceiling"}, effective_cap.get("configured_download_ceiling_bytes_per_sec")),
+                    ({"type": "isp_usable_download"}, effective_cap.get("isp_usable_download_limit_bytes_per_sec")),
+                    ({"type": "slow_reference_download"}, effective_cap.get("slow_reference_limit_bytes_per_sec")),
+                ],
+            )
+
+        budget = last_event.get("budget")
+        if isinstance(budget, dict):
+            append_gauge_family(
+                lines,
+                "qbt_guard_budget_bytes",
+                "Latest budget byte values.",
+                [
+                    ({"type": "monthly_usage"}, budget.get("monthly_usage_bytes")),
+                    ({"type": "monthly_guardrail"}, budget.get("monthly_guardrail_bytes")),
+                    ({"type": "monthly_remaining"}, budget.get("monthly_remaining_bytes")),
+                    ({"type": "daily_cap"}, budget.get("daily_cap_bytes")),
+                    ({"type": "daily_usage"}, budget.get("daily_usage_bytes")),
+                    ({"type": "daily_remaining"}, budget.get("daily_remaining_bytes")),
+                ],
+            )
+
+        storage = last_event.get("storage")
+        if isinstance(storage, dict):
+            append_gauge_family(
+                lines,
+                "qbt_guard_storage_bytes",
+                "Latest storage byte values.",
+                [
+                    ({"type": "total"}, storage.get("total_bytes")),
+                    ({"type": "free"}, storage.get("free_bytes")),
+                    ({"type": "reserve"}, storage.get("reserve_bytes")),
+                    ({"type": "headroom"}, storage.get("headroom_bytes")),
+                ],
+            )
+            append_gauge_family(
+                lines,
+                "qbt_guard_storage_stop",
+                "Whether storage guard requested a stop or constrained mode.",
+                [({}, bool_metric_value(storage.get("stop")))],
+            )
+            lines.extend([
+                "# HELP qbt_guard_storage_info Latest storage labels.",
+                "# TYPE qbt_guard_storage_info gauge",
+                prometheus_metric_line(
+                    "qbt_guard_storage_info",
+                    {
+                        "path": storage.get("path") or "",
+                        "reason": storage.get("reason") or "",
                     },
                     1,
                 ),
@@ -3154,6 +3383,7 @@ def torrent_decision_summary(torrent):
         "amount_left_bytes": torrent_amount_left(torrent),
         "downloaded_bytes": torrent_downloaded_bytes(torrent),
         "download_speed_bytes_per_sec": torrent_download_speed(torrent),
+        "eta_seconds": torrent_eta_seconds(torrent),
         "connected_seeds": torrent_connected_seeds(torrent),
         "reported_seeds": torrent_reported_seeds(torrent),
         "availability": torrent_availability(torrent),

@@ -25,9 +25,47 @@ class StatusEndpointTests(unittest.TestCase):
                 selected_torrent={
                     "hash": "abc123",
                     "name": "Example.S01E01",
+                    "category": "tv",
+                    "state": "stalledDL",
+                    "progress": 0.5,
+                    "amount_left_bytes": 1048576,
+                    "download_speed_bytes_per_sec": 0,
+                    "eta_seconds": 3600,
+                    "availability": 0.5,
+                    "connected_seeds": 0,
+                    "reported_seeds": 1,
                 },
+                parked_torrents=[
+                    {
+                        "hash": "parked123",
+                        "name": "Parked.S01E02",
+                        "category": "tv",
+                        "state": "stalledDL",
+                        "progress": 0.75,
+                        "amount_left_bytes": 2048,
+                        "download_speed_bytes_per_sec": 0,
+                        "availability": 0,
+                    }
+                ],
                 candidate_counts={"available": 3, "tracker_health_observed": 2},
                 rejected_counts={"cooldown": 1},
+                effective_cap={
+                    "requested_download_limit_bytes_per_sec": 1024,
+                    "download_limit_bytes_per_sec": 0,
+                    "upload_limit_bytes_per_sec": 512,
+                    "configured_download_ceiling_bytes_per_sec": 2048,
+                    "isp_usable_download_limit_bytes_per_sec": 2048,
+                    "slow_reference_limit_bytes_per_sec": 2048,
+                },
+                storage={
+                    "path": "/downloads",
+                    "reason": "enough space",
+                    "stop": False,
+                    "total_bytes": 100000,
+                    "free_bytes": 50000,
+                    "reserve_bytes": 10000,
+                    "headroom_bytes": 40000,
+                },
             )
 
         snapshot = self.guard.QUEUE_STATUS.snapshot()
@@ -37,6 +75,14 @@ class StatusEndpointTests(unittest.TestCase):
         metrics = self.guard.QUEUE_STATUS.prometheus_metrics()
         self.assertIn('qbt_guard_last_decision_info{action="try_candidate"', metrics)
         self.assertIn('selected_name="Example.S01E01"', metrics)
+        self.assertIn('qbt_guard_selected_torrent_progress_ratio 0.5', metrics)
+        self.assertIn('qbt_guard_selected_torrent_amount_left_bytes 1048576.0', metrics)
+        self.assertIn('qbt_guard_selected_torrent_eta_seconds 3600.0', metrics)
+        self.assertIn('qbt_guard_selected_torrent_seeds{type="connected"} 0.0', metrics)
+        self.assertIn('qbt_guard_effective_cap_bytes_per_sec{type="download"} 0.0', metrics)
+        self.assertIn('qbt_guard_storage_bytes{type="headroom"} 40000.0', metrics)
+        self.assertIn('qbt_guard_decision_torrent_count{role="parked"} 1.0', metrics)
+        self.assertIn('qbt_guard_torrent_info{category="tv",hash="parked123"', metrics)
         self.assertIn('qbt_guard_candidate_count{type="available"} 3.0', metrics)
         self.assertIn('qbt_guard_rejected_count{reason="cooldown"} 1.0', metrics)
 
