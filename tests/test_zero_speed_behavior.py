@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 
@@ -160,6 +161,60 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 {"amount_left": 1000, "downloaded": 100, "dlspeed": 1},
                 {"amount_left": 1000, "downloaded": 100, "dlspeed": 2},
                 min_download_delta_bytes=100,
+            ),
+        )
+
+    def test_adaptive_progress_threshold_scales_with_size_and_age(self):
+        now = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
+        floor = 1024 * 1024
+
+        small = {
+            "amount_left": 500 * 1024 * 1024,
+            "size": 500 * 1024 * 1024,
+            "added_on": int(now.timestamp()),
+        }
+        large = {
+            "amount_left": 100 * 1024 * 1024 * 1024,
+            "size": 100 * 1024 * 1024 * 1024,
+            "added_on": int(now.timestamp()),
+        }
+        old_large = dict(large)
+        old_large["added_on"] = int(now.timestamp()) - (30 * 86_400)
+
+        self.assertEqual(
+            floor,
+            self.guard.adaptive_progress_min_bytes(
+                small,
+                floor,
+                size_fraction=0.0002,
+                max_bytes=64 * 1024 * 1024,
+                age_relief_days=30,
+                age_relief_fraction=0.75,
+                now=now,
+            ),
+        )
+        self.assertEqual(
+            21_474_837,
+            self.guard.adaptive_progress_min_bytes(
+                large,
+                floor,
+                size_fraction=0.0002,
+                max_bytes=64 * 1024 * 1024,
+                age_relief_days=30,
+                age_relief_fraction=0.75,
+                now=now,
+            ),
+        )
+        self.assertEqual(
+            5_368_710,
+            self.guard.adaptive_progress_min_bytes(
+                old_large,
+                floor,
+                size_fraction=0.0002,
+                max_bytes=64 * 1024 * 1024,
+                age_relief_days=30,
+                age_relief_fraction=0.75,
+                now=now,
             ),
         )
 

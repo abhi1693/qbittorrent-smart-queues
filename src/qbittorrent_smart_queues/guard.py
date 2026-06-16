@@ -2573,6 +2573,37 @@ def torrent_amount_left(torrent):
         return 0
 
 
+def torrent_total_size(torrent):
+    for key in ("size", "total_size"):
+        try:
+            value = int(torrent.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+
+    progress = torrent_progress(torrent)
+    amount_left = torrent_amount_left(torrent)
+    if 0 < progress < 1 and amount_left > 0:
+        return max(amount_left, math.ceil(amount_left / (1.0 - progress)))
+    return amount_left
+
+
+def torrent_age_seconds(torrent, now):
+    try:
+        added_on = int(torrent.get("added_on"))
+    except (TypeError, ValueError):
+        return None
+    if added_on <= 0:
+        return None
+
+    try:
+        now_timestamp = int(now.timestamp())
+    except AttributeError:
+        return None
+    return max(0, now_timestamp - added_on)
+
+
 def torrent_downloaded_bytes(torrent):
     for key in ("downloaded", "downloaded_session", "completed"):
         try:
@@ -2589,6 +2620,34 @@ def torrent_progress(torrent):
         return float(torrent.get("progress") or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def adaptive_progress_min_bytes(
+    torrent,
+    floor_bytes,
+    size_fraction,
+    max_bytes,
+    age_relief_days,
+    age_relief_fraction,
+    now,
+):
+    floor_bytes = max(1, int(floor_bytes))
+    size_fraction = max(0.0, float(size_fraction or 0.0))
+    max_bytes = max(floor_bytes, int(max_bytes or floor_bytes))
+    age_relief_days = max(0.0, float(age_relief_days or 0.0))
+    age_relief_fraction = min(1.0, max(0.0, float(age_relief_fraction or 0.0)))
+
+    size_based = math.ceil(torrent_total_size(torrent) * size_fraction)
+    if size_based <= 0:
+        return floor_bytes
+
+    age_seconds = torrent_age_seconds(torrent, now)
+    if age_seconds is not None and age_relief_days > 0 and age_relief_fraction > 0:
+        age_days = age_seconds / 86_400
+        relief_ratio = min(1.0, age_days / age_relief_days) * age_relief_fraction
+        size_based = math.ceil(size_based * (1.0 - relief_ratio))
+
+    return min(max_bytes, max(floor_bytes, size_based))
 
 
 def torrent_download_speed(torrent):
@@ -4153,14 +4212,20 @@ def torrent_progress_reason(before, after, min_download_delta_bytes):
     after_left = torrent_amount_left(after)
     left_delta = before_left - after_left
     if left_delta >= min_download_delta_bytes:
-        return f"amount left decreased by {human_size(left_delta)}"
+        return (
+            f"amount left decreased by {human_size(left_delta)} "
+            f"(required {human_size(min_download_delta_bytes)})"
+        )
 
     before_downloaded = torrent_downloaded_bytes(before)
     after_downloaded = torrent_downloaded_bytes(after)
     if before_downloaded is not None and after_downloaded is not None:
         downloaded_delta = after_downloaded - before_downloaded
         if downloaded_delta >= min_download_delta_bytes:
-            return f"downloaded bytes increased by {human_size(downloaded_delta)}"
+            return (
+                f"downloaded bytes increased by {human_size(downloaded_delta)} "
+                f"(required {human_size(min_download_delta_bytes)})"
+            )
 
     return ""
 
@@ -4983,6 +5048,14 @@ def apply_single_download(
     run_decision_context["effective_cap"] = effective_cap
     stall_check_seconds = env_int("QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS", 60)
     min_progress_bytes = env_int("QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES", 1_048_576)
+    adaptive_progress_enabled = env_bool("QBT_SINGLE_DOWNLOAD_ADAPTIVE_PROGRESS_ENABLED", True)
+    adaptive_progress_size_fraction = env_float("QBT_SINGLE_DOWNLOAD_PROGRESS_SIZE_FRACTION", 0.0002)
+    adaptive_progress_max_bytes = env_int("QBT_SINGLE_DOWNLOAD_PROGRESS_MAX_BYTES", 67_108_864)
+    adaptive_progress_age_relief_days = env_float("QBT_SINGLE_DOWNLOAD_PROGRESS_AGE_RELIEF_DAYS", 30.0)
+    adaptive_progress_age_relief_fraction = env_float(
+        "QBT_SINGLE_DOWNLOAD_PROGRESS_AGE_RELIEF_FRACTION",
+        0.75,
+    )
     max_attempts = max(0, env_int("QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN", 0))
     attempt_limit_label = str(max_attempts) if max_attempts > 0 else "time-budget"
     max_run_seconds = max(1, env_int("QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS", 900))
@@ -5045,6 +5118,19 @@ def apply_single_download(
     sonarr_queue = SonarrQueueMetadata()
     jellyfin_watch = JellyfinWatchMetadata()
     radarr_queue = RadarrQueueMetadata()
+
+    def normal_progress_min_bytes(torrent):
+        if not adaptive_progress_enabled:
+            return max(1, int(min_progress_bytes))
+        return adaptive_progress_min_bytes(
+            torrent,
+            min_progress_bytes,
+            adaptive_progress_size_fraction,
+            adaptive_progress_max_bytes,
+            adaptive_progress_age_relief_days,
+            adaptive_progress_age_relief_fraction,
+            now,
+        )
 
     for client in clients:
         client.set_download_limit(download_limit)
@@ -5749,7 +5835,7 @@ def apply_single_download(
                     progress_reason = torrent_progress_reason(
                         keep,
                         keep_refreshed,
-                        min_progress_bytes,
+                        normal_progress_min_bytes(keep),
                     )
                 if progress_reason:
                     emit_decision_log(
@@ -6025,7 +6111,7 @@ def apply_single_download(
                 progress_reason = torrent_progress_reason(
                     selected,
                     selected_refreshed,
-                    min_progress_bytes,
+                    normal_progress_min_bytes(selected),
                 )
             if progress_reason:
                 emit_decision_log(

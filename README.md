@@ -178,7 +178,12 @@ Single-download mode keeps an active torrent only when selected bytes or
 downloaded bytes move by at least `QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES`
 during the `QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS` sample window. Instantaneous
 download speed is telemetry only for normal queue decisions; a low speed does
-not stop a torrent if it is making real progress.
+not stop a torrent if it is making real progress. When
+`QBT_SINGLE_DOWNLOAD_ADAPTIVE_PROGRESS_ENABLED=true`, defaulting to true, that
+floor scales up for larger torrents using `QBT_SINGLE_DOWNLOAD_PROGRESS_SIZE_FRACTION`,
+is capped by `QBT_SINGLE_DOWNLOAD_PROGRESS_MAX_BYTES`, and is relaxed for older
+torrents using `QBT_SINGLE_DOWNLOAD_PROGRESS_AGE_RELIEF_DAYS` and
+`QBT_SINGLE_DOWNLOAD_PROGRESS_AGE_RELIEF_FRACTION`.
 
 When download storage is at or below the configured reserve and torrent-fit
 checks are enabled, the controller enters a constrained recovery mode instead of
