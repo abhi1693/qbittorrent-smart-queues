@@ -2792,6 +2792,13 @@ def queue_record_download_ids(record):
     }
 
 
+def first_queue_record_download_id(record):
+    download_ids = sorted(queue_record_download_ids(record))
+    if download_ids:
+        return download_ids[0]
+    return ""
+
+
 def queue_record_titles(record):
     titles = []
     for key in ("title", "sourceTitle", "downloadClient", "downloadClientId"):
@@ -2806,6 +2813,38 @@ def queue_record_titles(record):
             if value:
                 titles.append(str(value))
     return titles
+
+
+def queue_record_status_messages(record):
+    messages = []
+    status_messages = record.get("statusMessages")
+    if isinstance(status_messages, list):
+        for item in status_messages:
+            if isinstance(item, dict):
+                title = item.get("title")
+                if title:
+                    messages.append(str(title))
+                raw_messages = item.get("messages")
+                if isinstance(raw_messages, list):
+                    messages.extend(str(message) for message in raw_messages if message)
+            elif item:
+                messages.append(str(item))
+
+    for key in ("statusMessage", "errorMessage", "message"):
+        value = record.get(key)
+        if value:
+            messages.append(str(value))
+    return messages
+
+
+def queue_record_status_text(record):
+    parts = [
+        record.get("status"),
+        record.get("trackedDownloadStatus"),
+        record.get("trackedDownloadState"),
+    ]
+    parts.extend(queue_record_status_messages(record))
+    return " ".join(str(part) for part in parts if part).lower()
 
 
 def queue_record_movie_titles(record):
@@ -2993,13 +3032,21 @@ class SonarrQueueMetadata:
             return None
 
         season, episode, season_pack = episode_order
+        status_messages = queue_record_status_messages(record)
         return {
+            "queue_id": int_or_none(record.get("id")),
+            "download_id": first_queue_record_download_id(record),
             "series": series,
             "season": season,
             "episode": episode,
             "season_pack": season_pack,
             "queue_position": position,
             "source": source,
+            "status": str(record.get("status") or ""),
+            "tracked_download_status": str(record.get("trackedDownloadStatus") or ""),
+            "tracked_download_state": str(record.get("trackedDownloadState") or ""),
+            "status_messages": status_messages,
+            "status_text": queue_record_status_text(record),
         }
 
     def torrent_metadata(self, torrent):
@@ -3270,12 +3317,20 @@ class RadarrQueueMetadata:
         movie = record.get("movie") if isinstance(record.get("movie"), dict) else {}
         movie_id = int_or_none(record.get("movieId") or movie.get("id"))
         year = int_or_none(movie.get("year"))
+        status_messages = queue_record_status_messages(record)
         return {
+            "queue_id": int_or_none(record.get("id")),
+            "download_id": first_queue_record_download_id(record),
             "title": title,
             "movie_id": movie_id,
             "year": year,
             "queue_position": position,
             "source": source,
+            "status": str(record.get("status") or ""),
+            "tracked_download_status": str(record.get("trackedDownloadStatus") or ""),
+            "tracked_download_state": str(record.get("trackedDownloadState") or ""),
+            "status_messages": status_messages,
+            "status_text": queue_record_status_text(record),
         }
 
     def torrent_metadata(self, torrent):
@@ -3773,9 +3828,242 @@ def cleanup_qbt_client(client):
         )
 
 
+def arr_queue_record_indicates_already_imported(metadata):
+    if not metadata:
+        return False
+    text = str(metadata.get("status_text") or "").lower()
+    messages = [str(message).lower() for message in metadata.get("status_messages") or []]
+    if not messages:
+        return False
+    imported_messages = [
+        message for message in messages
+        if "already imported" in message or "episode file already imported" in message
+    ]
+    return bool(imported_messages) and len(imported_messages) == len(messages)
+
+
+def arr_queue_record_indicates_permanent_corrupt_download(metadata):
+    if not metadata:
+        return False
+    text = str(metadata.get("status_text") or "").lower()
+    permanent_markers = (
+        "unable to determine if file is a sample",
+        "failed to get runtime",
+        "unable to parse media info",
+        "invalid data found when processing input",
+        "ebml header parsing failed",
+    )
+    return any(marker in text for marker in permanent_markers)
+
+
+def arr_delete_queue_record(base_url, api_key, queue_id, remove_from_client=True, blocklist=False, timeout=10):
+    if not base_url or not api_key or queue_id is None:
+        return False
+    opener = urllib.request.build_opener()
+    params = urllib.parse.urlencode({
+        "removeFromClient": str(bool(remove_from_client)).lower(),
+        "blocklist": str(bool(blocklist)).lower(),
+    })
+    url = join_url(base_url, f"/api/v3/queue/{queue_id}") + "?" + params
+    request_json(
+        opener,
+        "DELETE",
+        url,
+        headers={"Accept": "application/json", "X-Api-Key": api_key},
+        timeout=timeout,
+    )
+    return True
+
+
+def arr_delete_queue_record_from_configs(configs, source, queue_id, blocklist, timeout):
+    for label, base_url, api_key in configs:
+        if source and label != source:
+            continue
+        try:
+            arr_delete_queue_record(
+                base_url,
+                api_key,
+                queue_id,
+                remove_from_client=True,
+                blocklist=blocklist,
+                timeout=timeout,
+            )
+            return True
+        except ApiError as exc:
+            log_warning(
+                f"Failed to delete {label} queue record {queue_id}: {exc}",
+                queue_id=queue_id,
+                source=label,
+            )
+    return False
+
+
+def is_completed_torrent(torrent):
+    return torrent_progress(torrent) >= 1.0 or torrent_amount_left(torrent) == 0
+
+
+def torrent_name_is_hash(torrent):
+    name = normalize_download_id(torrent_name(torrent))
+    item_hash = normalize_download_id(torrent_hash(torrent))
+    return bool(name and item_hash and name == item_hash)
+
+
+def is_stale_stalled_observation_candidate(torrent):
+    if is_completed_torrent(torrent):
+        return False
+    if torrent_download_speed(torrent) > 0:
+        return False
+    if is_stalled_torrent(torrent):
+        return True
+    if not is_stopped_torrent(torrent):
+        return False
+    if torrent_name_is_hash(torrent):
+        return True
+    return (
+        torrent_connected_seeds(torrent) <= 0
+        and torrent_reported_seeds(torrent) <= 0
+        and torrent_availability(torrent) <= 0
+    )
+
+
+def stale_stalled_tag(prefix, since):
+    if since:
+        return f"{prefix}-{since.strftime('%Y%m%d')}"
+    return prefix
+
+
+def cleanup_arr_managed_completed_torrents(
+    client,
+    torrents,
+    sonarr_queue,
+    radarr_queue,
+    delete_files,
+):
+    remove_imported = env_bool("QBT_STALE_TORRENT_REMOVE_IMPORTED_COMPLETED", True)
+    fail_corrupt = env_bool("QBT_STALE_TORRENT_FAIL_PERMANENT_IMPORT_FAILURES", True)
+    arr_timeout = env_int("QBT_STALE_TORRENT_ARR_TIMEOUT", env_int("QBT_ARR_QUEUE_TIMEOUT", 10))
+    sonarr_configs = sonarr_queue.configs() if sonarr_queue else []
+    radarr_configs = radarr_queue.configs() if radarr_queue else []
+
+    for torrent in torrents:
+        if not torrent_hash(torrent) or not is_completed_torrent(torrent):
+            continue
+
+        sonarr_metadata = sonarr_queue.torrent_metadata(torrent) if sonarr_queue else None
+        if remove_imported and arr_queue_record_indicates_already_imported(sonarr_metadata):
+            queue_id = sonarr_metadata.get("queue_id")
+            deleted = arr_delete_queue_record_from_configs(
+                sonarr_configs,
+                sonarr_metadata.get("source"),
+                queue_id,
+                blocklist=False,
+                timeout=arr_timeout,
+            )
+            if not deleted:
+                client.delete_hashes([torrent_hash(torrent)], delete_files)
+            log_info(
+                f"Removed completed torrent already imported by Sonarr: {torrent_name(torrent)}",
+                hash=torrent_hash(torrent),
+                queue_id=queue_id,
+            )
+            continue
+
+        radarr_metadata = radarr_queue.torrent_metadata(torrent) if radarr_queue else None
+        if fail_corrupt and arr_queue_record_indicates_permanent_corrupt_download(radarr_metadata):
+            queue_id = radarr_metadata.get("queue_id")
+            deleted = arr_delete_queue_record_from_configs(
+                radarr_configs,
+                radarr_metadata.get("source"),
+                queue_id,
+                blocklist=True,
+                timeout=arr_timeout,
+            )
+            if not deleted:
+                client.delete_hashes([torrent_hash(torrent)], delete_files)
+            log_info(
+                f"Removed and blocklisted completed torrent with permanent Radarr import failure: "
+                f"{torrent_name(torrent)}",
+                hash=torrent_hash(torrent),
+                queue_id=queue_id,
+            )
+
+
+def maintain_stale_stalled_torrents(client, torrents, health_store, now):
+    if not env_bool("QBT_STALE_TORRENT_MAINTENANCE_ENABLED", True):
+        return
+    if health_store is None or not health_store.enabled:
+        return
+
+    threshold_seconds = max(1, env_int("QBT_STALE_TORRENT_DAYS", 14)) * 86_400
+    tag_prefix = os.environ.get("QBT_STALE_TORRENT_TAG_PREFIX", "stale-stalled").strip()
+    reannounce = env_bool("QBT_STALE_TORRENT_REANNOUNCE_ENABLED", True)
+    stop_running = env_bool("QBT_STALE_TORRENT_PARK_RUNNING_ENABLED", True)
+
+    health_store.observe_stale_stalled(torrents, now)
+    stale_torrents = []
+    for torrent in torrents:
+        if not torrent_hash(torrent) or not is_stale_stalled_observation_candidate(torrent):
+            continue
+        age_seconds = health_store.stale_stalled_age_seconds(torrent, now)
+        if age_seconds >= threshold_seconds:
+            stale_torrents.append((torrent, age_seconds))
+
+    if not stale_torrents:
+        return
+
+    stale_hashes = [torrent_hash(torrent) for torrent, _ in stale_torrents]
+    if tag_prefix:
+        for torrent, _ in stale_torrents:
+            since = health_store.stale_stalled_since(torrent)
+            tag = stale_stalled_tag(tag_prefix, since)
+            if tag not in torrent_tags(torrent):
+                client.add_tags([torrent_hash(torrent)], [tag])
+
+    if reannounce:
+        client.reannounce_hashes(stale_hashes)
+
+    running_hashes = [
+        torrent_hash(torrent) for torrent, _ in stale_torrents
+        if is_running_torrent(torrent)
+    ]
+    if stop_running and running_hashes:
+        client.stop_hashes(running_hashes)
+
+    log_info(
+        f"Maintained {len(stale_torrents)} torrent(s) stalled for at least "
+        f"{human_duration(threshold_seconds)}",
+        count=len(stale_torrents),
+        threshold_seconds=threshold_seconds,
+        hashes=stale_hashes,
+    )
+
+
 def cleanup_qbt_clients(clients):
+    health_store = TorrentHealthStore()
     for client in clients:
         cleanup_qbt_client(client)
+        try:
+            torrents = single_download_torrents(client)
+        except ApiError as exc:
+            log_warning(f"Failed to list qBittorrent torrents for stale maintenance: {exc}")
+            torrents = []
+        if torrents:
+            sonarr_queue = SonarrQueueMetadata()
+            radarr_queue = RadarrQueueMetadata()
+            delete_files = env_bool("QBT_DELETE_FILES", True)
+            cleanup_arr_managed_completed_torrents(
+                client,
+                torrents,
+                sonarr_queue,
+                radarr_queue,
+                delete_files,
+            )
+            maintain_stale_stalled_torrents(
+                client,
+                torrents,
+                health_store,
+                datetime.now(timezone.utc),
+            )
         cleanup_stall_tags(client)
 
 
@@ -4063,6 +4351,33 @@ class TorrentHealthStore:
         self.prune_stale(now)
         self.save()
 
+    def observe_stale_stalled(self, torrents, now):
+        if not self.enabled:
+            return
+
+        changed = False
+        for torrent in torrents:
+            item_hash = torrent_hash(torrent)
+            if not item_hash:
+                continue
+            entry = self.entry(item_hash)
+            if entry is None:
+                continue
+            if is_stale_stalled_observation_candidate(torrent):
+                entry.setdefault("stale_stalled_first_seen_at", format_utc(now))
+                entry["stale_stalled_last_seen_at"] = format_utc(now)
+                entry["name"] = torrent_name(torrent)
+                entry["category"] = torrent_category(torrent)
+                changed = True
+            elif entry.get("stale_stalled_first_seen_at"):
+                entry["stale_stalled_first_seen_at"] = ""
+                entry["stale_stalled_last_seen_at"] = ""
+                changed = True
+
+        if changed:
+            self.dirty = True
+            self.save()
+
     def prune_stale(self, now):
         cutoff = now - timedelta(days=self.stale_days)
         torrents = self.data.setdefault("torrents", {})
@@ -4186,6 +4501,18 @@ class TorrentHealthStore:
             return max(0, int(entry.get("storage_recovery_no_progress_samples") or 0))
         except (TypeError, ValueError):
             return 0
+
+    def stale_stalled_since(self, torrent):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return None
+        return parse_utc(entry.get("stale_stalled_first_seen_at"))
+
+    def stale_stalled_age_seconds(self, torrent, now):
+        since = self.stale_stalled_since(torrent)
+        if since is None:
+            return 0
+        return max(0, int((now - since).total_seconds()))
 
     def score(self, torrent, now):
         if not self.enabled:

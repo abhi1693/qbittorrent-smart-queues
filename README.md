@@ -4,11 +4,11 @@
 running a more deliberate download queue.
 
 It can enforce quota-aware download rates, keep only one useful download active,
-cool down stalled torrents, score torrent health over time, check local download
-storage headroom, optionally order TV and movie downloads from Sonarr/Radarr,
-optionally boost the next watched TV episode from Jellyfin activity, and
-optionally stop downloads when NVMe temperatures reported by Prometheus are too
-high.
+cool down stalled torrents, score torrent health over time, clean up stale
+Arr-managed download leftovers, check local download storage headroom,
+optionally order TV and movie downloads from Sonarr/Radarr, optionally boost the
+next watched TV episode from Jellyfin activity, and optionally stop downloads
+when NVMe temperatures reported by Prometheus are too high.
 
 The app is configured entirely with environment variables. It does not ship with
 private network addresses, Kubernetes service names, or media-server defaults;
@@ -84,6 +84,26 @@ When Sonarr TV queue metadata is available, TV torrents are constrained by a
 hard per-series order. A later season or episode for the same show cannot be
 selected while an older incomplete queued item for that show remains in
 qBittorrent; priority tags and Jellyfin watch boosts do not bypass this rule.
+
+Optional stale torrent maintenance:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QBT_STALE_TORRENT_MAINTENANCE_ENABLED` | `true` | Track stalled incomplete torrents in the health state and run stale maintenance. |
+| `QBT_STALE_TORRENT_DAYS` | `14` | Age before a continuously stalled or parked incomplete torrent is considered stale. |
+| `QBT_STALE_TORRENT_TAG_PREFIX` | `stale-stalled` | Prefix used for stale stalled torrent tags, for example `stale-stalled-20260601`. |
+| `QBT_STALE_TORRENT_REANNOUNCE_ENABLED` | `true` | Reannounce stale stalled torrents so they can find peers without occupying active work slots. |
+| `QBT_STALE_TORRENT_PARK_RUNNING_ENABLED` | `true` | Stop running stale stalled torrents after tagging/reannouncing so other downloads can run. |
+| `QBT_STALE_TORRENT_REMOVE_IMPORTED_COMPLETED` | `true` | Remove completed Sonarr leftovers when every queue warning says the episode file was already imported. |
+| `QBT_STALE_TORRENT_FAIL_PERMANENT_IMPORT_FAILURES` | `true` | Remove and blocklist completed Radarr downloads with permanent corrupt/sample-detection import failures. |
+| `QBT_STALE_TORRENT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls. |
+
+Stale maintenance is intentionally conservative. It does not delete incomplete
+14-day stalled torrents just because they are old; it tags, reannounces, and
+parks them so they can resume later while the selector moves on to torrents that
+can make progress. Destructive cleanup is limited to completed downloads where
+Arr confirms that the media was already imported, or completed Radarr downloads
+that Arr marks with permanent corrupt media/sample-detection failures.
 
 Optional single-download selection tuning:
 
