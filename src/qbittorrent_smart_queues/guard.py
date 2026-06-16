@@ -3241,6 +3241,18 @@ def queue_record_download_ids(record):
     }
 
 
+def unique_int_values(values):
+    result = []
+    seen = set()
+    for value in values:
+        item = int_or_none(value)
+        if item is None or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
 def first_queue_record_download_id(record):
     download_ids = sorted(queue_record_download_ids(record))
     if download_ids:
@@ -3343,6 +3355,36 @@ def queue_record_series_title(record):
     return ""
 
 
+def queue_record_series_id(record):
+    series = record.get("series")
+    series_id = int_or_none(record.get("seriesId"))
+    if series_id is not None:
+        return series_id
+    if isinstance(series, dict):
+        return int_or_none(series.get("id"))
+    return None
+
+
+def queue_record_episode_ids(record):
+    values = []
+    for key in ("episodeId", "episodeIds"):
+        value = record.get(key)
+        if isinstance(value, list):
+            values.extend(value)
+        else:
+            values.append(value)
+
+    episode = record.get("episode")
+    if isinstance(episode, dict):
+        values.append(episode.get("id"))
+    episodes = record.get("episodes")
+    if isinstance(episodes, list):
+        for item in episodes:
+            if isinstance(item, dict):
+                values.append(item.get("id"))
+    return unique_int_values(values)
+
+
 def queue_record_movie_title(record):
     movie = record.get("movie")
     if isinstance(movie, dict):
@@ -3368,6 +3410,41 @@ def queue_record_movie_title(record):
         if value:
             return str(value)
 
+    return ""
+
+
+def queue_record_movie_id(record):
+    movie = record.get("movie")
+    movie_id = int_or_none(record.get("movieId"))
+    if movie_id is not None:
+        return movie_id
+    if isinstance(movie, dict):
+        return int_or_none(movie.get("id"))
+    return None
+
+
+def queue_record_movie_file_id(record):
+    movie_file = record.get("movieFile")
+    values = [
+        record.get("movieFileId"),
+        record.get("movie_file_id"),
+    ]
+    if isinstance(movie_file, dict):
+        values.append(movie_file.get("id"))
+    ids = unique_int_values(values)
+    return ids[0] if ids else None
+
+
+def queue_record_movie_file_path(record):
+    movie_file = record.get("movieFile")
+    if isinstance(movie_file, dict):
+        path = movie_file.get("path")
+        if path:
+            return str(path)
+    for key in ("movieFilePath", "path"):
+        path = record.get(key)
+        if path:
+            return str(path)
     return ""
 
 
@@ -3485,6 +3562,8 @@ class SonarrQueueMetadata:
         return {
             "queue_id": int_or_none(record.get("id")),
             "download_id": first_queue_record_download_id(record),
+            "series_id": queue_record_series_id(record),
+            "episode_ids": queue_record_episode_ids(record),
             "series": series,
             "season": season,
             "episode": episode,
@@ -3764,7 +3843,7 @@ class RadarrQueueMetadata:
             return None
 
         movie = record.get("movie") if isinstance(record.get("movie"), dict) else {}
-        movie_id = int_or_none(record.get("movieId") or movie.get("id"))
+        movie_id = queue_record_movie_id(record)
         year = int_or_none(movie.get("year"))
         status_messages = queue_record_status_messages(record)
         return {
@@ -3772,6 +3851,8 @@ class RadarrQueueMetadata:
             "download_id": first_queue_record_download_id(record),
             "title": title,
             "movie_id": movie_id,
+            "movie_file_id": queue_record_movie_file_id(record),
+            "movie_file_path": queue_record_movie_file_path(record),
             "year": year,
             "queue_position": position,
             "source": source,
@@ -4305,6 +4386,129 @@ def arr_queue_record_indicates_permanent_corrupt_download(metadata):
     return any(marker in text for marker in permanent_markers)
 
 
+def arr_get_json(base_url, api_key, path, timeout):
+    opener = urllib.request.build_opener()
+    data, _ = request_json(
+        opener,
+        "GET",
+        join_url(base_url, path),
+        headers={"Accept": "application/json", "X-Api-Key": api_key},
+        timeout=timeout,
+    )
+    return data
+
+
+def sonarr_episode_file_path(base_url, api_key, episode_file_id, timeout):
+    if episode_file_id is None or episode_file_id <= 0:
+        return ""
+    data = arr_get_json(base_url, api_key, f"/api/v3/episodefile/{episode_file_id}", timeout)
+    if not isinstance(data, dict):
+        return ""
+    path = data.get("path")
+    return str(path) if path else ""
+
+
+def sonarr_episode_import_verified(base_url, api_key, metadata, timeout):
+    episode_ids = unique_int_values(metadata.get("episode_ids") or [])
+    if not episode_ids:
+        return False
+
+    expected_series_id = int_or_none(metadata.get("series_id"))
+    expected_season = int_or_none(metadata.get("season"))
+    expected_episode = int_or_none(metadata.get("episode"))
+    season_pack = bool(metadata.get("season_pack"))
+    imported_paths = []
+
+    for episode_id in episode_ids:
+        episode = arr_get_json(base_url, api_key, f"/api/v3/episode/{episode_id}", timeout)
+        if not isinstance(episode, dict):
+            return False
+
+        if expected_series_id is not None and int_or_none(episode.get("seriesId")) != expected_series_id:
+            return False
+        if expected_season is not None and int_or_none(episode.get("seasonNumber")) != expected_season:
+            return False
+        if not season_pack and expected_episode is not None:
+            if int_or_none(episode.get("episodeNumber")) != expected_episode:
+                return False
+
+        episode_file = episode.get("episodeFile")
+        episode_file_id = int_or_none(episode.get("episodeFileId"))
+        path = ""
+        if isinstance(episode_file, dict):
+            episode_file_id = int_or_none(episode_file.get("id")) or episode_file_id
+            path = str(episode_file.get("path") or "")
+        if not path:
+            path = sonarr_episode_file_path(base_url, api_key, episode_file_id, timeout)
+        if not path:
+            return False
+        imported_paths.append(path)
+
+    return bool(imported_paths)
+
+
+def radarr_movie_file_path(base_url, api_key, movie_file_id, timeout):
+    if movie_file_id is None or movie_file_id <= 0:
+        return ""
+    data = arr_get_json(base_url, api_key, f"/api/v3/moviefile/{movie_file_id}", timeout)
+    if not isinstance(data, dict):
+        return ""
+    path = data.get("path")
+    return str(path) if path else ""
+
+
+def radarr_movie_import_verified(base_url, api_key, metadata, timeout):
+    movie_id = int_or_none(metadata.get("movie_id"))
+    if movie_id is None:
+        return False
+
+    movie = arr_get_json(base_url, api_key, f"/api/v3/movie/{movie_id}", timeout)
+    if not isinstance(movie, dict):
+        return False
+    if int_or_none(movie.get("id")) != movie_id:
+        return False
+
+    expected_year = int_or_none(metadata.get("year"))
+    if expected_year is not None and int_or_none(movie.get("year")) != expected_year:
+        return False
+
+    movie_file = movie.get("movieFile")
+    movie_file_id = int_or_none(movie.get("movieFileId"))
+    path = ""
+    if isinstance(movie_file, dict):
+        movie_file_id = int_or_none(movie_file.get("id")) or movie_file_id
+        path = str(movie_file.get("path") or "")
+    if not path:
+        path = radarr_movie_file_path(base_url, api_key, movie_file_id, timeout)
+    return bool(path)
+
+
+def arr_import_verified_from_configs(configs, metadata, media_type, timeout):
+    if not metadata:
+        return False
+    source = metadata.get("source")
+    for label, base_url, api_key in configs:
+        if source and label != source:
+            continue
+        try:
+            if media_type == "sonarr":
+                verified = sonarr_episode_import_verified(base_url, api_key, metadata, timeout)
+            elif media_type == "radarr":
+                verified = radarr_movie_import_verified(base_url, api_key, metadata, timeout)
+            else:
+                verified = False
+        except ApiError as exc:
+            log_warning(
+                f"Failed to verify {label} imported media before completed torrent cleanup: {exc}",
+                queue_id=metadata.get("queue_id"),
+                source=label,
+            )
+            continue
+        if verified:
+            return True
+    return False
+
+
 def arr_delete_queue_record(base_url, api_key, queue_id, remove_from_client=True, blocklist=False, timeout=10):
     if not base_url or not api_key or queue_id is None:
         return False
@@ -4400,6 +4604,14 @@ def cleanup_arr_managed_completed_torrents(
 
         sonarr_metadata = sonarr_queue.torrent_metadata(torrent) if sonarr_queue else None
         if remove_imported and arr_queue_record_indicates_already_imported(sonarr_metadata):
+            if not arr_import_verified_from_configs(sonarr_configs, sonarr_metadata, "sonarr", arr_timeout):
+                log_warning(
+                    f"Leaving completed Sonarr torrent in queue because imported episode file "
+                    f"mapping could not be verified: {torrent_name(torrent)}",
+                    hash=torrent_hash(torrent),
+                    queue_id=sonarr_metadata.get("queue_id"),
+                )
+                continue
             queue_id = sonarr_metadata.get("queue_id")
             deleted = arr_delete_queue_record_from_configs(
                 sonarr_configs,
@@ -4418,6 +4630,32 @@ def cleanup_arr_managed_completed_torrents(
             continue
 
         radarr_metadata = radarr_queue.torrent_metadata(torrent) if radarr_queue else None
+        if remove_imported and arr_queue_record_indicates_already_imported(radarr_metadata):
+            if not arr_import_verified_from_configs(radarr_configs, radarr_metadata, "radarr", arr_timeout):
+                log_warning(
+                    f"Leaving completed Radarr torrent in queue because imported movie file "
+                    f"mapping could not be verified: {torrent_name(torrent)}",
+                    hash=torrent_hash(torrent),
+                    queue_id=radarr_metadata.get("queue_id"),
+                )
+                continue
+            queue_id = radarr_metadata.get("queue_id")
+            deleted = arr_delete_queue_record_from_configs(
+                radarr_configs,
+                radarr_metadata.get("source"),
+                queue_id,
+                blocklist=False,
+                timeout=arr_timeout,
+            )
+            if not deleted:
+                client.delete_hashes([torrent_hash(torrent)], delete_files)
+            log_info(
+                f"Removed completed torrent already imported by Radarr: {torrent_name(torrent)}",
+                hash=torrent_hash(torrent),
+                queue_id=queue_id,
+            )
+            continue
+
         if fail_corrupt and arr_queue_record_indicates_permanent_corrupt_download(radarr_metadata):
             queue_id = radarr_metadata.get("queue_id")
             deleted = arr_delete_queue_record_from_configs(

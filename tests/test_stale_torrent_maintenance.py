@@ -57,12 +57,31 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         sonarr = StaticQueue({
             "queue_id": 42,
             "source": "sonarr",
+            "series_id": 7,
+            "season": 1,
+            "episode": 1,
+            "season_pack": False,
+            "episode_ids": [1001],
             "status_messages": ["Episode file already imported"],
             "status_text": "warning importBlocked Episode file already imported",
         })
         radarr = StaticQueue(None, configs=[])
 
-        with mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
+        def fake_request_json(opener, method, url, **kwargs):
+            if method == "GET" and "/api/v3/episode/1001" in url:
+                return {
+                    "id": 1001,
+                    "seriesId": 7,
+                    "seasonNumber": 1,
+                    "episodeNumber": 1,
+                    "episodeFileId": 5001,
+                    "episodeFile": {"id": 5001, "path": "/tv/Already Imported Show/Season 01/S01E01.mkv"},
+                }, object()
+            if method == "DELETE" and "/api/v3/queue/42?" in url:
+                return {}, object()
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json) as request_json:
             self.guard.cleanup_arr_managed_completed_torrents(
                 client,
                 [torrent],
@@ -71,10 +90,114 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 delete_files=True,
             )
 
-        request_json.assert_called_once()
-        self.assertIn("/api/v3/queue/42?", request_json.call_args.args[2])
-        self.assertIn("removeFromClient=true", request_json.call_args.args[2])
-        self.assertIn("blocklist=false", request_json.call_args.args[2])
+        self.assertEqual(2, request_json.call_count)
+        urls = [call.args[2] for call in request_json.call_args_list]
+        self.assertTrue(any("/api/v3/episode/1001" in url for url in urls))
+        delete_url = urls[-1]
+        self.assertIn("/api/v3/queue/42?", delete_url)
+        self.assertIn("removeFromClient=true", delete_url)
+        self.assertIn("blocklist=false", delete_url)
+        self.assertEqual([], client.deleted)
+
+    def test_completed_sonarr_already_imported_torrent_is_kept_without_verified_episode_file(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "abc123",
+            "name": "Already Imported Show S01",
+            "state": "stoppedUP",
+            "progress": 1,
+            "amount_left": 0,
+            "category": "tv",
+        }
+        sonarr = StaticQueue({
+            "queue_id": 42,
+            "source": "sonarr",
+            "series_id": 7,
+            "season": 1,
+            "episode": 1,
+            "season_pack": False,
+            "episode_ids": [1001],
+            "status_messages": ["Episode file already imported"],
+            "status_text": "warning importBlocked Episode file already imported",
+        })
+        radarr = StaticQueue(None, configs=[])
+
+        def fake_request_json(opener, method, url, **kwargs):
+            if method == "GET" and "/api/v3/episode/1001" in url:
+                return {
+                    "id": 1001,
+                    "seriesId": 7,
+                    "seasonNumber": 1,
+                    "episodeNumber": 1,
+                    "episodeFileId": 0,
+                }, object()
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json) as request_json:
+            self.guard.cleanup_arr_managed_completed_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+                delete_files=True,
+            )
+
+        self.assertEqual(1, request_json.call_count)
+        self.assertEqual([], client.deleted)
+
+    def test_completed_radarr_already_imported_torrent_is_removed_after_movie_file_verification(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "feed123",
+            "name": "Already Imported Movie 2026",
+            "state": "stoppedUP",
+            "progress": 1,
+            "amount_left": 0,
+            "category": "movies",
+        }
+        sonarr = StaticQueue(None, configs=[])
+        radarr = StaticQueue(
+            {
+                "queue_id": 88,
+                "source": "radarr",
+                "title": "already imported movie",
+                "movie_id": 9001,
+                "year": 2026,
+                "status_messages": ["Movie file already imported"],
+                "status_text": "warning importBlocked Movie file already imported",
+            },
+            configs=[("radarr", "http://radarr.test", "radarr-key")],
+        )
+
+        def fake_request_json(opener, method, url, **kwargs):
+            if method == "GET" and "/api/v3/movie/9001" in url:
+                return {
+                    "id": 9001,
+                    "title": "Already Imported Movie",
+                    "year": 2026,
+                    "movieFileId": 7001,
+                    "movieFile": {"id": 7001, "path": "/movies/Already Imported Movie (2026)/movie.mkv"},
+                }, object()
+            if method == "DELETE" and "/api/v3/queue/88?" in url:
+                return {}, object()
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json) as request_json:
+            self.guard.cleanup_arr_managed_completed_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+                delete_files=True,
+            )
+
+        self.assertEqual(2, request_json.call_count)
+        urls = [call.args[2] for call in request_json.call_args_list]
+        self.assertTrue(any("/api/v3/movie/9001" in url for url in urls))
+        delete_url = urls[-1]
+        self.assertIn("/api/v3/queue/88?", delete_url)
+        self.assertIn("removeFromClient=true", delete_url)
+        self.assertIn("blocklist=false", delete_url)
         self.assertEqual([], client.deleted)
 
     def test_completed_radarr_corrupt_download_is_blocklisted(self):
