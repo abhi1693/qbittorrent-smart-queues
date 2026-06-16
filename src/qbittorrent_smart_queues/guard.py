@@ -4148,26 +4148,19 @@ def is_productive_torrent(torrent):
 
 
 def torrent_progress_reason(before, after, min_download_delta_bytes):
+    min_download_delta_bytes = max(1, int(min_download_delta_bytes))
     before_left = torrent_amount_left(before)
     after_left = torrent_amount_left(after)
     left_delta = before_left - after_left
-    if left_delta > 0:
+    if left_delta >= min_download_delta_bytes:
         return f"amount left decreased by {human_size(left_delta)}"
 
     before_downloaded = torrent_downloaded_bytes(before)
     after_downloaded = torrent_downloaded_bytes(after)
     if before_downloaded is not None and after_downloaded is not None:
         downloaded_delta = after_downloaded - before_downloaded
-        if downloaded_delta >= max(1, int(min_download_delta_bytes)):
+        if downloaded_delta >= min_download_delta_bytes:
             return f"downloaded bytes increased by {human_size(downloaded_delta)}"
-
-    before_speed = torrent_download_speed(before)
-    after_speed = torrent_download_speed(after)
-    if before_speed > 0 and after_speed > 0:
-        return (
-            f"download speed remained nonzero "
-            f"({human_rate(before_speed)} -> {human_rate(after_speed)})"
-        )
 
     return ""
 
@@ -4221,41 +4214,6 @@ def torrent_progress_delta_bytes(before, after):
         downloaded_delta = after_downloaded - before_downloaded
 
     return max(0, left_delta, downloaded_delta)
-
-
-def slow_torrent_reason(
-    torrent,
-    allowed_download_limit,
-    min_rate_fraction,
-    min_rate_bytes,
-    max_eta_seconds,
-    require_bad_eta=False,
-):
-    if not is_productive_torrent(torrent):
-        return ""
-
-    speed = torrent_download_speed(torrent)
-    if speed <= 0:
-        return ""
-
-    rate_floor = max(1, math.floor(max(1, allowed_download_limit) * min_rate_fraction))
-    rate_floor = max(rate_floor, max(1, int(min_rate_bytes)))
-    if speed >= rate_floor:
-        return ""
-
-    eta = torrent_eta_seconds(torrent)
-    if require_bad_eta and (eta is None or eta < max_eta_seconds):
-        return ""
-
-    eta_suffix = ", ETA unknown"
-    if eta is not None:
-        eta_suffix = f", ETA {human_duration(eta)}"
-
-    return (
-        f"download speed {human_rate(speed)} is below "
-        f"{human_rate(rate_floor)} minimum for allowed rate "
-        f"{human_rate(allowed_download_limit)}{eta_suffix}"
-    )
 
 
 def candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability):
@@ -5047,14 +5005,11 @@ def apply_single_download(
         env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED", 10),
     )
     normal_max_active_downloads = max(1, env_int("QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS", 1))
-    slow_min_rate_fraction = env_float("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_FRACTION", 0.10)
     slow_min_rate_bytes = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC", 65_536)
     storage_recovery_min_rate_bytes = max(
         0,
         env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MIN_RATE_BYTES_PER_SEC", slow_min_rate_bytes),
     )
-    slow_max_eta_seconds = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MAX_ETA_SECONDS", 172_800)
-    slow_require_bad_eta = env_bool("QBT_SINGLE_DOWNLOAD_SLOW_REQUIRE_BAD_ETA", False)
     healthy_min_seeds = env_int("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_SEEDS", 3)
     healthy_min_availability = env_float("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_AVAILABILITY", 1.05)
     selection_strategy_name = selection_strategy()
@@ -5381,7 +5336,6 @@ def apply_single_download(
                 rejected_counts["deferred_by_priority"] += len(available_candidates) - len(priority_candidates)
 
             productive_candidates = []
-            slow_candidates = []
             for torrent in selection_candidates:
                 if not is_productive_torrent(torrent):
                     if is_running_torrent(torrent) and torrent_download_speed(torrent) <= 0:
@@ -5389,21 +5343,7 @@ def apply_single_download(
                     else:
                         rejected_counts["not_productive"] += 1
                     continue
-                slow_reason = slow_torrent_reason(
-                    torrent,
-                    slow_reference_limit,
-                    slow_min_rate_fraction,
-                    slow_min_rate_bytes,
-                    slow_max_eta_seconds,
-                    slow_require_bad_eta,
-                )
-                if storage_constrained_mode:
-                    slow_reason = ""
-                if slow_reason:
-                    rejected_counts["too_slow"] += 1
-                    slow_candidates.append((torrent, slow_reason))
-                else:
-                    productive_candidates.append(torrent)
+                productive_candidates.append(torrent)
             candidate_counts = {
                 "total": len(torrents),
                 "eligible": len(all_candidates),
@@ -5415,7 +5355,7 @@ def apply_single_download(
                 "watch_priority": len(watch_priority_candidates),
                 "watched_tv_episode_torrents": len(tv_order_state.get("watch_priorities", {})),
                 "productive": len(productive_candidates),
-                "slow": len(slow_candidates),
+                "slow": 0,
                 "selection_strategy": selection_strategy_name,
                 "storage_constrained": storage_constrained_mode,
                 "storage_recovery_max_active": storage_recovery_max_active,
@@ -5804,47 +5744,6 @@ def apply_single_download(
                                 reason=storage_state["reason"],
                             )
                             break
-                if keep_refreshed:
-                    slow_reason = slow_torrent_reason(
-                        keep_refreshed,
-                        slow_reference_limit,
-                        slow_min_rate_fraction,
-                        slow_min_rate_bytes,
-                        slow_max_eta_seconds,
-                        slow_require_bad_eta,
-                    )
-                    if storage_constrained_mode:
-                        slow_reason = ""
-                    if slow_reason:
-                        client.stop_hashes([keep_hash])
-                        attempted_hashes.add(keep_hash)
-                        health_store.record_failure(keep_refreshed, datetime.now(timezone.utc), slow_reason)
-                        add_stall_cooldown_tag(
-                            client,
-                        keep_refreshed,
-                        storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
-                        now,
-                        stall_cooldown_seconds,
-                    )
-                        emit_decision_log(
-                            "qbt_guard_decision",
-                            **decision_base_context(run_decision_context, client, storage_state),
-                            action="stop_kept_too_slow",
-                            reason=slow_reason,
-                            selected_torrent=torrent_decision_summary(keep_refreshed),
-                            rejected_counts={"too_slow_after_wait": 1},
-                            candidate_counts=candidate_counts,
-                        )
-                        log_decision_info(
-                            "stop_kept_too_slow",
-                            f"Stopped kept torrent because it is too slow after "
-                            f"{stall_check_seconds}s: "
-                            f"{torrent_name(keep_refreshed)}; {slow_reason}",
-                            selected=torrent_name(keep_refreshed),
-                            reason=slow_reason,
-                        )
-                        continue
-
                 progress_reason = ""
                 if keep_refreshed:
                     progress_reason = torrent_progress_reason(
@@ -5927,47 +5826,6 @@ def apply_single_download(
                     f"{torrent_name(keep_refreshed or keep)}",
                     selected=torrent_name(keep_refreshed or keep),
                     reason="did not make progress",
-                )
-                continue
-
-            if slow_candidates:
-                slow_hashes = [torrent_hash(torrent) for torrent, _ in slow_candidates]
-                client.stop_hashes(slow_hashes)
-                emit_decision_log(
-                    "qbt_guard_decision",
-                    **decision_base_context(run_decision_context, client, storage_state),
-                    action="stop_slow_candidates",
-                    reason="slow candidates below productivity threshold",
-                    rejected_counts=dict(rejected_counts),
-                    candidate_counts=candidate_counts,
-                    selected_torrent=None,
-                    rejected_torrents=[
-                        {
-                            "torrent": torrent_decision_summary(torrent),
-                            "reason": slow_reason,
-                        }
-                        for torrent, slow_reason in slow_candidates[:5]
-                    ],
-                )
-                for torrent, slow_reason in slow_candidates:
-                    attempted_hashes.add(torrent_hash(torrent))
-                    health_store.record_failure(torrent, now, slow_reason)
-                    add_stall_cooldown_tag(
-                        client,
-                        torrent,
-                        storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
-                        now,
-                        stall_cooldown_seconds,
-                    )
-                    log_info(
-                        f"Stopped slow torrent: "
-                        f"{torrent_name(torrent)}; {slow_reason}"
-                    )
-                log_decision_info(
-                    "stop_slow_candidates",
-                    f"Stopped {len(slow_candidates)} slow torrent(s) "
-                    "while trying the next eligible candidate",
-                    count=len(slow_candidates),
                 )
                 continue
 
@@ -6162,46 +6020,6 @@ def apply_single_download(
                             reason=storage_state["reason"],
                         )
                         break
-            if selected_refreshed:
-                slow_reason = slow_torrent_reason(
-                    selected_refreshed,
-                    slow_reference_limit,
-                    slow_min_rate_fraction,
-                    slow_min_rate_bytes,
-                    slow_max_eta_seconds,
-                    slow_require_bad_eta,
-                )
-                if storage_constrained_mode:
-                    slow_reason = ""
-                if slow_reason:
-                    client.stop_hashes([selected_hash])
-                    health_store.record_failure(selected_refreshed, datetime.now(timezone.utc), slow_reason)
-                    add_stall_cooldown_tag(
-                        client,
-                        selected_refreshed,
-                        storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
-                        now,
-                        stall_cooldown_seconds,
-                    )
-                    emit_decision_log(
-                        "qbt_guard_decision",
-                        **decision_base_context(run_decision_context, client, storage_state),
-                        action="stop_selected_too_slow",
-                        reason=slow_reason,
-                        selected_torrent=torrent_decision_summary(selected_refreshed),
-                        rejected_counts={"too_slow_after_wait": 1},
-                        candidate_counts=candidate_counts,
-                    )
-                    log_decision_info(
-                        "stop_selected_too_slow",
-                        f"Stopped selected torrent because it is too slow after "
-                        f"{stall_check_seconds}s: "
-                        f"{torrent_name(selected_refreshed)}; {slow_reason}",
-                        selected=torrent_name(selected_refreshed),
-                        reason=slow_reason,
-                    )
-                    continue
-
             progress_reason = ""
             if selected_refreshed:
                 progress_reason = torrent_progress_reason(

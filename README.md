@@ -174,14 +174,11 @@ critical decision summaries for unchanged actions are emitted every
 default; set `QBT_DECISION_LOG_LEVEL=info` while tuning, or
 `QBT_DECISION_LOGS_ENABLED=false` to disable them.
 
-Single-download mode replaces active torrents that stay below the slow torrent
-floor after the sample window, even when qBittorrent reports some byte progress.
-The floor is the greater of `QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_FRACTION` of the
-current download cap, defaulting to `0.10`, and
-`QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC`, defaulting to `65536`. Set
-`QBT_SINGLE_DOWNLOAD_SLOW_REQUIRE_BAD_ETA=true` to restore the older behavior
-that only stops slow torrents when their ETA also exceeds
-`QBT_SINGLE_DOWNLOAD_SLOW_MAX_ETA_SECONDS`.
+Single-download mode keeps an active torrent only when selected bytes or
+downloaded bytes move by at least `QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES`
+during the `QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS` sample window. Instantaneous
+download speed is telemetry only for normal queue decisions; a low speed does
+not stop a torrent if it is making real progress.
 
 When download storage is at or below the configured reserve and torrent-fit
 checks are enabled, the controller enters a constrained recovery mode instead of

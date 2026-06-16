@@ -134,7 +134,15 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             "amount left decreased",
             self.guard.torrent_progress_reason(
                 before,
-                {"amount_left": 999, "downloaded": 100, "dlspeed": 0},
+                {"amount_left": 850, "downloaded": 100, "dlspeed": 0},
+                min_download_delta_bytes=100,
+            ),
+        )
+        self.assertEqual(
+            "",
+            self.guard.torrent_progress_reason(
+                before,
+                {"amount_left": 950, "downloaded": 100, "dlspeed": 0},
                 min_download_delta_bytes=100,
             ),
         )
@@ -146,50 +154,14 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 min_download_delta_bytes=100,
             ),
         )
-        self.assertIn(
-            "download speed remained nonzero",
+        self.assertEqual(
+            "",
             self.guard.torrent_progress_reason(
                 {"amount_left": 1000, "downloaded": 100, "dlspeed": 1},
                 {"amount_left": 1000, "downloaded": 100, "dlspeed": 2},
                 min_download_delta_bytes=100,
             ),
         )
-
-    def test_slow_torrent_reason_defaults_to_rate_floor_even_with_short_eta(self):
-        torrent = {
-            "state": "downloading",
-            "dlspeed": 50_000,
-            "amount_left": 1_000_000,
-        }
-
-        reason = self.guard.slow_torrent_reason(
-            torrent,
-            allowed_download_limit=947_000,
-            min_rate_fraction=0.10,
-            min_rate_bytes=65_536,
-            max_eta_seconds=172_800,
-        )
-
-        self.assertIn("download speed 50.0 KB/s is below", reason)
-        self.assertIn("minimum for allowed rate 947 KB/s", reason)
-
-    def test_slow_torrent_reason_can_require_bad_eta_for_legacy_behavior(self):
-        torrent = {
-            "state": "downloading",
-            "dlspeed": 50_000,
-            "amount_left": 1_000_000,
-        }
-
-        reason = self.guard.slow_torrent_reason(
-            torrent,
-            allowed_download_limit=947_000,
-            min_rate_fraction=0.10,
-            min_rate_bytes=65_536,
-            max_eta_seconds=172_800,
-            require_bad_eta=True,
-        )
-
-        self.assertEqual("", reason)
 
     def test_apply_single_download_stops_zero_speed_torrent_after_wait_without_bytes(self):
         client = FakeQbtClient([
@@ -267,6 +239,68 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 for hashes, tags in client.added_tags
             )
         )
+
+    def test_apply_single_download_keeps_low_speed_torrent_with_real_progress(self):
+        class ProgressingFakeQbtClient(FakeQbtClient):
+            def start_hashes(self, hashes):
+                super().start_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] in hashes:
+                        torrent["state"] = "downloading"
+                        torrent["dlspeed"] = 50_000
+                        torrent["amount_left"] -= 2 * 1024 * 1024
+                        torrent["downloaded"] += 2 * 1024 * 1024
+
+        client = ProgressingFakeQbtClient([
+            {
+                "hash": "slow-progress",
+                "name": "Slow.But.Progressing.S01E01",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 10 * 1024 * 1024,
+                "downloaded": 0,
+                "progress": 0.5,
+                "availability": 1.0,
+                "num_seeds": 1,
+                "num_complete": 1,
+                "tags": "",
+            },
+        ])
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "60",
+            "QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES": str(1024 * 1024),
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(self.guard.time, "sleep"):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=10_485_760,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        decision_actions = [item["action"] for item in decision_events]
+        self.assertIn("confirm_selected_productive", decision_actions)
+        self.assertNotIn("stop_selected_too_slow", decision_actions)
+        self.assertFalse(any("slow-progress" in hashes for hashes in client.stopped))
+        self.assertFalse(client.added_tags)
 
     def test_storage_constrained_mode_selects_smallest_verified_remaining_download(self):
         client = FakeQbtClient(
