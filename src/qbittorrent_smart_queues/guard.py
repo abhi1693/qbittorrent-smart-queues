@@ -80,6 +80,19 @@ THERMAL_ACTION_THROTTLE = "throttle"
 THERMAL_ACTION_PAUSE = "pause"
 _DECISION_SUMMARY_REPEAT_STATE = {}
 _DECISION_SUMMARY_REPEAT_LOCK = threading.Lock()
+STALL_COOLDOWN_REASON_LEGACY = "legacy"
+STALL_COOLDOWN_REASON_NO_PROGRESS = "no-progress"
+STALL_COOLDOWN_REASON_METADATA = "metadata"
+STALL_COOLDOWN_REASON_TRACKER_DEAD = "tracker-dead"
+STALL_COOLDOWN_REASON_IMPORT_FAILED = "import-failed"
+STALL_COOLDOWN_REASON_MANUAL_HOLD = "manual-hold"
+STALL_COOLDOWN_REASONS = {
+    STALL_COOLDOWN_REASON_NO_PROGRESS,
+    STALL_COOLDOWN_REASON_METADATA,
+    STALL_COOLDOWN_REASON_TRACKER_DEAD,
+    STALL_COOLDOWN_REASON_IMPORT_FAILED,
+    STALL_COOLDOWN_REASON_MANUAL_HOLD,
+}
 
 
 class ApiError(RuntimeError):
@@ -4186,6 +4199,17 @@ def is_stalled_torrent(torrent):
     return torrent_state(torrent) in {"metaDL", "stalledDL"} and torrent_download_speed(torrent) <= 0
 
 
+def tracker_dead_cooldown_reason(torrent):
+    if (
+        is_stalled_torrent(torrent)
+        and torrent_connected_seeds(torrent) <= 0
+        and torrent_reported_seeds(torrent) <= 0
+        and torrent_availability(torrent) <= 0
+    ):
+        return STALL_COOLDOWN_REASON_TRACKER_DEAD
+    return STALL_COOLDOWN_REASON_NO_PROGRESS
+
+
 def is_running_torrent(torrent):
     if is_stopped_torrent(torrent):
         return False
@@ -4868,33 +4892,112 @@ def storage_torrent_block_reason(client, torrent, storage_guard, storage_state):
     )
 
 
-def stall_cooldown_tag(prefix, now):
-    return f"{prefix}-{now.strftime('%Y%m%dT%H%M%SZ')}"
+def normalize_stall_cooldown_reason(reason):
+    normalized = str(reason or STALL_COOLDOWN_REASON_NO_PROGRESS).strip().lower()
+    normalized = normalized.replace("_", "-")
+    if normalized in STALL_COOLDOWN_REASONS:
+        return normalized
+    return STALL_COOLDOWN_REASON_NO_PROGRESS
 
 
-def parse_stall_cooldown_tag(tag, prefix):
+def stall_cooldown_tag(prefix, now, reason=None):
+    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+    if reason is None:
+        return f"{prefix}-{timestamp}"
+    return f"{prefix}-{normalize_stall_cooldown_reason(reason)}-{timestamp}"
+
+
+def parse_stall_cooldown_tag_details(tag, prefix):
     marker = f"{prefix}-"
     if not tag.startswith(marker):
         return None
+
+    suffix = tag[len(marker):]
+    reason = STALL_COOLDOWN_REASON_LEGACY
+    timestamp = suffix
+    for candidate_reason in sorted(STALL_COOLDOWN_REASONS, key=len, reverse=True):
+        reason_marker = f"{candidate_reason}-"
+        if suffix.startswith(reason_marker):
+            reason = candidate_reason
+            timestamp = suffix[len(reason_marker):]
+            break
+
     try:
-        return datetime.strptime(tag[len(marker):], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        return {
+            "reason": reason,
+            "time": datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc),
+            "tag": tag,
+        }
     except ValueError:
         return None
+
+
+def parse_stall_cooldown_tag(tag, prefix):
+    details = parse_stall_cooldown_tag_details(tag, prefix)
+    if not details:
+        return None
+    return details["time"]
+
+
+def stall_cooldown_seconds_for_reason(base_seconds, reason):
+    if reason == STALL_COOLDOWN_REASON_LEGACY:
+        return base_seconds
+    normalized = normalize_stall_cooldown_reason(reason)
+    env_suffix = normalized.upper().replace("-", "_")
+    reason_default = {
+        STALL_COOLDOWN_REASON_NO_PROGRESS: base_seconds,
+        STALL_COOLDOWN_REASON_METADATA: min(base_seconds, 1800) if base_seconds > 0 else 0,
+        STALL_COOLDOWN_REASON_TRACKER_DEAD: max(base_seconds, 21_600),
+        STALL_COOLDOWN_REASON_IMPORT_FAILED: max(base_seconds, 86_400),
+        STALL_COOLDOWN_REASON_MANUAL_HOLD: max(base_seconds, 604_800),
+    }.get(normalized, base_seconds)
+    return env_int(
+        f"QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_{env_suffix}_SECONDS",
+        reason_default,
+    )
+
+
+def stall_cooldown_cutoff(now, base_seconds, reason):
+    cooldown_seconds = max(0, stall_cooldown_seconds_for_reason(base_seconds, reason))
+    return now - timedelta(seconds=cooldown_seconds), cooldown_seconds
 
 
 def stall_cooldown_tags(torrent, prefix, now, cooldown_seconds):
     active_tags = []
     expired_tags = []
-    cutoff = now - timedelta(seconds=max(0, cooldown_seconds))
     for tag in torrent_tags(torrent):
-        tag_time = parse_stall_cooldown_tag(tag, prefix)
-        if tag_time is None:
+        details = parse_stall_cooldown_tag_details(tag, prefix)
+        if details is None:
             continue
-        if cooldown_seconds > 0 and tag_time > cutoff:
+        cutoff, reason_cooldown_seconds = stall_cooldown_cutoff(
+            now,
+            cooldown_seconds,
+            details["reason"],
+        )
+        if reason_cooldown_seconds > 0 and details["time"] > cutoff:
             active_tags.append(tag)
         else:
             expired_tags.append(tag)
     return active_tags, expired_tags
+
+
+def stall_cooldown_tag_reason_counts(tags, prefix):
+    counts = Counter()
+    for tag in tags:
+        details = parse_stall_cooldown_tag_details(tag, prefix)
+        if details:
+            counts[details["reason"]] += 1
+    return counts
+
+
+def stall_cooldown_reason_label(tags, prefix):
+    counts = stall_cooldown_tag_reason_counts(tags, prefix)
+    if not counts:
+        return "unknown"
+    return ",".join(
+        f"{reason}:{count}" if count > 1 else reason
+        for reason, count in sorted(counts.items())
+    )
 
 
 def clear_expired_stall_tags(client, torrent, prefix, now, cooldown_seconds):
@@ -4903,37 +5006,49 @@ def clear_expired_stall_tags(client, torrent, prefix, now, cooldown_seconds):
         try:
             client.remove_tags([torrent_hash(torrent)], expired_tags)
             log_info(
-                f"Cleared expired quota-stall cooldown tag(s) from "
+                f"Cleared expired stall cooldown tag(s) from "
                 f"{torrent_name(torrent)}"
             )
         except ApiError as exc:
             log_warning(
-                f"Failed to clear expired quota-stall cooldown tag(s) from "
+                f"Failed to clear expired stall cooldown tag(s) from "
                 f"{torrent_name(torrent)}: {exc}",
             )
     return active_tags
 
 
-def add_stall_cooldown_tag(client, torrent, prefix, now, cooldown_seconds):
+def add_stall_cooldown_tag(client, torrent, prefix, now, cooldown_seconds, reason=None):
     if cooldown_seconds <= 0 or not prefix or not torrent_hash(torrent):
         return
-    tag = stall_cooldown_tag(prefix, now)
+    cooldown_reason = normalize_stall_cooldown_reason(reason)
+    reason_cooldown_seconds = stall_cooldown_seconds_for_reason(cooldown_seconds, cooldown_reason)
+    if reason_cooldown_seconds <= 0:
+        return
+    tag = stall_cooldown_tag(prefix, now, cooldown_reason)
     try:
         client.add_tags([torrent_hash(torrent)], [tag])
         log_info(
-            f"Marked {torrent_name(torrent)} with quota-stall cooldown "
-            f"for {cooldown_seconds}s"
+            f"Marked {torrent_name(torrent)} with {cooldown_reason} stall cooldown "
+            f"for {reason_cooldown_seconds}s"
         )
     except ApiError as exc:
         log_warning(
-            f"Failed to mark {torrent_name(torrent)} with quota-stall cooldown: "
+            f"Failed to mark {torrent_name(torrent)} with {cooldown_reason} stall cooldown: "
             f"{exc}",
         )
 
 
 def cleanup_stall_tags(client):
     stall_tag_prefix = os.environ.get("QBT_SINGLE_DOWNLOAD_STALL_TAG_PREFIX", "quota-stalled").strip()
-    if not stall_tag_prefix:
+    storage_stall_tag_prefix = os.environ.get(
+        "QBT_SINGLE_DOWNLOAD_STORAGE_STALL_TAG_PREFIX",
+        "storage-stalled",
+    ).strip()
+    stall_tag_prefixes = []
+    for prefix in (stall_tag_prefix, storage_stall_tag_prefix):
+        if prefix and prefix not in stall_tag_prefixes:
+            stall_tag_prefixes.append(prefix)
+    if not stall_tag_prefixes:
         return
 
     now = datetime.now(timezone.utc)
@@ -4952,15 +5067,16 @@ def cleanup_stall_tags(client):
 
     for torrent in torrents:
         item_hash = torrent_hash(torrent)
-        active_tags, expired_tags = stall_cooldown_tags(
-            torrent,
-            stall_tag_prefix,
-            now,
-            stall_cooldown_seconds,
-        )
-        active_stall_tags.update(active_tags)
-        if item_hash and expired_tags:
-            expired_tag_assignments.append((torrent, expired_tags))
+        for prefix in stall_tag_prefixes:
+            active_tags, expired_tags = stall_cooldown_tags(
+                torrent,
+                prefix,
+                now,
+                stall_cooldown_seconds,
+            )
+            active_stall_tags.update(active_tags)
+            if item_hash and expired_tags:
+                expired_tag_assignments.append((torrent, expired_tags))
 
     removed_assignments = 0
     affected_torrents = 0
@@ -4992,7 +5108,10 @@ def cleanup_stall_tags(client):
 
     unused_stall_tags = sorted(
         tag for tag in all_tags
-        if parse_stall_cooldown_tag(tag, stall_tag_prefix) is not None
+        if any(
+            parse_stall_cooldown_tag(tag, prefix) is not None
+            for prefix in stall_tag_prefixes
+        )
         and tag not in active_stall_tags
     )
     if not unused_stall_tags:
@@ -5340,10 +5459,19 @@ def apply_single_download(
                     )
                 if active_tags:
                     rejected_counts["cooldown"] += 1
+                    for reason, count in stall_cooldown_tag_reason_counts(
+                        active_tags,
+                        active_stall_tag_prefix,
+                    ).items():
+                        rejected_counts[f"cooldown_{reason.replace('-', '_')}"] += count
                     cooldown_count += 1
+                    cooldown_reasons = stall_cooldown_reason_label(
+                        active_tags,
+                        active_stall_tag_prefix,
+                    )
                     log_info(
-                        f"Skipping torrent in quota-stall cooldown "
-                        f"{torrent_name(torrent)}"
+                        f"Skipping torrent in stall cooldown "
+                        f"({cooldown_reasons}) {torrent_name(torrent)}"
                     )
                     continue
                 available_candidates.append(torrent)
@@ -5895,6 +6023,7 @@ def apply_single_download(
                     storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
                     now,
                     stall_cooldown_seconds,
+                    tracker_dead_cooldown_reason(keep_refreshed or keep),
                 )
                 emit_decision_log(
                     "qbt_guard_decision",
@@ -5946,6 +6075,7 @@ def apply_single_download(
                         storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
                         now,
                         stall_cooldown_seconds,
+                        tracker_dead_cooldown_reason(torrent),
                     )
                 log_decision_info(
                     "stop_stalled_candidates",
@@ -6173,6 +6303,7 @@ def apply_single_download(
                 storage_stall_tag_prefix if storage_constrained_mode else stall_tag_prefix,
                 now,
                 stall_cooldown_seconds,
+                tracker_dead_cooldown_reason(selected_refreshed or selected),
             )
             emit_decision_log(
                 "qbt_guard_decision",

@@ -116,6 +116,20 @@ Optional single-download selection tuning:
 | `QBT_SINGLE_DOWNLOAD_SELECTION_STRATEGY` | `tiered` | Use `balanced` to score candidates with extra weight for near-complete torrents, smaller remaining downloads, shorter ETA, current seeds, and availability. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED` | `false` | Allow a productive active torrent to yield when a stopped candidate has a much better balanced score. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum balanced-score advantage required before preempting a productive torrent. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS` | `3600` | Base cooldown for torrents that fail a single-download attempt. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_NO_PROGRESS_SECONDS` | base cooldown | Cooldown for torrents that run but do not move enough bytes during the sample. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_METADATA_SECONDS` | min(base, 1800) | Cooldown honored for manually/future-applied metadata wait tags. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_TRACKER_DEAD_SECONDS` | max(base, 21600) | Cooldown for stalled torrents with no connected seeds, reported seeds, or availability. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_IMPORT_FAILED_SECONDS` | max(base, 86400) | Cooldown honored for manually/future-applied import-failed tags. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_MANUAL_HOLD_SECONDS` | max(base, 604800) | Cooldown honored for manually-applied hold tags. |
+
+Cooldown tags are reasoned as
+`<prefix>-<reason>-<timestamp>`, for example
+`quota-stalled-tracker-dead-20260601T123456Z`. Legacy
+`<prefix>-<timestamp>` tags are still honored with the base cooldown. The
+normal selector writes `no-progress` and `tracker-dead` tags today; `metadata`,
+`import-failed`, and `manual-hold` are parsed and cleaned so they can be applied
+manually or by future integrations without being treated as generic stalls.
 
 Optional storage and thermal guards:
 
