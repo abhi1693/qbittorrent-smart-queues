@@ -663,6 +663,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         ][-1]
 
         self.assertIn(["replacement"], client.started)
+        self.assertEqual(1, client.started.count(["slow"]))
         self.assertTrue(any("slow" in stop_call for stop_call in client.stopped))
         self.assertEqual(1, recovery_event["candidate_counts"]["storage_recovery_slow_excluded"])
 

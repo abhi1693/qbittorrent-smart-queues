@@ -4963,7 +4963,10 @@ def apply_single_download(
                     ):
                         storage_recovery_slow_excluded_hashes.add(item_hash)
                         continue
-                    if not is_running_torrent(torrent) or is_productive_torrent(torrent):
+                    if not is_running_torrent(torrent):
+                        storage_recovery_slow_excluded_hashes.add(item_hash)
+                        continue
+                    if is_productive_torrent(torrent):
                         continue
                     remaining_bytes = storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state)
                     if remaining_bytes is None:
