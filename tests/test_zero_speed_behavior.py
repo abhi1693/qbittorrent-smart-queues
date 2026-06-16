@@ -540,11 +540,12 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             for line in stdout.getvalue().splitlines()
             if line.startswith("{")
         ]
-        recovery_event = next(
+        recovery_event = [
             item for item in decision_logs
             if item.get("event") == "qbt_guard_decision"
             and item.get("action") == "storage_recovery_batch"
-        )
+            and "candidate_counts" in item
+        ][-1]
 
         self.assertIn(["small-5"], client.started)
         self.assertEqual(5, recovery_event["candidate_counts"]["storage_recovery_parked_stalled"])
@@ -561,6 +562,109 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         )
         self.assertIn((5, None), client.queue_limits)
         self.assertIn((6, None), client.queue_limits)
+
+    def test_storage_constrained_mode_replaces_too_slow_recovery_worker(self):
+        class SlowStartFakeQbtClient(FakeQbtClient):
+            def start_hashes(self, hashes):
+                super().start_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] in hashes:
+                        torrent["state"] = "downloading"
+                        torrent["dlspeed"] = 1024
+
+        torrents = [
+            {
+                "hash": "slow",
+                "name": "Slow.Recovery.Worker",
+                "category": "movies",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 1024 * 1024,
+                "downloaded": 0,
+                "progress": 0.99,
+                "availability": 1.0,
+                "num_seeds": 1,
+                "num_complete": 1,
+                "tags": "",
+            },
+            {
+                "hash": "replacement",
+                "name": "Replacement.Worker",
+                "category": "movies",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 2 * 1024 * 1024,
+                "downloaded": 0,
+                "progress": 0.99,
+                "availability": 1.0,
+                "num_seeds": 2,
+                "num_complete": 2,
+                "tags": "",
+            },
+        ]
+        files = {
+            item["hash"]: [
+                {
+                    "name": f"{item['hash']}.mkv",
+                    "size": 100 * 1024 * 1024,
+                    "progress": 0.99,
+                    "priority": 1,
+                }
+            ]
+            for item in torrents
+        }
+        client = SlowStartFakeQbtClient(torrents, files=files)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_ACTIVE": "1",
+                "QBT_DOWNLOAD_STORAGE_RECOVERY_STALL_SAMPLES": "1",
+                "QBT_DOWNLOAD_STORAGE_RECOVERY_MIN_RATE_BYTES_PER_SEC": "65536",
+                "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+                "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "60",
+                "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+                "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_TORRENT_HEALTH_STATE_PATH": f"{tmpdir}/torrent-health.json",
+                "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+                "QBT_LOG_FORMAT": "json",
+                "QBT_DECISION_LOG_LEVEL": "info",
+            }
+
+            with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(self.guard.time, "sleep"):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=ConstrainedStorageGuard(),
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.guard.apply_single_download(
+                        [client],
+                        usage_bytes=0,
+                        monthly_limit_bytes=1000,
+                        download_limit=1024,
+                        limit_reason="unit test",
+                        storage_guard=ConstrainedStorageGuard(),
+                    )
+
+        decision_logs = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{")
+        ]
+        recovery_event = [
+            item for item in decision_logs
+            if item.get("event") == "qbt_guard_decision"
+            and item.get("action") == "storage_recovery_batch"
+            and "candidate_counts" in item
+        ][-1]
+
+        self.assertIn(["replacement"], client.started)
+        self.assertTrue(any("slow" in stop_call for stop_call in client.stopped))
+        self.assertEqual(1, recovery_event["candidate_counts"]["storage_recovery_slow_excluded"])
 
     def test_apply_single_download_preempts_productive_for_better_balanced_candidate(self):
         client = FakeQbtClient([

@@ -3852,6 +3852,43 @@ def torrent_progress_reason(before, after, min_download_delta_bytes):
     return ""
 
 
+def storage_recovery_progress_reason(
+    before,
+    after,
+    min_download_delta_bytes,
+    min_rate_bytes_per_second,
+    sample_seconds,
+):
+    min_rate_bytes_per_second = max(0, int(min_rate_bytes_per_second or 0))
+    if min_rate_bytes_per_second <= 0:
+        return torrent_progress_reason(before, after, min_download_delta_bytes)
+
+    sample_seconds = max(1, int(sample_seconds or 1))
+    delta_bytes = torrent_progress_delta_bytes(before, after)
+    observed_speed = max(
+        torrent_download_speed(after),
+        math.floor(max(0, delta_bytes) / sample_seconds),
+    )
+    if observed_speed < min_rate_bytes_per_second:
+        return ""
+
+    if delta_bytes > 0:
+        return (
+            f"storage recovery progressed at {human_rate(observed_speed)} "
+            f"over {sample_seconds}s"
+        )
+    return (
+        f"download speed {human_rate(observed_speed)} met storage recovery "
+        f"minimum {human_rate(min_rate_bytes_per_second)}"
+    )
+
+
+def is_slow_storage_recovery_torrent(torrent, min_rate_bytes_per_second):
+    min_rate_bytes_per_second = max(0, int(min_rate_bytes_per_second or 0))
+    speed = torrent_download_speed(torrent)
+    return min_rate_bytes_per_second > 0 and speed > 0 and speed < min_rate_bytes_per_second
+
+
 def torrent_progress_delta_bytes(before, after):
     before_left = torrent_amount_left(before)
     after_left = torrent_amount_left(after)
@@ -4642,6 +4679,10 @@ def apply_single_download(
     normal_max_active_downloads = max(1, env_int("QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS", 1))
     slow_min_rate_fraction = env_float("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_FRACTION", 0.10)
     slow_min_rate_bytes = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC", 65_536)
+    storage_recovery_min_rate_bytes = max(
+        0,
+        env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MIN_RATE_BYTES_PER_SEC", slow_min_rate_bytes),
+    )
     slow_max_eta_seconds = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MAX_ETA_SECONDS", 172_800)
     healthy_min_seeds = env_int("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_SEEDS", 3)
     healthy_min_availability = env_float("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_AVAILABILITY", 1.05)
@@ -4907,6 +4948,7 @@ def apply_single_download(
             storage_recovery_parked_hashes = set()
             storage_recovery_parked_remaining_bytes = 0
             storage_recovery_parked_deferred_count = 0
+            storage_recovery_slow_excluded_hashes = set()
             if storage_constrained_mode:
                 fit_bytes = storage_fit_headroom_bytes(storage_guard, storage_state)
                 for torrent in available_candidates:
@@ -4914,6 +4956,12 @@ def apply_single_download(
                     if not item_hash:
                         continue
                     if health_store.storage_recovery_no_progress_samples(torrent) < storage_recovery_stall_samples:
+                        continue
+                    if is_running_torrent(torrent) and is_slow_storage_recovery_torrent(
+                        torrent,
+                        storage_recovery_min_rate_bytes,
+                    ):
+                        storage_recovery_slow_excluded_hashes.add(item_hash)
                         continue
                     if not is_running_torrent(torrent) or is_productive_torrent(torrent):
                         continue
@@ -4942,10 +4990,11 @@ def apply_single_download(
                     storage_state,
                     storage_recovery_max_active,
                     initial_remaining_bytes=storage_recovery_parked_remaining_bytes,
-                    excluded_hashes=storage_recovery_parked_hashes,
+                    excluded_hashes=storage_recovery_parked_hashes | storage_recovery_slow_excluded_hashes,
                 )
                 rejected_counts["parked_storage_recovery_stalled"] += len(storage_recovery_parked_torrents)
                 rejected_counts["deferred_storage_recovery_parked"] += storage_recovery_parked_deferred_count
+                rejected_counts["excluded_slow_storage_recovery"] += len(storage_recovery_slow_excluded_hashes)
                 rejected_counts["deferred_by_storage_recovery_batch"] += storage_recovery_deferred_count
             else:
                 storage_recovery_selected_remaining_bytes = 0
@@ -4999,6 +5048,8 @@ def apply_single_download(
                 "storage_recovery_parked_stalled": len(storage_recovery_parked_torrents),
                 "storage_recovery_parked_remaining_bytes": storage_recovery_parked_remaining_bytes,
                 "storage_recovery_stall_samples": storage_recovery_stall_samples,
+                "storage_recovery_min_rate_bytes_per_sec": storage_recovery_min_rate_bytes,
+                "storage_recovery_slow_excluded": len(storage_recovery_slow_excluded_hashes),
             }
 
             if storage_constrained_mode and storage_recovery_parked_torrents and not selection_candidates:
@@ -5149,19 +5200,30 @@ def apply_single_download(
 
                 progress_events = []
                 stalled_count = 0
+                slow_count = 0
                 no_progress_count = 0
                 parked_after_sample = []
+                slow_excluded_after_sample = []
                 for selected in selection_candidates:
                     selected_hash = torrent_hash(selected)
                     selected_refreshed = refreshed.get(selected_hash)
                     if selected_refreshed and is_stalled_torrent(selected_refreshed):
                         stalled_count += 1
                     progress_reason = ""
+                    selected_is_slow_recovery = False
                     if selected_refreshed:
-                        progress_reason = torrent_progress_reason(
+                        if is_slow_storage_recovery_torrent(
+                            selected_refreshed,
+                            storage_recovery_min_rate_bytes,
+                        ):
+                            slow_count += 1
+                            selected_is_slow_recovery = True
+                        progress_reason = storage_recovery_progress_reason(
                             selected,
                             selected_refreshed,
                             min_progress_bytes,
+                            storage_recovery_min_rate_bytes,
+                            stall_check_seconds,
                         )
                     if progress_reason:
                         progress_events.append(
@@ -5187,7 +5249,10 @@ def apply_single_download(
                             health_store.storage_recovery_no_progress_samples(parked_torrent)
                             >= storage_recovery_stall_samples
                         ):
-                            parked_after_sample.append(parked_torrent)
+                            if selected_is_slow_recovery:
+                                slow_excluded_after_sample.append(parked_torrent)
+                            else:
+                                parked_after_sample.append(parked_torrent)
 
                 emit_decision_log(
                     "qbt_guard_decision",
@@ -5206,21 +5271,29 @@ def apply_single_download(
                         torrent_decision_summary(torrent)
                         for torrent in storage_recovery_parked_torrents + parked_after_sample
                     ],
+                    slow_excluded_torrents=[
+                        torrent_decision_summary(torrent)
+                        for torrent in slow_excluded_after_sample
+                    ],
                     progress_torrents=progress_events[:5],
                     rejected_counts=dict(rejected_counts),
                     candidate_counts={
                         **candidate_counts,
                         "storage_recovery_stalled": stalled_count,
+                        "storage_recovery_slow": slow_count,
                         "storage_recovery_no_progress": no_progress_count,
                         "storage_recovery_newly_parked": len(parked_after_sample),
+                        "storage_recovery_newly_slow_excluded": len(slow_excluded_after_sample),
                     },
                 )
                 log_decision_info(
                     "keep_storage_recovery_batch",
                     f"Keeping storage-recovery batch selected after {stall_check_seconds}s; "
                     f"{len(progress_events)} progressed, {stalled_count} stalled, "
+                    f"{slow_count} below recovery rate, "
                     f"{no_progress_count} without measured progress, "
-                    f"{len(parked_after_sample)} newly parked for replacement next poll",
+                    f"{len(parked_after_sample)} newly parked, "
+                    f"{len(slow_excluded_after_sample)} newly excluded for replacement next poll",
                     selected=", ".join(torrent_name(torrent) for torrent in selection_candidates[:5]),
                 )
                 break

@@ -163,7 +163,11 @@ seeders appear, but it no longer consumes one of the active recovery worker
 slots. The controller then refills open worker slots with other fitting
 torrents while accounting for parked torrents in the storage headroom budget.
 At most `QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED` stalled torrents are
-parked, defaulting to `10`. Once storage is back above reserve, the next
+parked, defaulting to `10`. Recovery workers also need to meet
+`QBT_DOWNLOAD_STORAGE_RECOVERY_MIN_RATE_BYTES_PER_SEC`, defaulting to the normal
+slow torrent floor of `QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC`. A
+running torrent below that rate is treated as too slow for recovery and is
+replaced instead of being parked. Once storage is back above reserve, the next
 controller pass restores the normal active download limit from
 `QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS`, defaulting to `1`. Torrents
 with unknown remaining size or no selected files are blocked while storage is
