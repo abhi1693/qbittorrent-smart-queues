@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookiejar import CookieJar
 
 
@@ -80,6 +81,8 @@ THERMAL_ACTION_THROTTLE = "throttle"
 THERMAL_ACTION_PAUSE = "pause"
 _DECISION_SUMMARY_REPEAT_STATE = {}
 _DECISION_SUMMARY_REPEAT_LOCK = threading.Lock()
+_STATUS_HTTP_SERVER = None
+_STATUS_HTTP_THREAD = None
 STALL_COOLDOWN_REASON_LEGACY = "legacy"
 STALL_COOLDOWN_REASON_NO_PROGRESS = "no-progress"
 STALL_COOLDOWN_REASON_METADATA = "metadata"
@@ -93,6 +96,160 @@ STALL_COOLDOWN_REASONS = {
     STALL_COOLDOWN_REASON_IMPORT_FAILED,
     STALL_COOLDOWN_REASON_MANUAL_HOLD,
 }
+
+
+def prometheus_label(value):
+    text = str(value or "")
+    return text.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def prometheus_metric_line(name, labels, value):
+    if labels:
+        label_text = ",".join(
+            f'{key}="{prometheus_label(label_value)}"'
+            for key, label_value in sorted(labels.items())
+        )
+        return f"{name}{{{label_text}}} {value}"
+    return f"{name} {value}"
+
+
+def numeric_metric_value(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+class QueueStatusStore:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.started_at = datetime.now(timezone.utc)
+        self.last_event = None
+        self.last_decision_at = None
+        self.last_loop_at = None
+        self.loop_result = 0
+        self.status_update_counts = Counter()
+
+    def record(self, event, source="structured", **fields):
+        now = datetime.now(timezone.utc)
+        safe_fields = json_safe(fields)
+        action = str(safe_fields.get("action") or "")
+        with self.lock:
+            if event == "qbt_guard_loop":
+                self.last_loop_at = now
+                self.loop_result = int(safe_fields.get("result") or 0)
+            if event == "qbt_guard_decision" or event == "qbt_guard_loop":
+                self.last_event = {
+                    "event": event,
+                    "source": source,
+                    "timestamp": format_utc(now),
+                    **safe_fields,
+                }
+                if event == "qbt_guard_decision":
+                    self.last_decision_at = now
+                    self.status_update_counts[(action, source)] += 1
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "started_at": format_utc(self.started_at),
+                "last_event": dict(self.last_event or {}),
+                "last_decision_at": format_utc(self.last_decision_at) if self.last_decision_at else "",
+                "last_loop_at": format_utc(self.last_loop_at) if self.last_loop_at else "",
+                "loop_result": self.loop_result,
+                "status_update_counts": [
+                    {"action": action, "source": source, "count": count}
+                    for (action, source), count in sorted(self.status_update_counts.items())
+                ],
+            }
+
+    def prometheus_metrics(self):
+        snapshot = self.snapshot()
+        last_event = snapshot.get("last_event") or {}
+        lines = [
+            "# HELP qbt_guard_status_up qBittorrent smart queues status endpoint health.",
+            "# TYPE qbt_guard_status_up gauge",
+            "qbt_guard_status_up 1",
+            "# HELP qbt_guard_start_timestamp_seconds Unix timestamp when the controller process started.",
+            "# TYPE qbt_guard_start_timestamp_seconds gauge",
+            f"qbt_guard_start_timestamp_seconds {self.started_at.timestamp():.0f}",
+            "# HELP qbt_guard_loop_result Last guard loop result code.",
+            "# TYPE qbt_guard_loop_result gauge",
+            f"qbt_guard_loop_result {snapshot.get('loop_result', 0)}",
+            "# HELP qbt_guard_decision_status_updates_total Decision status updates observed by the endpoint.",
+            "# TYPE qbt_guard_decision_status_updates_total counter",
+        ]
+        for item in snapshot.get("status_update_counts") or []:
+            lines.append(prometheus_metric_line(
+                "qbt_guard_decision_status_updates_total",
+                {"action": item["action"], "source": item["source"]},
+                item["count"],
+            ))
+
+        if self.last_decision_at:
+            lines.extend([
+                "# HELP qbt_guard_last_decision_timestamp_seconds Unix timestamp of the latest queue decision.",
+                "# TYPE qbt_guard_last_decision_timestamp_seconds gauge",
+                f"qbt_guard_last_decision_timestamp_seconds {self.last_decision_at.timestamp():.0f}",
+            ])
+
+        action = str(last_event.get("action") or "")
+        reason = str(last_event.get("reason") or "")
+        selected = last_event.get("selected_torrent")
+        if not isinstance(selected, dict):
+            selected = {}
+            if last_event.get("selected"):
+                selected["name"] = str(last_event.get("selected"))
+        selected_name = selected.get("name") or ""
+        selected_hash = selected.get("hash") or ""
+        if action or selected_name or reason:
+            lines.extend([
+                "# HELP qbt_guard_last_decision_info Last queue decision labels.",
+                "# TYPE qbt_guard_last_decision_info gauge",
+                prometheus_metric_line(
+                    "qbt_guard_last_decision_info",
+                    {
+                        "action": action,
+                        "reason": reason,
+                        "selected_hash": selected_hash,
+                        "selected_name": selected_name,
+                    },
+                    1,
+                ),
+            ])
+
+        candidate_counts = last_event.get("candidate_counts")
+        if isinstance(candidate_counts, dict):
+            lines.extend([
+                "# HELP qbt_guard_candidate_count Last decision candidate counts by type.",
+                "# TYPE qbt_guard_candidate_count gauge",
+            ])
+            for key, value in sorted(candidate_counts.items()):
+                if isinstance(value, (int, float)):
+                    lines.append(prometheus_metric_line(
+                        "qbt_guard_candidate_count",
+                        {"type": key},
+                        numeric_metric_value(value),
+                    ))
+
+        rejected_counts = last_event.get("rejected_counts")
+        if isinstance(rejected_counts, dict):
+            lines.extend([
+                "# HELP qbt_guard_rejected_count Last decision rejected counts by reason.",
+                "# TYPE qbt_guard_rejected_count gauge",
+            ])
+            for key, value in sorted(rejected_counts.items()):
+                if isinstance(value, (int, float)):
+                    lines.append(prometheus_metric_line(
+                        "qbt_guard_rejected_count",
+                        {"reason": key},
+                        numeric_metric_value(value),
+                    ))
+
+        return "\n".join(lines) + "\n"
+
+
+QUEUE_STATUS = QueueStatusStore()
 
 
 class ApiError(RuntimeError):
@@ -373,6 +530,7 @@ def decision_log_message(event, fields):
 
 
 def emit_decision_log(event, **fields):
+    QUEUE_STATUS.record(event, source="structured", **fields)
     if not decision_logs_enabled():
         return
     emit_log(
@@ -422,6 +580,88 @@ def log_decision_info(
         text_omit_fields=text_omit_fields,
         **fields,
     )
+    QUEUE_STATUS.record(
+        "qbt_guard_decision",
+        source="summary",
+        action=action,
+        message=message,
+        **fields,
+    )
+
+
+class QueueStatusHttpHandler(BaseHTTPRequestHandler):
+    server_version = "QbtSmartQueuesStatus/1.0"
+
+    def log_message(self, format_text, *args):
+        log_debug(
+            "Status endpoint request",
+            client=self.address_string(),
+            request=format_text % args,
+        )
+
+    def send_bytes(self, status_code, body, content_type):
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):
+        request_path = urllib.parse.urlparse(self.path).path
+        if request_path == "/healthz":
+            self.send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
+            return
+        if request_path == "/metrics":
+            body = QUEUE_STATUS.prometheus_metrics().encode("utf-8")
+            self.send_bytes(200, body, "text/plain; version=0.0.4; charset=utf-8")
+            return
+        if request_path == "/status":
+            body = json.dumps(
+                json_safe(QUEUE_STATUS.snapshot()),
+                sort_keys=True,
+                indent=2,
+            ).encode("utf-8")
+            self.send_bytes(200, body + b"\n", "application/json; charset=utf-8")
+            return
+        self.send_bytes(404, b"not found\n", "text/plain; charset=utf-8")
+
+    def do_HEAD(self):
+        self.do_GET()
+
+
+def start_status_http_server():
+    global _STATUS_HTTP_SERVER, _STATUS_HTTP_THREAD
+    if not env_bool("QBT_STATUS_HTTP_ENABLED", False):
+        return None
+    if _STATUS_HTTP_SERVER is not None:
+        return _STATUS_HTTP_SERVER
+
+    host = os.environ.get("QBT_STATUS_HTTP_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    port = env_int("QBT_STATUS_HTTP_PORT", 8081)
+    server = ThreadingHTTPServer((host, port), QueueStatusHttpHandler)
+    thread = threading.Thread(target=server.serve_forever, name="qbt-status-http", daemon=True)
+    thread.start()
+    _STATUS_HTTP_SERVER = server
+    _STATUS_HTTP_THREAD = thread
+    log_info("Started qBittorrent smart queues status endpoint", host=host, port=port)
+    return server
+
+
+def stop_status_http_server():
+    global _STATUS_HTTP_SERVER, _STATUS_HTTP_THREAD
+    server = _STATUS_HTTP_SERVER
+    thread = _STATUS_HTTP_THREAD
+    _STATUS_HTTP_SERVER = None
+    _STATUS_HTTP_THREAD = None
+    if server is None:
+        return
+    server.shutdown()
+    server.server_close()
+    if thread is not None:
+        thread.join(timeout=5)
+    log_info("Stopped qBittorrent smart queues status endpoint")
 
 
 def parse_udm_row_time(value):
@@ -6720,6 +6960,10 @@ def run_loop():
         f"poll={poll_seconds}s, error_poll={error_poll_seconds}s"
     )
     log_info("Configured qBittorrent service endpoint(s)", qbt_urls=qbt_urls())
+    try:
+        start_status_http_server()
+    except OSError as exc:
+        log_warning(f"Failed to start qBittorrent smart queues status endpoint: {exc}")
 
     while not stop_event.is_set():
         started = time.monotonic()
@@ -6731,6 +6975,7 @@ def run_loop():
             log_error(f"Unhandled qBittorrent guard loop error: {exc}")
 
         if result and env_bool("QBT_GUARD_LOOP_EXIT_ON_ERROR", False):
+            stop_status_http_server()
             return result
         if stop_event.is_set():
             break
@@ -6757,6 +7002,7 @@ def run_loop():
         result = stop_all_downloads_for_shutdown()
 
     log_info("Continuous qBittorrent guard loop stopped")
+    stop_status_http_server()
     return result
 
 

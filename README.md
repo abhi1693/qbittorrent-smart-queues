@@ -126,6 +126,9 @@ Optional single-download selection tuning:
 | `QBT_TRACKER_HEALTH_MAX_CANDIDATES_PER_PASS` | `50` | Maximum `/torrents/trackers` reads per controller pass. |
 | `QBT_TRACKER_HEALTH_MIN_REFRESH_SECONDS` | `300` | Minimum age before refreshing a torrent's tracker health again. |
 | `QBT_TRACKER_HEALTH_SCORE_MAX_AGE_SECONDS` | `21600` | Maximum tracker-health observation age used for scoring; `0` means no age limit. |
+| `QBT_STATUS_HTTP_ENABLED` | `false` | Enable the in-process queue status endpoint. |
+| `QBT_STATUS_HTTP_HOST` | `0.0.0.0` | Bind address for the status endpoint. |
+| `QBT_STATUS_HTTP_PORT` | `8081` | Bind port for `/healthz`, `/status`, and `/metrics`. |
 
 Cooldown tags are reasoned as
 `<prefix>-<reason>-<timestamp>`, for example
@@ -191,6 +194,12 @@ critical decision summaries for unchanged actions are emitted every
 `0` to emit every loop. Full decision payloads are emitted at `DEBUG` by
 default; set `QBT_DECISION_LOG_LEVEL=info` while tuning, or
 `QBT_DECISION_LOGS_ENABLED=false` to disable them.
+
+When `QBT_STATUS_HTTP_ENABLED=true`, the controller exposes:
+
+- `/healthz`: plain `ok` health response.
+- `/status`: JSON snapshot of the latest queue decision, loop result, selected torrent, rejection counts, and candidate counts.
+- `/metrics`: Prometheus text metrics for the latest decision, including `qbt_guard_last_decision_info`, `qbt_guard_candidate_count`, and `qbt_guard_rejected_count`.
 
 Single-download mode keeps an active torrent only when selected bytes or
 downloaded bytes move by at least `QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES`
