@@ -1,6 +1,8 @@
 import importlib
+import os
+import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 
@@ -114,6 +116,89 @@ class CooldownParsingTests(unittest.TestCase):
                 "availability": 0,
             }),
         )
+
+    def test_no_progress_backoff_extends_cooldown_and_decays_on_progress(self):
+        now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        torrent = {
+            "hash": "abc123",
+            "name": "Backoff.Show.S01E01",
+            "category": "tv",
+            "state": "stalledDL",
+            "amount_left": 1000,
+            "downloaded": 0,
+            "progress": 0.5,
+            "tags": "quota-stalled-no-progress-20260601T103000Z",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {
+                "QBT_TORRENT_HEALTH_STATE_PATH": os.path.join(tmpdir, "health.json"),
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_STALL_BACKOFF_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_STALL_BACKOFF_MULTIPLIER": "2",
+                "QBT_SINGLE_DOWNLOAD_STALL_BACKOFF_MAX_SECONDS": "86400",
+                "QBT_SINGLE_DOWNLOAD_STALL_BACKOFF_DECAY_STEPS": "1",
+            },
+            clear=False,
+        ):
+            store = self.guard.TorrentHealthStore()
+
+            store.record_failure(torrent, now, "did not make progress", cooldown_reason="no-progress")
+            self.assertEqual(1, store.no_progress_backoff_level(torrent))
+            self.assertEqual(3600, store.cooldown_seconds_for_torrent(torrent, 3600, "no-progress"))
+
+            store.record_failure(
+                torrent,
+                now + timedelta(minutes=5),
+                "did not make progress",
+                cooldown_reason="no-progress",
+            )
+            self.assertEqual(2, store.no_progress_backoff_level(torrent))
+            self.assertEqual(7200, store.cooldown_seconds_for_torrent(torrent, 3600, "no-progress"))
+            self.assertIn("backoff level 2", store.summary(torrent, now))
+
+            active, expired = self.guard.stall_cooldown_tags(
+                torrent,
+                "quota-stalled",
+                now,
+                3600,
+                health_store=store,
+            )
+            self.assertEqual(["quota-stalled-no-progress-20260601T103000Z"], active)
+            self.assertEqual([], expired)
+
+            after = dict(torrent)
+            after["amount_left"] = 0
+            after["downloaded"] = 1000
+            after["progress"] = 1.0
+            store.record_productive(torrent, after, now + timedelta(minutes=10), sample_seconds=60)
+            self.assertEqual(1, store.no_progress_backoff_level(torrent))
+            self.assertEqual(3600, store.cooldown_seconds_for_torrent(torrent, 3600, "no-progress"))
+
+    def test_no_progress_backoff_is_capped(self):
+        now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        torrent = {"hash": "abc123", "name": "Backoff.Show.S01E02", "amount_left": 1000}
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {
+                "QBT_TORRENT_HEALTH_STATE_PATH": os.path.join(tmpdir, "health.json"),
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_STALL_BACKOFF_MULTIPLIER": "3",
+                "QBT_SINGLE_DOWNLOAD_STALL_BACKOFF_MAX_SECONDS": "10000",
+            },
+            clear=False,
+        ):
+            store = self.guard.TorrentHealthStore()
+            for offset in range(5):
+                store.record_failure(
+                    torrent,
+                    now + timedelta(minutes=offset),
+                    "did not make progress",
+                    cooldown_reason="no-progress",
+                )
+
+            self.assertEqual(5, store.no_progress_backoff_level(torrent))
+            self.assertEqual(10000, store.cooldown_seconds_for_torrent(torrent, 3600, "no-progress"))
 
 
 if __name__ == "__main__":
