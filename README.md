@@ -71,6 +71,10 @@ unavailable and `UDM_FAIL_CLOSED=false`, the controller uses
 | `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
 | `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
 | `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
+| `QBT_QUOTA_BURST_ENABLED` | `false` | Allow faster downloads above the smoothed quota-safe rate while daily and monthly reserves remain. |
+| `QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | Burst cap; set this no higher than the usable ISP download speed. |
+| `QBT_QUOTA_BURST_MIN_MONTHLY_REMAINING_FRACTION` | `0.10` | Minimum monthly guardrail reserve required before burst mode is allowed. |
+| `QBT_QUOTA_BURST_MIN_DAILY_REMAINING_FRACTION` | `0.20` | Minimum daily guardrail reserve required before burst mode is allowed. |
 
 Optional media integrations only load when both URL(s) and an API key are set:
 

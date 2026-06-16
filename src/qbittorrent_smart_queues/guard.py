@@ -2463,6 +2463,10 @@ def quota_rate_state(
     daily_cap_bytes,
     headroom,
     max_download_limit,
+    burst_enabled=False,
+    burst_download_limit=0,
+    burst_min_monthly_remaining_fraction=0.0,
+    burst_min_daily_remaining_fraction=0.0,
 ):
     if usage_bytes >= cap_bytes:
         return {"stop_reason": "monthly UDM quota guardrail reached"}
@@ -2482,6 +2486,24 @@ def quota_rate_state(
     if max_download_limit > 0:
         aggregate_limit = min(aggregate_limit, max_download_limit)
 
+    burst_limit = 0
+    burst_active = False
+    if burst_enabled:
+        monthly_reserve_bytes = math.floor(
+            max(0, cap_bytes) * max(0.0, burst_min_monthly_remaining_fraction)
+        )
+        daily_reserve_bytes = math.floor(
+            max(0, daily_cap_bytes) * max(0.0, burst_min_daily_remaining_fraction)
+        )
+        if monthly_remaining_bytes > monthly_reserve_bytes and daily_remaining_bytes > daily_reserve_bytes:
+            burst_limit = burst_download_limit if burst_download_limit > 0 else max_download_limit
+            if max_download_limit > 0:
+                burst_limit = min(burst_limit, max_download_limit)
+            burst_limit = max(0, burst_limit)
+            if burst_limit > aggregate_limit:
+                aggregate_limit = burst_limit
+                burst_active = True
+
     return {
         "stop_reason": "",
         "monthly_remaining_bytes": monthly_remaining_bytes,
@@ -2492,6 +2514,8 @@ def quota_rate_state(
         "daily_limit": daily_limit,
         "aggregate_limit": aggregate_limit,
         "smart_download_limit": max(1, aggregate_limit),
+        "burst_active": burst_active,
+        "burst_limit": burst_limit,
     }
 
 
@@ -6280,6 +6304,16 @@ def run_once():
         "QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC",
         max_download_limit,
     )
+    quota_burst_enabled = env_bool("QBT_QUOTA_BURST_ENABLED", False)
+    quota_burst_download_limit = env_int("QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC", max_download_limit)
+    quota_burst_min_monthly_remaining_fraction = env_float(
+        "QBT_QUOTA_BURST_MIN_MONTHLY_REMAINING_FRACTION",
+        0.10,
+    )
+    quota_burst_min_daily_remaining_fraction = env_float(
+        "QBT_QUOTA_BURST_MIN_DAILY_REMAINING_FRACTION",
+        0.20,
+    )
 
     rpi_cooling_state = apply_rpi_thermal_cooling()
     storage_guard = DownloadStorageGuard()
@@ -6384,12 +6418,20 @@ def run_once():
         daily_cap_bytes,
         headroom,
         max_download_limit,
+        quota_burst_enabled,
+        quota_burst_download_limit,
+        quota_burst_min_monthly_remaining_fraction,
+        quota_burst_min_daily_remaining_fraction,
     )
     base_decision_context["budget"].update({
         "monthly_limit_bytes_per_sec": quota_state.get("monthly_limit"),
         "daily_limit_bytes_per_sec": quota_state.get("daily_limit"),
         "smart_download_limit_bytes_per_sec": quota_state.get("smart_download_limit"),
         "max_download_limit_bytes_per_sec": max_download_limit,
+        "quota_burst_active": quota_state.get("burst_active", False),
+        "quota_burst_limit_bytes_per_sec": quota_state.get("burst_limit", 0),
+        "quota_burst_min_monthly_remaining_fraction": quota_burst_min_monthly_remaining_fraction,
+        "quota_burst_min_daily_remaining_fraction": quota_burst_min_daily_remaining_fraction,
     })
     if quota_state["stop_reason"]:
         apply_stop_limits(

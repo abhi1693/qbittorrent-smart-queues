@@ -42,6 +42,47 @@ class QuotaMathTests(unittest.TestCase):
         self.assertEqual(10, state["aggregate_limit"])
         self.assertEqual(10, state["smart_download_limit"])
 
+    def test_rate_state_can_burst_above_smoothed_quota_rate(self):
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+
+        state = self.guard.quota_rate_state(
+            now,
+            usage_bytes=100,
+            day_usage_bytes=10,
+            cap_bytes=1000,
+            daily_cap_bytes=100,
+            headroom=0.5,
+            max_download_limit=500,
+            burst_enabled=True,
+            burst_download_limit=250,
+            burst_min_monthly_remaining_fraction=0.10,
+            burst_min_daily_remaining_fraction=0.20,
+        )
+
+        self.assertTrue(state["burst_active"])
+        self.assertEqual(250, state["aggregate_limit"])
+        self.assertEqual(250, state["smart_download_limit"])
+
+    def test_rate_state_does_not_burst_when_daily_reserve_is_low(self):
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+
+        state = self.guard.quota_rate_state(
+            now,
+            usage_bytes=100,
+            day_usage_bytes=85,
+            cap_bytes=1000,
+            daily_cap_bytes=100,
+            headroom=0.5,
+            max_download_limit=500,
+            burst_enabled=True,
+            burst_download_limit=250,
+            burst_min_monthly_remaining_fraction=0.10,
+            burst_min_daily_remaining_fraction=0.20,
+        )
+
+        self.assertFalse(state["burst_active"])
+        self.assertLess(state["smart_download_limit"], 250)
+
     def test_rate_state_reports_monthly_guardrail_before_daily_guardrail(self):
         now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
 
