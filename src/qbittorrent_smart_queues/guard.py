@@ -6293,6 +6293,7 @@ def apply_single_download(
         env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED", 10),
     )
     normal_max_active_downloads = max(1, env_int("QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS", 1))
+    uncapped_window_active = bool(budget.get("uncapped_download_window_active"))
     uncapped_window_max_active_downloads = max(
         normal_max_active_downloads,
         env_int(
@@ -6302,9 +6303,16 @@ def apply_single_download(
     )
     normal_worker_limit = (
         uncapped_window_max_active_downloads
-        if budget.get("uncapped_download_window_active")
+        if uncapped_window_active
         else normal_max_active_downloads
     )
+
+    def normal_desired_queue_limit(worker_count, parked_count=0):
+        desired = max(1, int(worker_count) + int(parked_count))
+        if uncapped_window_active:
+            return min(uncapped_window_max_active_downloads, desired)
+        return desired
+
     park_stalled_downloads_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED", True)
     park_stalled_samples = max(
         1,
@@ -6476,7 +6484,7 @@ def apply_single_download(
             if storage_constrained_mode:
                 desired_queue_limit = None
             else:
-                desired_queue_limit = normal_worker_limit
+                desired_queue_limit = normal_desired_queue_limit(normal_worker_limit)
             if desired_queue_limit is not None and active_queue_limit != desired_queue_limit:
                 try:
                     client.set_active_queue_limits(desired_queue_limit)
@@ -6746,7 +6754,7 @@ def apply_single_download(
                     torrent_hash(torrent) for torrent in normal_parked_stalled_torrents
                     if torrent_hash(torrent)
                 ]
-                desired_queue_limit = max(1, len(parked_hashes))
+                desired_queue_limit = normal_desired_queue_limit(0, len(parked_hashes))
                 if active_queue_limit != desired_queue_limit:
                     try:
                         client.set_active_queue_limits(desired_queue_limit)
@@ -6786,9 +6794,9 @@ def apply_single_download(
                 and normal_parked_stalled_torrents
                 and selection_candidates
             ):
-                desired_queue_limit = max(
+                desired_queue_limit = normal_desired_queue_limit(
                     normal_worker_limit,
-                    normal_worker_limit + len(normal_parked_stalled_hashes),
+                    len(normal_parked_stalled_hashes),
                 )
                 if active_queue_limit != desired_queue_limit:
                     try:
@@ -7306,9 +7314,9 @@ def apply_single_download(
                         normal_parked_stalled_hashes.add(item_hash)
                         normal_parked_stalled_torrents.append(torrent)
                         health_store.record_storage_recovery_no_progress(torrent, now)
-                desired_queue_limit = max(
-                    1,
-                    normal_worker_limit + len(normal_parked_stalled_hashes),
+                desired_queue_limit = normal_desired_queue_limit(
+                    normal_worker_limit,
+                    len(normal_parked_stalled_hashes),
                 )
                 if active_queue_limit != desired_queue_limit:
                     try:

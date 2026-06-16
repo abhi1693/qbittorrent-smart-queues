@@ -398,6 +398,61 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
 
         self.assertIn((5, None), client.queue_limits)
 
+    def test_uncapped_window_caps_queue_limit_with_parked_stalled_torrent(self):
+        client = FakeQbtClient([
+            {
+                "hash": "stalled",
+                "name": "Stalled.S01E01",
+                "category": "tv",
+                "state": "stalledDL",
+                "dlspeed": 0,
+                "amount_left": 1000,
+                "downloaded": 100,
+                "progress": 0.5,
+                "tags": "",
+            },
+            {
+                "hash": "next",
+                "name": "Next.S01E02",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 2000,
+                "downloaded": 0,
+                "progress": 0.25,
+                "tags": "",
+            },
+        ])
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS": "1",
+            "QBT_UNCAPPED_DOWNLOAD_WINDOW_MAX_ACTIVE_DOWNLOADS": "5",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            self.guard.apply_single_download(
+                [client],
+                usage_bytes=0,
+                monthly_limit_bytes=1000,
+                download_limit=0,
+                limit_reason="unit test uncapped",
+                storage_guard=FakeStorageGuard(),
+                decision_context={
+                    "budget": {
+                        "uncapped_download_window_active": True,
+                    },
+                },
+            )
+
+        self.assertIn(["next"], client.started)
+        self.assertFalse(any("stalled" in hashes for hashes in client.stopped))
+        self.assertIn((5, None), client.queue_limits)
+        self.assertNotIn((6, None), client.queue_limits)
+
     def test_apply_single_download_keeps_low_speed_torrent_with_real_progress(self):
         class ProgressingFakeQbtClient(FakeQbtClient):
             def start_hashes(self, hashes):
