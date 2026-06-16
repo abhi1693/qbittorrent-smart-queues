@@ -78,6 +78,10 @@ after router/VPN/protocol overhead.
 | `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
 | `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
 | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `10485760` | Hard ISP usable download cap in bytes/s. This caps smoothed quota rates, burst mode, and single-download mode. Example: `10485760` = `10 MiB/s`. Replaces `QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC` and `QBT_SINGLE_DOWNLOAD_DOWNLOAD_LIMIT_BYTES_PER_SEC`, which remain accepted as fallback aliases. |
+| `QBT_UNCAPPED_DOWNLOAD_WINDOW_ENABLED` | `false` | Set qBittorrent's download limit to `0` during the configured local-time window, which qBittorrent treats as unlimited. Monthly/daily quota stop guardrails, thermal checks, storage checks, and queue selection still apply. |
+| `QBT_UNCAPPED_DOWNLOAD_WINDOW_TIMEZONE` | `Asia/Kolkata` | IANA timezone used for the uncapped window. |
+| `QBT_UNCAPPED_DOWNLOAD_WINDOW_START_LOCAL` | `22:00` | Local start time for uncapped downloads, inclusive. Example: `22:00` = 10 PM. |
+| `QBT_UNCAPPED_DOWNLOAD_WINDOW_END_LOCAL` | `05:00` | Local end time for uncapped downloads, exclusive. Windows that cross midnight are supported. Example: `05:00` = 5 AM. |
 | `QBT_QUOTA_BURST_ENABLED` | `false` | Allow faster downloads above the smoothed quota-safe rate while daily and monthly reserves remain. |
 | `QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | Burst-mode ISP usable cap in bytes/s. Example: `10485760` = `10 MiB/s`. Replaces `QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC`, which remains accepted as a fallback alias. |
 | `QBT_QUOTA_BURST_MIN_MONTHLY_REMAINING_FRACTION` | `0.10` | Minimum monthly guardrail reserve required before burst mode is allowed. |

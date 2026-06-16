@@ -13,9 +13,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookiejar import CookieJar
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 QBT_DEFAULT_URLS = []
@@ -400,6 +401,58 @@ def utc_day_start(now):
 
 def utc_day_end(now):
     return utc_day_start(now) + timedelta(days=1) - timedelta(seconds=1)
+
+
+def parse_local_clock_time(value, default):
+    text = str(value or "").strip()
+    if not text:
+        text = str(default)
+    try:
+        parsed = datetime_time.fromisoformat(text)
+    except ValueError:
+        parsed = datetime_time.fromisoformat(str(default))
+    return parsed.replace(tzinfo=None)
+
+
+def clock_time_in_window(current, start, end):
+    if start == end:
+        return True
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def uncapped_download_window_state(now):
+    enabled = env_bool("QBT_UNCAPPED_DOWNLOAD_WINDOW_ENABLED", False)
+    timezone_name = os.environ.get(
+        "QBT_UNCAPPED_DOWNLOAD_WINDOW_TIMEZONE",
+        "Asia/Kolkata",
+    ).strip() or "Asia/Kolkata"
+    start = parse_local_clock_time(
+        os.environ.get("QBT_UNCAPPED_DOWNLOAD_WINDOW_START_LOCAL"),
+        "22:00",
+    )
+    end = parse_local_clock_time(
+        os.environ.get("QBT_UNCAPPED_DOWNLOAD_WINDOW_END_LOCAL"),
+        "05:00",
+    )
+    reason = ""
+    try:
+        local_tz = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        local_tz = timezone.utc
+        reason = f"unknown timezone {timezone_name}; using UTC"
+    local_now = now.astimezone(local_tz)
+    active = enabled and clock_time_in_window(local_now.time().replace(tzinfo=None), start, end)
+    return {
+        "enabled": enabled,
+        "active": active,
+        "timezone": timezone_name,
+        "start_local": start.strftime("%H:%M:%S"),
+        "end_local": end.strftime("%H:%M:%S"),
+        "current_local": local_now.isoformat(),
+        "reason": reason,
+    }
 
 
 def format_utc(value):
@@ -2755,6 +2808,7 @@ def quota_rate_state(
     burst_download_limit=0,
     burst_min_monthly_remaining_fraction=0.0,
     burst_min_daily_remaining_fraction=0.0,
+    uncapped_downloads_active=False,
 ):
     if usage_bytes >= cap_bytes:
         return {"stop_reason": "monthly UDM quota guardrail reached"}
@@ -2801,9 +2855,10 @@ def quota_rate_state(
         "monthly_limit": monthly_limit,
         "daily_limit": daily_limit,
         "aggregate_limit": aggregate_limit,
-        "smart_download_limit": max(1, aggregate_limit),
+        "smart_download_limit": 0 if uncapped_downloads_active else max(1, aggregate_limit),
         "burst_active": burst_active,
         "burst_limit": burst_limit,
+        "uncapped_downloads_active": bool(uncapped_downloads_active),
     }
 
 
@@ -7186,6 +7241,7 @@ def run_once():
         "QBT_QUOTA_BURST_MIN_DAILY_REMAINING_FRACTION",
         0.20,
     )
+    uncapped_window = uncapped_download_window_state(now)
 
     rpi_cooling_state = apply_rpi_thermal_cooling()
     storage_guard = DownloadStorageGuard()
@@ -7206,6 +7262,8 @@ def run_once():
                 "monthly_guardrail_bytes": monthly_quota,
                 "monthly_remaining_bytes": monthly_quota,
                 "quota_source": "fallback",
+                "uncapped_download_window": uncapped_window,
+                "uncapped_download_window_active": uncapped_window["active"],
             },
             "udm": udm_decision_summary(None, now, error=exc),
             "thermal": thermal_decision_summary(thermal_state),
@@ -7215,12 +7273,18 @@ def run_once():
             return 0
         if apply_full_guard_thermal_stop(clients, thermal_state, fallback_context):
             return 0
+        fallback_active_limit = 0 if uncapped_window["active"] else fallback_download_limit
+        fallback_reason = (
+            "UDM quota data unavailable fallback; uncapped download window active"
+            if uncapped_window["active"]
+            else "UDM quota data unavailable fallback"
+        )
         apply_single_download(
             clients,
             0,
             monthly_quota,
-            fallback_download_limit,
-            "UDM quota data unavailable fallback",
+            fallback_active_limit,
+            fallback_reason,
             storage_guard,
             decision_context=fallback_context,
         )
@@ -7253,6 +7317,8 @@ def run_once():
                 "day_usage_bytes": day_usage_bytes,
                 "daily_guardrail_bytes": daily_cap_bytes,
                 "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
+                "uncapped_download_window": uncapped_window,
+                "uncapped_download_window_active": uncapped_window["active"],
             },
             udm=udm_decision_summary(udm_client, now),
         )
@@ -7270,6 +7336,8 @@ def run_once():
             "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
             "days_in_month": days_in_month,
             "rate_headroom_fraction": headroom,
+            "uncapped_download_window": uncapped_window,
+            "uncapped_download_window_active": uncapped_window["active"],
         },
         "udm": udm_decision_summary(udm_client, now),
         "thermal": thermal_decision_summary(thermal_state),
@@ -7294,6 +7362,7 @@ def run_once():
         quota_burst_download_limit,
         quota_burst_min_monthly_remaining_fraction,
         quota_burst_min_daily_remaining_fraction,
+        uncapped_window["active"],
     )
     base_decision_context["budget"].update({
         "monthly_limit_bytes_per_sec": quota_state.get("monthly_limit"),
@@ -7307,6 +7376,7 @@ def run_once():
         "configured_isp_usable_burst_download_limit_bytes_per_sec": quota_burst_download_limit,
         "quota_burst_min_monthly_remaining_fraction": quota_burst_min_monthly_remaining_fraction,
         "quota_burst_min_daily_remaining_fraction": quota_burst_min_daily_remaining_fraction,
+        "uncapped_download_window_active": quota_state.get("uncapped_downloads_active", False),
     })
     if quota_state["stop_reason"]:
         apply_stop_limits(
@@ -7325,7 +7395,11 @@ def run_once():
         usage_bytes,
         cap_bytes,
         smart_download_limit,
-        "monthly and daily quota guard",
+        (
+            "monthly and daily quota guard; uncapped download window active"
+            if uncapped_window["active"]
+            else "monthly and daily quota guard"
+        ),
         storage_guard,
         decision_context=base_decision_context,
     )

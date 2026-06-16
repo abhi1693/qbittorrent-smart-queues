@@ -85,6 +85,43 @@ class QuotaMathTests(unittest.TestCase):
         self.assertFalse(state["burst_active"])
         self.assertLess(state["smart_download_limit"], 250)
 
+    def test_rate_state_uses_unlimited_download_limit_during_uncapped_window(self):
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+
+        state = self.guard.quota_rate_state(
+            now,
+            usage_bytes=100,
+            day_usage_bytes=10,
+            cap_bytes=1000,
+            daily_cap_bytes=100,
+            headroom=0.5,
+            max_download_limit=500,
+            uncapped_downloads_active=True,
+        )
+
+        self.assertEqual("", state["stop_reason"])
+        self.assertEqual(0, state["smart_download_limit"])
+        self.assertTrue(state["uncapped_downloads_active"])
+
+    def test_uncapped_window_is_active_across_midnight_in_ist(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "QBT_UNCAPPED_DOWNLOAD_WINDOW_ENABLED": "true",
+                "QBT_UNCAPPED_DOWNLOAD_WINDOW_TIMEZONE": "Asia/Kolkata",
+                "QBT_UNCAPPED_DOWNLOAD_WINDOW_START_LOCAL": "22:00",
+                "QBT_UNCAPPED_DOWNLOAD_WINDOW_END_LOCAL": "05:00",
+            },
+            clear=False,
+        ):
+            evening = datetime(2026, 6, 16, 17, 0, tzinfo=timezone.utc)
+            early_morning = datetime(2026, 6, 16, 23, 0, tzinfo=timezone.utc)
+            daytime = datetime(2026, 6, 16, 8, 0, tzinfo=timezone.utc)
+
+            self.assertTrue(self.guard.uncapped_download_window_state(evening)["active"])
+            self.assertTrue(self.guard.uncapped_download_window_state(early_morning)["active"])
+            self.assertFalse(self.guard.uncapped_download_window_state(daytime)["active"])
+
     def test_isp_usable_cap_aliases_prefer_clear_names(self):
         with mock.patch.dict(
             os.environ,
