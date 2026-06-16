@@ -4087,6 +4087,8 @@ class TorrentHealthStore:
         entry["successful_attempts"] = int(entry.get("successful_attempts") or 0) + 1
         entry["consecutive_failures"] = 0
         entry["last_failure_reason"] = ""
+        entry["storage_recovery_no_progress_samples"] = 0
+        entry["storage_recovery_last_no_progress_at"] = ""
         entry["last_amount_left_bytes"] = torrent_amount_left(after)
         entry["last_speed_bytes_per_sec"] = torrent_download_speed(after)
         entry["last_connected_seeds"] = torrent_connected_seeds(after)
@@ -4118,6 +4120,35 @@ class TorrentHealthStore:
         entry["predicted_completion_seconds"] = self.predicted_completion_seconds(torrent, entry)
         self.dirty = True
         self.save()
+
+    def record_storage_recovery_no_progress(self, torrent, now):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return
+
+        entry["name"] = torrent_name(torrent)
+        entry["category"] = torrent_category(torrent)
+        entry["storage_recovery_no_progress_samples"] = (
+            int(entry.get("storage_recovery_no_progress_samples") or 0) + 1
+        )
+        entry["storage_recovery_last_no_progress_at"] = format_utc(now)
+        entry["last_amount_left_bytes"] = torrent_amount_left(torrent)
+        entry["last_speed_bytes_per_sec"] = torrent_download_speed(torrent)
+        entry["last_connected_seeds"] = torrent_connected_seeds(torrent)
+        entry["last_reported_seeds"] = torrent_reported_seeds(torrent)
+        entry["last_availability"] = torrent_availability(torrent)
+        entry["predicted_completion_seconds"] = self.predicted_completion_seconds(torrent, entry)
+        self.dirty = True
+        self.save()
+
+    def storage_recovery_no_progress_samples(self, torrent):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return 0
+        try:
+            return max(0, int(entry.get("storage_recovery_no_progress_samples") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def score(self, torrent, now):
         if not self.enabled:
@@ -4322,14 +4353,34 @@ def storage_verified_remaining_bytes(client, torrent, storage_guard, storage_sta
     return max(0, remaining_bytes)
 
 
-def storage_recovery_batch(client, candidates, storage_guard, storage_state, max_active):
+def storage_recovery_sort_remaining_bytes(client, torrent, storage_guard, storage_state):
+    remaining_bytes = storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state)
+    if remaining_bytes is None:
+        return sys.maxsize
+    return int(remaining_bytes)
+
+
+def storage_recovery_batch(
+    client,
+    candidates,
+    storage_guard,
+    storage_state,
+    max_active,
+    initial_remaining_bytes=0,
+    excluded_hashes=None,
+):
     max_active = max(1, int(max_active))
     fit_bytes = storage_fit_headroom_bytes(storage_guard, storage_state)
+    excluded_hashes = set(excluded_hashes or [])
     selected = []
-    selected_remaining_bytes = 0
+    selected_remaining_bytes = max(0, int(initial_remaining_bytes or 0))
     deferred_count = 0
 
     for torrent in candidates:
+        item_hash = torrent_hash(torrent)
+        if item_hash and item_hash in excluded_hashes:
+            deferred_count += 1
+            continue
         remaining_bytes = storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state)
         if remaining_bytes is None:
             deferred_count += 1
@@ -4580,6 +4631,14 @@ def apply_single_download(
         5,
         max(1, env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_ACTIVE", 5)),
     )
+    storage_recovery_stall_samples = max(
+        1,
+        env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_STALL_SAMPLES", 2),
+    )
+    storage_recovery_max_parked_stalled = max(
+        0,
+        env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED", 10),
+    )
     normal_max_active_downloads = max(1, env_int("QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS", 1))
     slow_min_rate_fraction = env_float("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_FRACTION", 0.10)
     slow_min_rate_bytes = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC", 65_536)
@@ -4723,10 +4782,11 @@ def apply_single_download(
             else:
                 storage_state = None
             storage_constrained_mode = storage_state_is_reserve_constrained(storage_guard, storage_state)
-            desired_queue_limit = (
-                storage_recovery_max_active if storage_constrained_mode else normal_max_active_downloads
-            )
-            if active_queue_limit != desired_queue_limit:
+            if storage_constrained_mode:
+                desired_queue_limit = None
+            else:
+                desired_queue_limit = normal_max_active_downloads
+            if desired_queue_limit is not None and active_queue_limit != desired_queue_limit:
                 try:
                     client.set_active_queue_limits(desired_queue_limit)
                     active_queue_limit = desired_queue_limit
@@ -4803,7 +4863,7 @@ def apply_single_download(
             if storage_constrained_mode:
                 candidates.sort(
                     key=lambda torrent: (
-                        storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state),
+                        storage_recovery_sort_remaining_bytes(client, torrent, storage_guard, storage_state),
                         torrent_name(torrent).lower(),
                     )
                 )
@@ -4843,7 +4903,34 @@ def apply_single_download(
                 torrent for torrent in available_candidates
                 if torrent_priority_reason(torrent, priority_tags, priority_categories)
             ]
+            storage_recovery_parked_torrents = []
+            storage_recovery_parked_hashes = set()
+            storage_recovery_parked_remaining_bytes = 0
+            storage_recovery_parked_deferred_count = 0
             if storage_constrained_mode:
+                fit_bytes = storage_fit_headroom_bytes(storage_guard, storage_state)
+                for torrent in available_candidates:
+                    item_hash = torrent_hash(torrent)
+                    if not item_hash:
+                        continue
+                    if health_store.storage_recovery_no_progress_samples(torrent) < storage_recovery_stall_samples:
+                        continue
+                    if not is_running_torrent(torrent) or is_productive_torrent(torrent):
+                        continue
+                    remaining_bytes = storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state)
+                    if remaining_bytes is None:
+                        storage_recovery_parked_deferred_count += 1
+                        continue
+                    if len(storage_recovery_parked_torrents) >= storage_recovery_max_parked_stalled:
+                        storage_recovery_parked_deferred_count += 1
+                        continue
+                    if storage_recovery_parked_remaining_bytes + remaining_bytes > fit_bytes:
+                        storage_recovery_parked_deferred_count += 1
+                        continue
+                    storage_recovery_parked_torrents.append(torrent)
+                    storage_recovery_parked_hashes.add(item_hash)
+                    storage_recovery_parked_remaining_bytes += remaining_bytes
+
                 (
                     selection_candidates,
                     storage_recovery_selected_remaining_bytes,
@@ -4854,7 +4941,11 @@ def apply_single_download(
                     storage_guard,
                     storage_state,
                     storage_recovery_max_active,
+                    initial_remaining_bytes=storage_recovery_parked_remaining_bytes,
+                    excluded_hashes=storage_recovery_parked_hashes,
                 )
+                rejected_counts["parked_storage_recovery_stalled"] += len(storage_recovery_parked_torrents)
+                rejected_counts["deferred_storage_recovery_parked"] += storage_recovery_parked_deferred_count
                 rejected_counts["deferred_by_storage_recovery_batch"] += storage_recovery_deferred_count
             else:
                 storage_recovery_selected_remaining_bytes = 0
@@ -4905,7 +4996,50 @@ def apply_single_download(
                 "storage_constrained": storage_constrained_mode,
                 "storage_recovery_max_active": storage_recovery_max_active,
                 "storage_recovery_selected_remaining_bytes": storage_recovery_selected_remaining_bytes,
+                "storage_recovery_parked_stalled": len(storage_recovery_parked_torrents),
+                "storage_recovery_parked_remaining_bytes": storage_recovery_parked_remaining_bytes,
+                "storage_recovery_stall_samples": storage_recovery_stall_samples,
             }
+
+            if storage_constrained_mode and storage_recovery_parked_torrents and not selection_candidates:
+                parked_hashes = [
+                    torrent_hash(torrent) for torrent in storage_recovery_parked_torrents
+                    if torrent_hash(torrent)
+                ]
+                desired_queue_limit = max(1, len(parked_hashes))
+                if active_queue_limit != desired_queue_limit:
+                    try:
+                        client.set_active_queue_limits(desired_queue_limit)
+                        active_queue_limit = desired_queue_limit
+                    except (AttributeError, ApiError) as exc:
+                        log_warning(
+                            f"Failed to set qBittorrent active queue limit to "
+                            f"{desired_queue_limit}: {exc}",
+                        )
+                client.stop_hashes([
+                    torrent_hash(torrent) for torrent in torrents
+                    if torrent_hash(torrent) and torrent_hash(torrent) not in set(parked_hashes)
+                ])
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="keep_storage_recovery_parked",
+                    reason="storage recovery has parked stalled torrents but no fitting replacement workers",
+                    selected_torrent=None,
+                    selected_torrents=[
+                        torrent_decision_summary(torrent)
+                        for torrent in storage_recovery_parked_torrents
+                    ],
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                )
+                log_decision_info(
+                    "keep_storage_recovery_parked",
+                    f"Keeping {len(storage_recovery_parked_torrents)} stalled storage-recovery "
+                    "torrent(s) active while waiting for fitting replacement workers",
+                    selected=", ".join(torrent_name(torrent) for torrent in storage_recovery_parked_torrents[:5]),
+                )
+                break
 
             if storage_constrained_mode and selection_candidates:
                 selected_hashes = [
@@ -4913,12 +5047,27 @@ def apply_single_download(
                     if torrent_hash(torrent)
                 ]
                 selected_hash_set = set(selected_hashes)
+                protected_hashes = selected_hash_set | storage_recovery_parked_hashes
+                desired_queue_limit = max(1, len(protected_hashes))
+                desired_queue_limit = min(
+                    storage_recovery_max_active + storage_recovery_max_parked_stalled,
+                    max(storage_recovery_max_active, desired_queue_limit),
+                )
+                if active_queue_limit != desired_queue_limit:
+                    try:
+                        client.set_active_queue_limits(desired_queue_limit)
+                        active_queue_limit = desired_queue_limit
+                    except (AttributeError, ApiError) as exc:
+                        log_warning(
+                            f"Failed to set qBittorrent active queue limit to "
+                            f"{desired_queue_limit}: {exc}",
+                        )
                 for torrent in selection_candidates:
                     health_store.record_attempt(torrent, now)
                 attempt += 1
                 stop_hashes = [
                     torrent_hash(torrent) for torrent in torrents
-                    if torrent_hash(torrent) and torrent_hash(torrent) not in selected_hash_set
+                    if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
                 ]
                 client.stop_hashes(stop_hashes)
                 for selected in selection_candidates:
@@ -4947,7 +5096,7 @@ def apply_single_download(
                     selected_torrent=torrent_decision_summary(selection_candidates[0]),
                     selected_torrents=[
                         torrent_decision_summary(torrent)
-                        for torrent in selection_candidates
+                        for torrent in storage_recovery_parked_torrents + selection_candidates
                     ],
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
@@ -4959,7 +5108,8 @@ def apply_single_download(
                     f"Running {len(selection_candidates)} storage-recovery torrent(s) "
                     f"with {human_size(storage_recovery_selected_remaining_bytes)} selected bytes left "
                     f"inside {human_size(storage_fit_headroom_bytes(storage_guard, storage_state))} "
-                    f"currently free; qB active download limit {storage_recovery_max_active}",
+                    f"currently free; {len(storage_recovery_parked_torrents)} stalled torrent(s) parked; "
+                    f"qB active download limit {desired_queue_limit}",
                     selected=", ".join(torrent_name(torrent) for torrent in selection_candidates[:5]),
                     attempt=attempt,
                     attempt_limit=max_attempts,
@@ -5000,6 +5150,7 @@ def apply_single_download(
                 progress_events = []
                 stalled_count = 0
                 no_progress_count = 0
+                parked_after_sample = []
                 for selected in selection_candidates:
                     selected_hash = torrent_hash(selected)
                     selected_refreshed = refreshed.get(selected_hash)
@@ -5027,16 +5178,33 @@ def apply_single_download(
                         )
                     else:
                         no_progress_count += 1
+                        parked_torrent = selected_refreshed or selected
+                        health_store.record_storage_recovery_no_progress(
+                            parked_torrent,
+                            datetime.now(timezone.utc),
+                        )
+                        if (
+                            health_store.storage_recovery_no_progress_samples(parked_torrent)
+                            >= storage_recovery_stall_samples
+                        ):
+                            parked_after_sample.append(parked_torrent)
 
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="keep_storage_recovery_batch",
-                    reason="storage recovery batch remains selected for next poll",
+                    reason=(
+                        "storage recovery batch remains selected; repeated no-progress "
+                        "members will be parked and replacement workers selected next poll"
+                    ),
                     selected_torrent=torrent_decision_summary(selection_candidates[0]),
                     selected_torrents=[
                         torrent_decision_summary(refreshed.get(torrent_hash(torrent)) or torrent)
-                        for torrent in selection_candidates
+                        for torrent in storage_recovery_parked_torrents + selection_candidates
+                    ],
+                    parked_torrents=[
+                        torrent_decision_summary(torrent)
+                        for torrent in storage_recovery_parked_torrents + parked_after_sample
                     ],
                     progress_torrents=progress_events[:5],
                     rejected_counts=dict(rejected_counts),
@@ -5044,13 +5212,15 @@ def apply_single_download(
                         **candidate_counts,
                         "storage_recovery_stalled": stalled_count,
                         "storage_recovery_no_progress": no_progress_count,
+                        "storage_recovery_newly_parked": len(parked_after_sample),
                     },
                 )
                 log_decision_info(
                     "keep_storage_recovery_batch",
                     f"Keeping storage-recovery batch selected after {stall_check_seconds}s; "
                     f"{len(progress_events)} progressed, {stalled_count} stalled, "
-                    f"{no_progress_count} without measured progress",
+                    f"{no_progress_count} without measured progress, "
+                    f"{len(parked_after_sample)} newly parked for replacement next poll",
                     selected=", ".join(torrent_name(torrent) for torrent in selection_candidates[:5]),
                 )
                 break

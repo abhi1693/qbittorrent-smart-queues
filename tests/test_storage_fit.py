@@ -56,6 +56,42 @@ class StorageFitTests(unittest.TestCase):
 
         self.assertIn("unknown", reason)
 
+    def test_storage_recovery_sort_places_unknown_remaining_size_last(self):
+        class Client:
+            def torrent_files(self, item_hash):
+                if item_hash == "unknown":
+                    return []
+                return [
+                    {"name": "known.mkv", "size": 1000, "progress": 0.5, "priority": 1},
+                ]
+
+        storage_state = {
+            "enabled": True,
+            "stop": True,
+            "reason": "reserve reached",
+            "free_bytes": 2000,
+            "reserve_bytes": 3000,
+            "headroom_bytes": 0,
+        }
+
+        class StorageGuard:
+            require_torrent_fit = True
+
+        ordered = sorted(
+            [
+                {"hash": "unknown", "name": "unknown", "amount_left": 0, "progress": 0.5},
+                {"hash": "known", "name": "known", "amount_left": 500, "progress": 0.5},
+            ],
+            key=lambda torrent: self.guard.storage_recovery_sort_remaining_bytes(
+                Client(),
+                torrent,
+                StorageGuard(),
+                storage_state,
+            ),
+        )
+
+        self.assertEqual(["known", "unknown"], [item["hash"] for item in ordered])
+
 
 if __name__ == "__main__":
     unittest.main()

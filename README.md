@@ -156,9 +156,15 @@ pausing every torrent. It only considers torrents whose selected remaining bytes
 can fit in the currently free space, selects the smallest verified remaining
 downloads first, temporarily raises qBittorrent's active queue limit up to
 `QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_ACTIVE` downloads, defaulting to `5`, and
-keeps the recovery batch selected for the next poll even if individual torrents
-are stalled or make no measured progress. Once storage is back above reserve,
-the next controller pass restores the normal active download limit from
+tracks no-progress samples for each recovery member. After
+`QBT_DOWNLOAD_STORAGE_RECOVERY_STALL_SAMPLES` samples, defaulting to `2`, a
+stalled member is parked: it stays active in qBittorrent so it can resume if
+seeders appear, but it no longer consumes one of the active recovery worker
+slots. The controller then refills open worker slots with other fitting
+torrents while accounting for parked torrents in the storage headroom budget.
+At most `QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED` stalled torrents are
+parked, defaulting to `10`. Once storage is back above reserve, the next
+controller pass restores the normal active download limit from
 `QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS`, defaulting to `1`. Torrents
 with unknown remaining size or no selected files are blocked while storage is
 constrained.
