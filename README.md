@@ -82,7 +82,7 @@ after router/VPN/protocol overhead.
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_TIMEZONE` | `Asia/Kolkata` | IANA timezone used for the uncapped window. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_START_LOCAL` | `22:00` | Local start time for uncapped downloads, inclusive. Example: `22:00` = 10 PM. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_END_LOCAL` | `05:00` | Local end time for uncapped downloads, exclusive. Windows that cross midnight are supported. Example: `05:00` = 5 AM. |
-| `QBT_UNCAPPED_DOWNLOAD_WINDOW_MAX_ACTIVE_DOWNLOADS` | `QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS` | Total qBittorrent active download limit used during the uncapped window. Parked stalled torrents stay active inside this ceiling instead of adding slots above it. |
+| `QBT_UNCAPPED_DOWNLOAD_WINDOW_MAX_ACTIVE_DOWNLOADS` | `QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS` | Active download worker limit used during the uncapped window. Parked stalled torrents add listening slots above this worker limit so they can resume immediately when seeders return. |
 | `QBT_QUOTA_BURST_ENABLED` | `false` | Allow faster downloads above the smoothed quota-safe rate while daily and monthly reserves remain. |
 | `QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | Burst-mode ISP usable cap in bytes/s. Example: `10485760` = `10 MiB/s`. Replaces `QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC`, which remains accepted as a fallback alias. |
 | `QBT_QUOTA_BURST_MIN_MONTHLY_REMAINING_FRACTION` | `0.10` | Minimum monthly guardrail reserve required before burst mode is allowed. |
@@ -250,7 +250,8 @@ seeders appear, but it no longer consumes one of the active recovery worker
 slots. The controller then refills open worker slots with other fitting
 torrents while accounting for parked torrents in the storage headroom budget.
 At most `QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED` stalled torrents are
-parked, defaulting to `10`. Recovery workers also need to meet
+parked, defaulting to `10`; set it to `0` for no parked-stalled count cap.
+Recovery workers also need to meet
 `QBT_DOWNLOAD_STORAGE_RECOVERY_MIN_RATE_BYTES_PER_SEC`, defaulting to the normal
 slow torrent floor of `QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC`. A
 running torrent below that rate is treated as too slow for recovery and is

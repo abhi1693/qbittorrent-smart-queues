@@ -6308,10 +6308,7 @@ def apply_single_download(
     )
 
     def normal_desired_queue_limit(worker_count, parked_count=0):
-        desired = max(1, int(worker_count) + int(parked_count))
-        if uncapped_window_active:
-            return min(uncapped_window_max_active_downloads, desired)
-        return desired
+        return max(1, int(worker_count) + int(parked_count))
 
     park_stalled_downloads_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED", True)
     park_stalled_samples = max(
@@ -6651,7 +6648,10 @@ def apply_single_download(
                     if remaining_bytes is None:
                         storage_recovery_parked_deferred_count += 1
                         continue
-                    if len(storage_recovery_parked_torrents) >= storage_recovery_max_parked_stalled:
+                    if (
+                        storage_recovery_max_parked_stalled > 0
+                        and len(storage_recovery_parked_torrents) >= storage_recovery_max_parked_stalled
+                    ):
                         storage_recovery_parked_deferred_count += 1
                         continue
                     if storage_recovery_parked_remaining_bytes + remaining_bytes > fit_bytes:
@@ -6856,10 +6856,12 @@ def apply_single_download(
                 selected_hash_set = set(selected_hashes)
                 protected_hashes = selected_hash_set | storage_recovery_parked_hashes
                 desired_queue_limit = max(1, len(protected_hashes))
-                desired_queue_limit = min(
-                    storage_recovery_max_active + storage_recovery_max_parked_stalled,
-                    max(storage_recovery_max_active, desired_queue_limit),
-                )
+                desired_queue_limit = max(storage_recovery_max_active, desired_queue_limit)
+                if storage_recovery_max_parked_stalled > 0:
+                    desired_queue_limit = min(
+                        storage_recovery_max_active + storage_recovery_max_parked_stalled,
+                        desired_queue_limit,
+                    )
                 if active_queue_limit != desired_queue_limit:
                     try:
                         client.set_active_queue_limits(desired_queue_limit)

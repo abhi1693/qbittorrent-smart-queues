@@ -398,7 +398,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
 
         self.assertIn((5, None), client.queue_limits)
 
-    def test_uncapped_window_caps_queue_limit_with_parked_stalled_torrent(self):
+    def test_uncapped_window_allows_parked_stalled_slots_above_worker_limit(self):
         client = FakeQbtClient([
             {
                 "hash": "stalled",
@@ -451,7 +451,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertIn(["next"], client.started)
         self.assertFalse(any("stalled" in hashes for hashes in client.stopped))
         self.assertIn((5, None), client.queue_limits)
-        self.assertNotIn((6, None), client.queue_limits)
+        self.assertIn((6, None), client.queue_limits)
 
     def test_apply_single_download_keeps_low_speed_torrent_with_real_progress(self):
         class ProgressingFakeQbtClient(FakeQbtClient):
@@ -755,9 +755,9 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
     def test_storage_constrained_mode_parks_stalled_batch_members_and_refills_slots(self):
         torrents = []
         files = {}
-        for index in range(6):
+        for index in range(7):
             item_hash = f"small-{index}"
-            state = "stalledDL" if index < 5 else "stoppedDL"
+            state = "stalledDL" if index < 6 else "stoppedDL"
             torrents.append(
                 {
                     "hash": item_hash,
@@ -792,21 +792,17 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
                 "QBT_TORRENT_HEALTH_STATE_PATH": f"{tmpdir}/torrent-health.json",
                 "QBT_DOWNLOAD_STORAGE_RECOVERY_STALL_SAMPLES": "1",
-                "QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED": "5",
+                "QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED": "0",
                 "QBT_TV_QUEUE_SONARR_ENABLED": "false",
                 "QBT_LOG_FORMAT": "json",
                 "QBT_DECISION_LOG_LEVEL": "info",
             }
 
             with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(self.guard.time, "sleep"):
-                self.guard.apply_single_download(
-                    [client],
-                    usage_bytes=0,
-                    monthly_limit_bytes=1000,
-                    download_limit=1024,
-                    limit_reason="unit test",
-                    storage_guard=ConstrainedStorageGuard(),
-                )
+                health_store = self.guard.TorrentHealthStore()
+                now = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
+                for torrent in torrents[:6]:
+                    health_store.record_storage_recovery_no_progress(torrent, now)
                 stdout = io.StringIO()
                 with contextlib.redirect_stdout(stdout):
                     self.guard.apply_single_download(
@@ -830,21 +826,20 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             and "candidate_counts" in item
         ][-1]
 
-        self.assertIn(["small-5"], client.started)
-        self.assertEqual(5, recovery_event["candidate_counts"]["storage_recovery_parked_stalled"])
-        self.assertEqual(["small-0", "small-1", "small-2", "small-3", "small-4"], [
-            item["hash"] for item in recovery_event["selected_torrents"][:5]
+        self.assertIn(["small-6"], client.started)
+        self.assertEqual(6, recovery_event["candidate_counts"]["storage_recovery_parked_stalled"])
+        self.assertEqual(["small-0", "small-1", "small-2", "small-3", "small-4", "small-5"], [
+            item["hash"] for item in recovery_event["selected_torrents"][:6]
         ])
-        self.assertEqual("small-5", recovery_event["selected_torrents"][5]["hash"])
+        self.assertEqual("small-6", recovery_event["selected_torrents"][6]["hash"])
         self.assertFalse(
             any(
-                stopped_hash in {"small-0", "small-1", "small-2", "small-3", "small-4"}
+                stopped_hash in {"small-0", "small-1", "small-2", "small-3", "small-4", "small-5"}
                 for stop_call in client.stopped
                 for stopped_hash in stop_call
             )
         )
-        self.assertIn((5, None), client.queue_limits)
-        self.assertIn((6, None), client.queue_limits)
+        self.assertIn((7, None), client.queue_limits)
 
     def test_storage_constrained_mode_replaces_too_slow_recovery_worker(self):
         class SlowStartFakeQbtClient(FakeQbtClient):
