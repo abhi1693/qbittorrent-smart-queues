@@ -4883,6 +4883,17 @@ def is_productive_torrent(torrent):
     return torrent_download_speed(torrent) > 0
 
 
+def should_park_stalled_torrent(torrent, health_store, required_no_progress_samples):
+    if not is_running_torrent(torrent) or is_productive_torrent(torrent):
+        return False
+    if is_stalled_torrent(torrent):
+        return True
+    return (
+        health_store.storage_recovery_no_progress_samples(torrent)
+        >= max(1, int(required_no_progress_samples))
+    )
+
+
 def torrent_progress_reason(before, after, min_download_delta_bytes):
     min_download_delta_bytes = max(1, int(min_download_delta_bytes))
     before_left = torrent_amount_left(before)
@@ -6052,6 +6063,15 @@ def apply_single_download(
         env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED", 10),
     )
     normal_max_active_downloads = max(1, env_int("QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS", 1))
+    park_stalled_downloads_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED", True)
+    park_stalled_samples = max(
+        1,
+        env_int("QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES", storage_recovery_stall_samples),
+    )
+    max_parked_stalled_downloads = max(
+        0,
+        env_int("QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED", 0),
+    )
     slow_min_rate_bytes = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC", 65_536)
     storage_recovery_min_rate_bytes = max(
         0,
@@ -6355,6 +6375,9 @@ def apply_single_download(
             storage_recovery_parked_remaining_bytes = 0
             storage_recovery_parked_deferred_count = 0
             storage_recovery_slow_excluded_hashes = set()
+            normal_parked_stalled_torrents = []
+            normal_parked_stalled_hashes = set()
+            normal_parked_stalled_deferred_count = 0
             if storage_constrained_mode:
                 fit_bytes = storage_fit_headroom_bytes(storage_guard, storage_state)
                 for torrent in available_candidates:
@@ -6407,7 +6430,28 @@ def apply_single_download(
                 rejected_counts["deferred_by_storage_recovery_batch"] += storage_recovery_deferred_count
             else:
                 storage_recovery_selected_remaining_bytes = 0
-                selection_candidates = watch_priority_candidates or priority_candidates or available_candidates
+                if park_stalled_downloads_enabled:
+                    for torrent in candidates:
+                        item_hash = torrent_hash(torrent)
+                        if not item_hash:
+                            continue
+                        if not should_park_stalled_torrent(torrent, health_store, park_stalled_samples):
+                            continue
+                        if (
+                            max_parked_stalled_downloads > 0
+                            and len(normal_parked_stalled_torrents) >= max_parked_stalled_downloads
+                        ):
+                            normal_parked_stalled_deferred_count += 1
+                            continue
+                        normal_parked_stalled_torrents.append(torrent)
+                        normal_parked_stalled_hashes.add(item_hash)
+                    rejected_counts["parked_stalled"] += len(normal_parked_stalled_torrents)
+                    rejected_counts["deferred_parked_stalled"] += normal_parked_stalled_deferred_count
+                base_selection_candidates = watch_priority_candidates or priority_candidates or available_candidates
+                selection_candidates = [
+                    torrent for torrent in base_selection_candidates
+                    if torrent_hash(torrent) not in normal_parked_stalled_hashes
+                ]
             if not storage_constrained_mode and watch_priority_candidates:
                 rejected_counts["deferred_by_watch_activity"] += (
                     len(available_candidates) - len(watch_priority_candidates)
@@ -6446,7 +6490,73 @@ def apply_single_download(
                 "storage_recovery_stall_samples": storage_recovery_stall_samples,
                 "storage_recovery_min_rate_bytes_per_sec": storage_recovery_min_rate_bytes,
                 "storage_recovery_slow_excluded": len(storage_recovery_slow_excluded_hashes),
+                "parked_stalled": len(normal_parked_stalled_torrents),
+                "parked_stalled_samples": park_stalled_samples,
+                "parked_stalled_max": max_parked_stalled_downloads,
             }
+
+            if (
+                not storage_constrained_mode
+                and normal_parked_stalled_torrents
+                and not selection_candidates
+            ):
+                parked_hashes = [
+                    torrent_hash(torrent) for torrent in normal_parked_stalled_torrents
+                    if torrent_hash(torrent)
+                ]
+                desired_queue_limit = max(1, len(parked_hashes))
+                if active_queue_limit != desired_queue_limit:
+                    try:
+                        client.set_active_queue_limits(desired_queue_limit)
+                        active_queue_limit = desired_queue_limit
+                    except (AttributeError, ApiError) as exc:
+                        log_warning(
+                            f"Failed to set qBittorrent active queue limit to "
+                            f"{desired_queue_limit}: {exc}",
+                        )
+                client.stop_hashes([
+                    torrent_hash(torrent) for torrent in torrents
+                    if torrent_hash(torrent) and torrent_hash(torrent) not in set(parked_hashes)
+                ])
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="keep_parked_stalled",
+                    reason="stalled torrents remain active while waiting for replacement candidates",
+                    selected_torrent=None,
+                    selected_torrents=[
+                        torrent_decision_summary(torrent)
+                        for torrent in normal_parked_stalled_torrents
+                    ],
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                )
+                log_decision_info(
+                    "keep_parked_stalled",
+                    f"Keeping {len(normal_parked_stalled_torrents)} stalled torrent(s) active "
+                    "with no replacement candidates available",
+                    selected=", ".join(torrent_name(torrent) for torrent in normal_parked_stalled_torrents[:5]),
+                )
+                break
+
+            if (
+                not storage_constrained_mode
+                and normal_parked_stalled_torrents
+                and selection_candidates
+            ):
+                desired_queue_limit = max(
+                    normal_max_active_downloads,
+                    normal_max_active_downloads + len(normal_parked_stalled_hashes),
+                )
+                if active_queue_limit != desired_queue_limit:
+                    try:
+                        client.set_active_queue_limits(desired_queue_limit)
+                        active_queue_limit = desired_queue_limit
+                    except (AttributeError, ApiError) as exc:
+                        log_warning(
+                            f"Failed to set qBittorrent active queue limit to "
+                            f"{desired_queue_limit}: {exc}",
+                        )
 
             if storage_constrained_mode and storage_recovery_parked_torrents and not selection_candidates:
                 parked_hashes = [
@@ -6759,9 +6869,10 @@ def apply_single_download(
             if productive_candidates:
                 keep = productive_candidates[0]
                 keep_hash = torrent_hash(keep)
+                protected_hashes = {keep_hash} | normal_parked_stalled_hashes
                 stop_hashes = [
                     torrent_hash(torrent) for torrent in torrents
-                    if torrent_hash(torrent) and torrent_hash(torrent) != keep_hash
+                    if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
                 ]
                 client.stop_hashes(stop_hashes)
                 apply_tv_episode_file_priorities(
@@ -6877,6 +6988,34 @@ def apply_single_download(
                     )
                     break
 
+                if not storage_constrained_mode and park_stalled_downloads_enabled:
+                    parked_torrent = keep_refreshed or keep
+                    health_store.record_storage_recovery_no_progress(
+                        parked_torrent,
+                        datetime.now(timezone.utc),
+                    )
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action="park_kept_no_progress",
+                        reason=(
+                            "did not make progress; keeping active so it can resume "
+                            "immediately if peers return"
+                        ),
+                        selected_torrent=torrent_decision_summary(parked_torrent),
+                        parked_torrents=[torrent_decision_summary(parked_torrent)],
+                        rejected_counts={"no_progress_after_wait": 1},
+                        candidate_counts=candidate_counts,
+                    )
+                    log_decision_info(
+                        "park_kept_no_progress",
+                        f"Keeping no-progress torrent active after {stall_check_seconds}s: "
+                        f"{torrent_name(parked_torrent)}",
+                        selected=torrent_name(parked_torrent),
+                        reason="did not make progress",
+                    )
+                    break
+
                 client.stop_hashes([keep_hash])
                 attempted_hashes.add(keep_hash)
                 cooldown_reason = tracker_dead_cooldown_reason(keep_refreshed or keep)
@@ -6918,6 +7057,53 @@ def apply_single_download(
                 torrent for torrent in selection_candidates
                 if is_running_torrent(torrent) and is_stalled_torrent(torrent)
             ]
+            if stalled_candidates and not storage_constrained_mode and park_stalled_downloads_enabled:
+                for torrent in stalled_candidates:
+                    item_hash = torrent_hash(torrent)
+                    if item_hash:
+                        normal_parked_stalled_hashes.add(item_hash)
+                        normal_parked_stalled_torrents.append(torrent)
+                        health_store.record_storage_recovery_no_progress(torrent, now)
+                desired_queue_limit = max(
+                    1,
+                    normal_max_active_downloads + len(normal_parked_stalled_hashes),
+                )
+                if active_queue_limit != desired_queue_limit:
+                    try:
+                        client.set_active_queue_limits(desired_queue_limit)
+                        active_queue_limit = desired_queue_limit
+                    except (AttributeError, ApiError) as exc:
+                        log_warning(
+                            f"Failed to set qBittorrent active queue limit to "
+                            f"{desired_queue_limit}: {exc}",
+                        )
+                client.stop_hashes([
+                    torrent_hash(torrent) for torrent in torrents
+                    if torrent_hash(torrent) and torrent_hash(torrent) not in normal_parked_stalled_hashes
+                ])
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="keep_stalled_candidates",
+                    reason="stalled torrents remain active and will be skipped for replacement selection",
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts={
+                        **candidate_counts,
+                        "parked_stalled": len(normal_parked_stalled_torrents),
+                    },
+                    selected_torrent=None,
+                    selected_torrents=[
+                        torrent_decision_summary(torrent)
+                        for torrent in stalled_candidates[:5]
+                    ],
+                )
+                log_decision_info(
+                    "keep_stalled_candidates",
+                    f"Keeping {len(stalled_candidates)} stalled torrent(s) active "
+                    "instead of pausing them",
+                    count=len(stalled_candidates),
+                )
+                break
             if stalled_candidates:
                 rejected_counts["stalled_zero_speed"] += len(stalled_candidates)
                 candidate_counts["stalled"] = len(stalled_candidates)
@@ -7035,9 +7221,10 @@ def apply_single_download(
             attempted_hashes.add(selected_hash)
             health_store.record_attempt(selected, now)
             attempt += 1
+            protected_hashes = {selected_hash} | normal_parked_stalled_hashes
             stop_hashes = [
                 torrent_hash(torrent) for torrent in torrents
-                if torrent_hash(torrent) and torrent_hash(torrent) != selected_hash
+                if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
             ]
             client.stop_hashes(stop_hashes)
             apply_tv_episode_file_priorities(
@@ -7165,6 +7352,34 @@ def apply_single_download(
                     f"{human_rate(torrent_download_speed(selected_refreshed))} down)",
                     selected=torrent_name(selected_refreshed),
                     reason="storage-constrained candidate has not stalled",
+                )
+                break
+
+            if not storage_constrained_mode and park_stalled_downloads_enabled:
+                parked_torrent = selected_refreshed or selected
+                health_store.record_storage_recovery_no_progress(
+                    parked_torrent,
+                    datetime.now(timezone.utc),
+                )
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="park_selected_no_progress",
+                    reason=(
+                        "did not make progress; keeping active so it can resume "
+                        "immediately if peers return"
+                    ),
+                    selected_torrent=torrent_decision_summary(parked_torrent),
+                    parked_torrents=[torrent_decision_summary(parked_torrent)],
+                    rejected_counts={"no_progress_after_wait": 1},
+                    candidate_counts=candidate_counts,
+                )
+                log_decision_info(
+                    "park_selected_no_progress",
+                    f"Keeping selected torrent active after {stall_check_seconds}s without progress: "
+                    f"{torrent_name(parked_torrent)}",
+                    selected=torrent_name(parked_torrent),
+                    reason="did not make progress",
                 )
                 break
 

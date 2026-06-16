@@ -218,7 +218,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             ),
         )
 
-    def test_apply_single_download_stops_zero_speed_torrent_after_wait_without_bytes(self):
+    def test_apply_single_download_parks_zero_speed_torrent_after_wait_without_bytes(self):
         client = FakeQbtClient([
             {
                 "hash": "zero",
@@ -269,9 +269,9 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             if item.get("event") == "qbt_guard_decision"
         ]
         try_event = next(item for item in decision_events if item.get("action") == "try_candidate")
-        stop_event = next(
+        park_event = next(
             item for item in decision_events
-            if item.get("action") == "stop_selected_no_progress"
+            if item.get("action") == "park_selected_no_progress"
         )
 
         self.assertEqual("zero", try_event["selected_torrent"]["hash"])
@@ -281,19 +281,81 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual(4000, try_event["storage"]["headroom_bytes"])
         self.assertFalse(try_event["thermal"]["stop"])
         self.assertNotIn("client", try_event)
-        self.assertNotIn("client", stop_event)
+        self.assertNotIn("client", park_event)
         self.assertEqual(1, try_event["rejected_counts"]["not_productive_zero_speed"])
-        self.assertEqual("zero", stop_event["selected_torrent"]["hash"])
-        self.assertEqual(1, stop_event["rejected_counts"]["no_progress_after_wait"])
+        self.assertEqual("zero", park_event["selected_torrent"]["hash"])
+        self.assertEqual(1, park_event["rejected_counts"]["no_progress_after_wait"])
         self.assertIn(["zero"], client.started)
-        self.assertTrue(any("zero" in hashes for hashes in client.stopped))
-        self.assertEqual(1, client.stop_all_calls)
-        self.assertTrue(
-            any(
-                hashes == ["zero"] and tags[0].startswith("quota-stalled-")
-                for hashes, tags in client.added_tags
-            )
-        )
+        self.assertFalse(any("zero" in hashes for hashes in client.stopped))
+        self.assertEqual(0, client.stop_all_calls)
+        self.assertEqual([], client.added_tags)
+
+    def test_apply_single_download_parks_stalled_torrent_and_runs_replacement(self):
+        client = FakeQbtClient([
+            {
+                "hash": "stalled",
+                "name": "Stalled.S01E01",
+                "category": "tv",
+                "state": "stalledDL",
+                "dlspeed": 0,
+                "amount_left": 1000,
+                "downloaded": 100,
+                "progress": 0.5,
+                "tags": "",
+            },
+            {
+                "hash": "next",
+                "name": "Next.S01E02",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 2000,
+                "downloaded": 0,
+                "progress": 0.25,
+                "tags": "",
+            },
+        ])
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                    decision_context={},
+                )
+
+        decision_logs = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{")
+        ]
+        decision_events = [
+            item for item in decision_logs
+            if item.get("event") == "qbt_guard_decision"
+        ]
+        try_event = next(item for item in decision_events if item.get("action") == "try_candidate")
+
+        self.assertEqual("next", try_event["selected_torrent"]["hash"])
+        self.assertEqual(1, try_event["candidate_counts"]["parked_stalled"])
+        self.assertIn(["next"], client.started)
+        self.assertFalse(any("stalled" in hashes for hashes in client.stopped))
+        self.assertIn((2, None), client.queue_limits)
+        self.assertEqual([], client.added_tags)
 
     def test_apply_single_download_keeps_low_speed_torrent_with_real_progress(self):
         class ProgressingFakeQbtClient(FakeQbtClient):
