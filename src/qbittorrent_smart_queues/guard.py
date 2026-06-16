@@ -4199,7 +4199,14 @@ def torrent_progress_delta_bytes(before, after):
     return max(0, left_delta, downloaded_delta)
 
 
-def slow_torrent_reason(torrent, allowed_download_limit, min_rate_fraction, min_rate_bytes, max_eta_seconds):
+def slow_torrent_reason(
+    torrent,
+    allowed_download_limit,
+    min_rate_fraction,
+    min_rate_bytes,
+    max_eta_seconds,
+    require_bad_eta=False,
+):
     if not is_productive_torrent(torrent):
         return ""
 
@@ -4207,19 +4214,23 @@ def slow_torrent_reason(torrent, allowed_download_limit, min_rate_fraction, min_
     if speed <= 0:
         return ""
 
-    eta = torrent_eta_seconds(torrent)
-    if eta is None or eta < max_eta_seconds:
-        return ""
-
     rate_floor = max(1, math.floor(max(1, allowed_download_limit) * min_rate_fraction))
     rate_floor = max(rate_floor, max(1, int(min_rate_bytes)))
     if speed >= rate_floor:
         return ""
 
+    eta = torrent_eta_seconds(torrent)
+    if require_bad_eta and (eta is None or eta < max_eta_seconds):
+        return ""
+
+    eta_suffix = ", ETA unknown"
+    if eta is not None:
+        eta_suffix = f", ETA {human_duration(eta)}"
+
     return (
         f"download speed {human_rate(speed)} is below "
         f"{human_rate(rate_floor)} minimum for allowed rate "
-        f"{human_rate(allowed_download_limit)}, ETA {human_duration(eta)}"
+        f"{human_rate(allowed_download_limit)}{eta_suffix}"
     )
 
 
@@ -5019,6 +5030,7 @@ def apply_single_download(
         env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MIN_RATE_BYTES_PER_SEC", slow_min_rate_bytes),
     )
     slow_max_eta_seconds = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MAX_ETA_SECONDS", 172_800)
+    slow_require_bad_eta = env_bool("QBT_SINGLE_DOWNLOAD_SLOW_REQUIRE_BAD_ETA", False)
     healthy_min_seeds = env_int("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_SEEDS", 3)
     healthy_min_availability = env_float("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_AVAILABILITY", 1.05)
     selection_strategy_name = selection_strategy()
@@ -5359,6 +5371,7 @@ def apply_single_download(
                     slow_min_rate_fraction,
                     slow_min_rate_bytes,
                     slow_max_eta_seconds,
+                    slow_require_bad_eta,
                 )
                 if storage_constrained_mode:
                     slow_reason = ""
@@ -5774,6 +5787,7 @@ def apply_single_download(
                         slow_min_rate_fraction,
                         slow_min_rate_bytes,
                         slow_max_eta_seconds,
+                        slow_require_bad_eta,
                     )
                     if storage_constrained_mode:
                         slow_reason = ""
@@ -6131,6 +6145,7 @@ def apply_single_download(
                     slow_min_rate_fraction,
                     slow_min_rate_bytes,
                     slow_max_eta_seconds,
+                    slow_require_bad_eta,
                 )
                 if storage_constrained_mode:
                     slow_reason = ""

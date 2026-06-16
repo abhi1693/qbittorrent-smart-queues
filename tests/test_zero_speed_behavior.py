@@ -155,6 +155,42 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             ),
         )
 
+    def test_slow_torrent_reason_defaults_to_rate_floor_even_with_short_eta(self):
+        torrent = {
+            "state": "downloading",
+            "dlspeed": 50_000,
+            "amount_left": 1_000_000,
+        }
+
+        reason = self.guard.slow_torrent_reason(
+            torrent,
+            allowed_download_limit=947_000,
+            min_rate_fraction=0.10,
+            min_rate_bytes=65_536,
+            max_eta_seconds=172_800,
+        )
+
+        self.assertIn("download speed 50.0 KB/s is below", reason)
+        self.assertIn("minimum for allowed rate 947 KB/s", reason)
+
+    def test_slow_torrent_reason_can_require_bad_eta_for_legacy_behavior(self):
+        torrent = {
+            "state": "downloading",
+            "dlspeed": 50_000,
+            "amount_left": 1_000_000,
+        }
+
+        reason = self.guard.slow_torrent_reason(
+            torrent,
+            allowed_download_limit=947_000,
+            min_rate_fraction=0.10,
+            min_rate_bytes=65_536,
+            max_eta_seconds=172_800,
+            require_bad_eta=True,
+        )
+
+        self.assertEqual("", reason)
+
     def test_apply_single_download_stops_zero_speed_torrent_after_wait_without_bytes(self):
         client = FakeQbtClient([
             {
