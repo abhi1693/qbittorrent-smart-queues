@@ -2021,6 +2021,16 @@ class QbtClient:
         payload = self.request("GET", path)
         return json.loads(payload.decode("utf-8"))
 
+    def torrent_trackers(self, item_hash):
+        if not item_hash:
+            return []
+        path = "/api/v2/torrents/trackers?" + urllib.parse.urlencode({"hash": item_hash})
+        payload = self.request("GET", path)
+        trackers = json.loads(payload.decode("utf-8"))
+        if not isinstance(trackers, list):
+            raise ApiError(f"qBittorrent trackers response has unexpected shape: {type(trackers).__name__}")
+        return trackers
+
     def set_file_priority(self, item_hash, file_ids, priority):
         if not item_hash or not file_ids:
             return
@@ -2725,6 +2735,91 @@ def torrent_reported_seeds(torrent):
 
 def torrent_availability(torrent):
     return torrent_float(torrent, "availability")
+
+
+def tracker_int(tracker, key):
+    try:
+        return max(0, int(tracker.get(key) or 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def tracker_status_name(tracker):
+    raw_status = tracker.get("status") if isinstance(tracker, dict) else None
+    if isinstance(raw_status, int):
+        return {
+            0: "disabled",
+            1: "not-contacted",
+            2: "working",
+            3: "updating",
+            4: "not-working",
+        }.get(raw_status, "unknown")
+
+    raw_text = str(raw_status or tracker.get("msg") if isinstance(tracker, dict) else "").strip().lower()
+    if not raw_text:
+        return "unknown"
+    if "not contacted" in raw_text:
+        return "not-contacted"
+    if "updating" in raw_text:
+        return "updating"
+    if "not working" in raw_text or "error" in raw_text or "fail" in raw_text:
+        return "not-working"
+    if "disabled" in raw_text:
+        return "disabled"
+    if "working" in raw_text:
+        return "working"
+    return "unknown"
+
+
+def tracker_health_summary(trackers):
+    summary = {
+        "total": 0,
+        "working": 0,
+        "updating": 0,
+        "not_working": 0,
+        "not_contacted": 0,
+        "disabled": 0,
+        "unknown": 0,
+        "seed_count": 0,
+        "leech_count": 0,
+        "peer_count": 0,
+        "downloaded_count": 0,
+        "last_status": "unknown",
+    }
+    for tracker in trackers or []:
+        if not isinstance(tracker, dict):
+            continue
+        summary["total"] += 1
+        status = tracker_status_name(tracker)
+        if status == "working":
+            summary["working"] += 1
+        elif status == "updating":
+            summary["updating"] += 1
+        elif status == "not-working":
+            summary["not_working"] += 1
+        elif status == "not-contacted":
+            summary["not_contacted"] += 1
+        elif status == "disabled":
+            summary["disabled"] += 1
+        else:
+            summary["unknown"] += 1
+
+        summary["seed_count"] += tracker_int(tracker, "num_seeds")
+        summary["leech_count"] += tracker_int(tracker, "num_leeches")
+        summary["peer_count"] += tracker_int(tracker, "num_peers")
+        summary["downloaded_count"] += tracker_int(tracker, "num_downloaded")
+
+    if summary["working"]:
+        summary["last_status"] = "working"
+    elif summary["updating"]:
+        summary["last_status"] = "updating"
+    elif summary["not_working"]:
+        summary["last_status"] = "not-working"
+    elif summary["not_contacted"]:
+        summary["last_status"] = "not-contacted"
+    elif summary["disabled"]:
+        summary["last_status"] = "disabled"
+    return summary
 
 
 def torrent_decision_summary(torrent):
@@ -4370,6 +4465,11 @@ class TorrentHealthStore:
         self.path = os.environ.get("QBT_TORRENT_HEALTH_STATE_PATH", "/state/torrent-health.json").strip()
         self.ewma_alpha = max(0.01, min(1.0, env_float("QBT_TORRENT_HEALTH_EWMA_ALPHA", 0.35)))
         self.stale_days = max(1, env_int("QBT_TORRENT_HEALTH_STALE_DAYS", 90))
+        self.tracker_health_enabled = env_bool("QBT_TRACKER_HEALTH_SCORING_ENABLED", True)
+        self.tracker_health_score_max_age_seconds = max(
+            0,
+            env_int("QBT_TRACKER_HEALTH_SCORE_MAX_AGE_SECONDS", 21_600),
+        )
         self.data = {"version": 1, "torrents": {}}
         self.dirty = False
         if self.enabled:
@@ -4440,6 +4540,53 @@ class TorrentHealthStore:
 
         self.prune_stale(now)
         self.save()
+
+    def tracker_health_is_fresh(self, torrent, now, min_refresh_seconds):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return False
+        observed_at = parse_utc(entry.get("tracker_health_observed_at"))
+        if observed_at is None:
+            return False
+        age_seconds = max(0, int((now - observed_at).total_seconds()))
+        return age_seconds < max(0, int(min_refresh_seconds or 0))
+
+    def observe_tracker_health(self, client, torrents, now, max_torrents, min_refresh_seconds):
+        if not self.enabled or not self.tracker_health_enabled or max_torrents <= 0:
+            return 0
+
+        observed = 0
+        for torrent in torrents:
+            if observed >= max_torrents:
+                break
+            item_hash = torrent_hash(torrent)
+            if not item_hash:
+                continue
+            if self.tracker_health_is_fresh(torrent, now, min_refresh_seconds):
+                continue
+            try:
+                trackers = client.torrent_trackers(item_hash)
+            except (AttributeError, ApiError, json.JSONDecodeError) as exc:
+                log_debug(
+                    f"Failed to read qBittorrent tracker health for "
+                    f"{torrent_name(torrent)}: {exc}",
+                )
+                continue
+            self.record_tracker_health(torrent, trackers, now)
+            observed += 1
+        if observed:
+            self.save()
+        return observed
+
+    def record_tracker_health(self, torrent, trackers, now):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return
+        entry["name"] = torrent_name(torrent)
+        entry["category"] = torrent_category(torrent)
+        entry["tracker_health_observed_at"] = format_utc(now)
+        entry["tracker_health"] = tracker_health_summary(trackers)
+        self.dirty = True
 
     def observe_stale_stalled(self, torrents, now):
         if not self.enabled:
@@ -4653,6 +4800,35 @@ class TorrentHealthStore:
         score -= min(45.0, consecutive_failures * 14.0)
         score -= min(20.0, max(0, failed_attempts - int(entry.get("successful_attempts") or 0)) * 2.0)
 
+        tracker_health = entry.get("tracker_health")
+        tracker_observed_at = parse_utc(entry.get("tracker_health_observed_at"))
+        if self.tracker_health_enabled and isinstance(tracker_health, dict) and tracker_observed_at:
+            tracker_age_seconds = max(0, int((now - tracker_observed_at).total_seconds()))
+            if (
+                self.tracker_health_score_max_age_seconds <= 0
+                or tracker_age_seconds <= self.tracker_health_score_max_age_seconds
+            ):
+                total = int(tracker_health.get("total") or 0)
+                working = int(tracker_health.get("working") or 0)
+                updating = int(tracker_health.get("updating") or 0)
+                not_working = int(tracker_health.get("not_working") or 0)
+                not_contacted = int(tracker_health.get("not_contacted") or 0)
+                seed_count = int(tracker_health.get("seed_count") or 0)
+                peer_count = int(tracker_health.get("peer_count") or 0)
+                downloaded_count = int(tracker_health.get("downloaded_count") or 0)
+
+                score += min(24.0, working * 8.0)
+                score += min(8.0, updating * 2.0)
+                score += min(22.0, seed_count * 1.5)
+                score += min(12.0, peer_count * 0.5)
+                score += min(6.0, downloaded_count * 0.5)
+                score -= min(24.0, not_working * 6.0)
+                if total > 0 and working <= 0:
+                    if not_working >= total:
+                        score -= 35.0
+                    elif not_contacted >= total:
+                        score -= 10.0
+
         return max(-100.0, min(100.0, score))
 
     def summary(self, torrent, now):
@@ -4665,6 +4841,16 @@ class TorrentHealthStore:
         score = self.score(torrent, now)
         speed = int(entry.get("ewma_speed_bytes_per_sec") or 0)
         failures = int(entry.get("consecutive_failures") or 0)
+        tracker_text = ""
+        tracker_health = entry.get("tracker_health")
+        if isinstance(tracker_health, dict):
+            tracker_text = (
+                f", tracker {tracker_health.get('last_status') or 'unknown'} "
+                f"{int(tracker_health.get('working') or 0)}/"
+                f"{int(tracker_health.get('total') or 0)} working, "
+                f"seeds {int(tracker_health.get('seed_count') or 0)}, "
+                f"peers {int(tracker_health.get('peer_count') or 0)}"
+            )
         predicted = entry.get("predicted_completion_seconds")
         predicted_text = "unknown"
         try:
@@ -4679,6 +4865,7 @@ class TorrentHealthStore:
         return (
             f"; health score {score:.1f}, ewma {human_rate(speed)}, "
             f"ETA {predicted_text}, consecutive failures {failures}"
+            f"{tracker_text}"
         )
 
 
@@ -5204,6 +5391,8 @@ def apply_single_download(
     )
     healthy_min_seeds = env_int("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_SEEDS", 3)
     healthy_min_availability = env_float("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_AVAILABILITY", 1.05)
+    tracker_health_max_candidates = max(0, env_int("QBT_TRACKER_HEALTH_MAX_CANDIDATES_PER_PASS", 50))
+    tracker_health_min_refresh_seconds = max(0, env_int("QBT_TRACKER_HEALTH_MIN_REFRESH_SECONDS", 300))
     selection_strategy_name = selection_strategy()
     preempt_productive_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED", False)
     preempt_productive_score_margin = env_float("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN", 25.0)
@@ -5381,6 +5570,14 @@ def apply_single_download(
                     rejected_counts[reject_reason] += 1
                 else:
                     eligible_torrents.append(torrent)
+
+            tracker_health_observed = health_store.observe_tracker_health(
+                client,
+                eligible_torrents,
+                now,
+                tracker_health_max_candidates,
+                tracker_health_min_refresh_seconds,
+            )
 
             tv_order_state = build_tv_order_state(
                 torrents,
@@ -5572,6 +5769,7 @@ def apply_single_download(
                 "slow": 0,
                 "selection_strategy": selection_strategy_name,
                 "storage_constrained": storage_constrained_mode,
+                "tracker_health_observed": tracker_health_observed,
                 "storage_recovery_max_active": storage_recovery_max_active,
                 "storage_recovery_selected_remaining_bytes": storage_recovery_selected_remaining_bytes,
                 "storage_recovery_parked_stalled": len(storage_recovery_parked_torrents),

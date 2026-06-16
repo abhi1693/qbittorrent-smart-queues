@@ -1,6 +1,8 @@
 import importlib
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 
 class FakeHealthStore:
@@ -123,6 +125,81 @@ class CandidateSortingTests(unittest.TestCase):
         ordered = self.sort([unhealthy, healthy], store)
 
         self.assertEqual(["healthy", "unhealthy"], [item["hash"] for item in ordered])
+
+    def test_persisted_tracker_response_health_breaks_equal_candidates(self):
+        dead = self.torrent("dead", availability=1.0, num_seeds=0, num_complete=0)
+        healthy = self.torrent("healthy", availability=1.0, num_seeds=0, num_complete=0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "QBT_TORRENT_HEALTH_STATE_PATH": f"{tmpdir}/health.json",
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_TRACKER_HEALTH_SCORING_ENABLED": "true",
+            }
+            with mock.patch.dict("os.environ", env, clear=False):
+                store = self.guard.TorrentHealthStore()
+                store.record_tracker_health(dead, [
+                    {"url": "udp://dead.example/announce", "status": 4, "num_peers": 0, "num_seeds": 0},
+                ], self.now)
+                store.record_tracker_health(healthy, [
+                    {
+                        "url": "udp://ok.example/announce",
+                        "status": 2,
+                        "num_peers": 18,
+                        "num_seeds": 8,
+                        "num_leeches": 10,
+                    },
+                ], self.now)
+
+                ordered = self.sort([dead, healthy], store)
+
+        self.assertEqual(["healthy", "dead"], [item["hash"] for item in ordered])
+
+    def test_tracker_health_observation_is_bounded_and_cached(self):
+        class TrackerClient:
+            def __init__(self):
+                self.calls = []
+
+            def torrent_trackers(self, item_hash):
+                self.calls.append(item_hash)
+                return [{"url": f"udp://{item_hash}.example/announce", "status": 2, "num_peers": 3}]
+
+        torrents = [self.torrent("one"), self.torrent("two"), self.torrent("three")]
+        client = TrackerClient()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "QBT_TORRENT_HEALTH_STATE_PATH": f"{tmpdir}/health.json",
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_TRACKER_HEALTH_SCORING_ENABLED": "true",
+            }
+            with mock.patch.dict("os.environ", env, clear=False):
+                store = self.guard.TorrentHealthStore()
+
+                observed = store.observe_tracker_health(
+                    client,
+                    torrents,
+                    self.now,
+                    max_torrents=2,
+                    min_refresh_seconds=300,
+                )
+                observed_again = store.observe_tracker_health(
+                    client,
+                    torrents,
+                    self.now,
+                    max_torrents=2,
+                    min_refresh_seconds=300,
+                )
+                observed_third_time = store.observe_tracker_health(
+                    client,
+                    torrents,
+                    self.now,
+                    max_torrents=2,
+                    min_refresh_seconds=300,
+                )
+
+        self.assertEqual(2, observed)
+        self.assertEqual(1, observed_again)
+        self.assertEqual(0, observed_third_time)
+        self.assertEqual(["one", "two", "three"], client.calls)
 
     def test_balanced_strategy_prefers_near_complete_candidate(self):
         early = self.torrent("early", progress=0.25, amount_left=80 * 1024 * 1024 * 1024)

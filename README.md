@@ -122,6 +122,10 @@ Optional single-download selection tuning:
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_TRACKER_DEAD_SECONDS` | max(base, 21600) | Cooldown for stalled torrents with no connected seeds, reported seeds, or availability. |
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_IMPORT_FAILED_SECONDS` | max(base, 86400) | Cooldown honored for manually/future-applied import-failed tags. |
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_MANUAL_HOLD_SECONDS` | max(base, 604800) | Cooldown honored for manually-applied hold tags. |
+| `QBT_TRACKER_HEALTH_SCORING_ENABLED` | `true` | Read qBittorrent tracker responses for eligible candidates and include tracker health in selection scores. |
+| `QBT_TRACKER_HEALTH_MAX_CANDIDATES_PER_PASS` | `50` | Maximum `/torrents/trackers` reads per controller pass. |
+| `QBT_TRACKER_HEALTH_MIN_REFRESH_SECONDS` | `300` | Minimum age before refreshing a torrent's tracker health again. |
+| `QBT_TRACKER_HEALTH_SCORE_MAX_AGE_SECONDS` | `21600` | Maximum tracker-health observation age used for scoring; `0` means no age limit. |
 
 Cooldown tags are reasoned as
 `<prefix>-<reason>-<timestamp>`, for example
