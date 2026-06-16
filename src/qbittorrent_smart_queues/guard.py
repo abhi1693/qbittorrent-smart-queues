@@ -139,12 +139,30 @@ class QueueStatusStore:
                 self.last_loop_at = now
                 self.loop_result = int(safe_fields.get("result") or 0)
             if event == "qbt_guard_decision" or event == "qbt_guard_loop":
-                self.last_event = {
+                previous_event = dict(self.last_event or {})
+                next_event = {
                     "event": event,
                     "source": source,
                     "timestamp": format_utc(now),
                     **safe_fields,
                 }
+                if (
+                    event == "qbt_guard_decision"
+                    and source == "summary"
+                    and previous_event.get("event") == "qbt_guard_decision"
+                    and previous_event.get("action") == action
+                ):
+                    for key in (
+                        "budget",
+                        "candidate_counts",
+                        "effective_cap",
+                        "rejected_counts",
+                        "selected_torrent",
+                        "storage",
+                    ):
+                        if key not in next_event and key in previous_event:
+                            next_event[key] = previous_event[key]
+                self.last_event = next_event
                 if event == "qbt_guard_decision":
                     self.last_decision_at = now
                     self.status_update_counts[(action, source)] += 1

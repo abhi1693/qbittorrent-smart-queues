@@ -70,6 +70,30 @@ class StatusEndpointTests(unittest.TestCase):
         self.assertIn('selected_name="Movie.2026"', metrics_text)
         self.assertEqual("ok\n", health_text)
 
+    def test_summary_update_preserves_structured_count_context(self):
+        self.guard.QUEUE_STATUS.record(
+            "qbt_guard_decision",
+            source="structured",
+            action="keep_productive",
+            selected_torrent={"hash": "abc123", "name": "Example.S01E01"},
+            candidate_counts={"available": 4, "productive": 1},
+            rejected_counts={"cooldown": 2},
+        )
+        self.guard.QUEUE_STATUS.record(
+            "qbt_guard_decision",
+            source="summary",
+            action="keep_productive",
+            message="Keeping active: Example.S01E01",
+            selected="Example.S01E01",
+        )
+
+        snapshot = self.guard.QUEUE_STATUS.snapshot()
+        self.assertEqual({"available": 4, "productive": 1}, snapshot["last_event"]["candidate_counts"])
+        self.assertEqual({"cooldown": 2}, snapshot["last_event"]["rejected_counts"])
+        metrics = self.guard.QUEUE_STATUS.prometheus_metrics()
+        self.assertIn('qbt_guard_candidate_count{type="available"} 4.0', metrics)
+        self.assertIn('qbt_guard_rejected_count{reason="cooldown"} 2.0', metrics)
+
 
 if __name__ == "__main__":
     unittest.main()
