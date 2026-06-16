@@ -4048,16 +4048,24 @@ def cleanup_qbt_clients(clients):
             log_warning(f"Failed to list qBittorrent torrents for stale maintenance: {exc}")
             torrents = []
         if torrents:
-            sonarr_queue = SonarrQueueMetadata()
-            radarr_queue = RadarrQueueMetadata()
             delete_files = env_bool("QBT_DELETE_FILES", True)
-            cleanup_arr_managed_completed_torrents(
-                client,
-                torrents,
-                sonarr_queue,
-                radarr_queue,
-                delete_files,
-            )
+            completed_torrents = [
+                torrent for torrent in torrents
+                if torrent_hash(torrent) and is_completed_torrent(torrent)
+            ]
+            if completed_torrents and (
+                env_bool("QBT_STALE_TORRENT_REMOVE_IMPORTED_COMPLETED", True)
+                or env_bool("QBT_STALE_TORRENT_FAIL_PERMANENT_IMPORT_FAILURES", True)
+            ):
+                sonarr_queue = SonarrQueueMetadata()
+                radarr_queue = RadarrQueueMetadata()
+                cleanup_arr_managed_completed_torrents(
+                    client,
+                    completed_torrents,
+                    sonarr_queue,
+                    radarr_queue,
+                    delete_files,
+                )
             maintain_stale_stalled_torrents(
                 client,
                 torrents,
