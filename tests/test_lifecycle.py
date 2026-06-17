@@ -110,6 +110,28 @@ class TorrentLifecycleTests(unittest.TestCase):
         self.assertFalse(lifecycle.selectable)
         self.assertFalse(lifecycle.retryable)
 
+    def test_smart_queue_slot_plan_separates_workers_from_listeners(self):
+        plan = self.guard.smart_queue_slot_plan(worker_slots=2, parked_listener_slots=3)
+
+        self.assertEqual(2, plan.worker_slots)
+        self.assertEqual(3, plan.parked_listener_slots)
+        self.assertEqual(5, plan.qbt_active_download_limit)
+        self.assertEqual(
+            {
+                "smart_queue_worker_slots": 2,
+                "smart_queue_parked_listener_slots": 3,
+                "qbt_active_download_limit": 5,
+            },
+            plan.as_counts(),
+        )
+
+    def test_empty_slot_plan_keeps_qbt_limit_valid(self):
+        plan = self.guard.smart_queue_slot_plan(worker_slots=0, parked_listener_slots=0)
+
+        self.assertEqual(0, plan.worker_slots)
+        self.assertEqual(0, plan.parked_listener_slots)
+        self.assertEqual(1, plan.qbt_active_download_limit)
+
 
 if __name__ == "__main__":
     unittest.main()

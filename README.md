@@ -236,7 +236,11 @@ By default, normal single-download mode now parks stalled/no-progress torrents
 instead of pausing and cooldown-tagging them. Parked torrents stay active in
 qBittorrent so they can resume immediately if a needed peer appears, while the
 controller excludes them from replacement selection and raises qBittorrent's
-active download limit enough to start another candidate beside them.
+active download limit enough to start another candidate beside them. The
+controller tracks qBittorrent active slots separately from Smart Queue worker
+slots: `qB active download limit = useful worker slots + parked listener
+slots`. Parked listeners stay active for peer discovery but do not consume the
+limited useful download worker slots.
 Internally the selector classifies every torrent into a lifecycle state:
 `candidate`, `selected-worker`, `productive`, `parked-listener`, `cooldown`,
 `retryable`, or `stale`. Worker states consume a useful download slot;
@@ -262,7 +266,9 @@ tracks no-progress samples for each recovery member. After
 stalled member is parked: it stays active in qBittorrent so it can resume if
 seeders appear, but it no longer consumes one of the active recovery worker
 slots. The controller then refills open worker slots with other fitting
-torrents while accounting for parked torrents in the storage headroom budget.
+torrents while accounting for parked torrents in the storage headroom budget and
+adding parked listeners on top of the recovery worker-slot limit in
+qBittorrent's active download limit.
 At most `QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_PARKED_STALLED` stalled torrents are
 parked, defaulting to `10`; set it to `0` for no parked-stalled count cap.
 Recovery workers also need to meet

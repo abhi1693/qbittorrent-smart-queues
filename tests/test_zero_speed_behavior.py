@@ -359,6 +359,9 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
 
         self.assertEqual("next", try_event["selected_torrent"]["hash"])
         self.assertEqual(1, try_event["candidate_counts"]["parked_stalled"])
+        self.assertEqual(1, try_event["candidate_counts"]["smart_queue_worker_slots"])
+        self.assertEqual(1, try_event["candidate_counts"]["smart_queue_parked_listener_slots"])
+        self.assertEqual(2, try_event["candidate_counts"]["qbt_active_download_limit"])
         self.assertIn(["next"], client.started)
         self.assertFalse(any("stalled" in hashes for hashes in client.stopped))
         self.assertIn((2, None), client.queue_limits)
@@ -608,6 +611,9 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             item["hash"] for item in try_event["selected_torrents"]
         ])
         self.assertTrue(try_event["candidate_counts"]["storage_constrained"])
+        self.assertEqual(5, try_event["candidate_counts"]["smart_queue_worker_slots"])
+        self.assertEqual(0, try_event["candidate_counts"]["smart_queue_parked_listener_slots"])
+        self.assertEqual(5, try_event["candidate_counts"]["qbt_active_download_limit"])
         self.assertEqual(0, try_event["rejected_counts"].get("deferred_by_storage_recovery_batch", 0))
 
     def test_storage_constrained_mode_ignores_legacy_quota_cooldown_tags(self):
@@ -844,6 +850,9 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             item["hash"] for item in recovery_event["selected_torrents"][:6]
         ])
         self.assertEqual("small-6", recovery_event["selected_torrents"][6]["hash"])
+        self.assertEqual(5, recovery_event["candidate_counts"]["smart_queue_worker_slots"])
+        self.assertEqual(6, recovery_event["candidate_counts"]["smart_queue_parked_listener_slots"])
+        self.assertEqual(11, recovery_event["candidate_counts"]["qbt_active_download_limit"])
         self.assertFalse(
             any(
                 stopped_hash in {"small-0", "small-1", "small-2", "small-3", "small-4", "small-5"}
@@ -851,7 +860,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 for stopped_hash in stop_call
             )
         )
-        self.assertIn((7, None), client.queue_limits)
+        self.assertIn((11, None), client.queue_limits)
 
     def test_storage_constrained_mode_replaces_too_slow_recovery_worker(self):
         class SlowStartFakeQbtClient(FakeQbtClient):

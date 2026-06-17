@@ -128,6 +128,45 @@ class TorrentLifecycle:
 
 
 @dataclass(frozen=True)
+class SmartQueueSlotPlan:
+    worker_slots: int
+    parked_listener_slots: int = 0
+
+    @property
+    def qbt_active_download_limit(self):
+        return max(1, self.worker_slots + self.parked_listener_slots)
+
+    def as_counts(self):
+        return {
+            "smart_queue_worker_slots": self.worker_slots,
+            "smart_queue_parked_listener_slots": self.parked_listener_slots,
+            "qbt_active_download_limit": self.qbt_active_download_limit,
+        }
+
+
+def smart_queue_slot_plan(worker_slots, parked_listener_slots=0):
+    return SmartQueueSlotPlan(
+        worker_slots=max(0, int(worker_slots or 0)),
+        parked_listener_slots=max(0, int(parked_listener_slots or 0)),
+    )
+
+
+def set_active_queue_limit_for_slots(client, active_queue_limit, slot_plan):
+    desired_queue_limit = slot_plan.qbt_active_download_limit
+    if active_queue_limit == desired_queue_limit:
+        return active_queue_limit
+    try:
+        client.set_active_queue_limits(desired_queue_limit)
+        return desired_queue_limit
+    except (AttributeError, ApiError) as exc:
+        log_warning(
+            f"Failed to set qBittorrent active queue limit to "
+            f"{desired_queue_limit}: {exc}",
+        )
+        return active_queue_limit
+
+
+@dataclass(frozen=True)
 class CandidateScore:
     strategy: str
     total: float
@@ -6711,9 +6750,6 @@ def apply_single_download(
         else normal_max_active_downloads
     )
 
-    def normal_desired_queue_limit(worker_count, parked_count=0):
-        return max(1, int(worker_count) + int(parked_count))
-
     park_stalled_downloads_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED", True)
     park_stalled_samples = max(
         1,
@@ -6883,18 +6919,15 @@ def apply_single_download(
                 storage_state = None
             storage_constrained_mode = storage_state_is_reserve_constrained(storage_guard, storage_state)
             if storage_constrained_mode:
-                desired_queue_limit = None
+                initial_slot_plan = None
             else:
-                desired_queue_limit = normal_desired_queue_limit(normal_worker_limit)
-            if desired_queue_limit is not None and active_queue_limit != desired_queue_limit:
-                try:
-                    client.set_active_queue_limits(desired_queue_limit)
-                    active_queue_limit = desired_queue_limit
-                except (AttributeError, ApiError) as exc:
-                    log_warning(
-                        f"Failed to set qBittorrent active queue limit to "
-                        f"{desired_queue_limit}: {exc}",
-                    )
+                initial_slot_plan = smart_queue_slot_plan(normal_worker_limit, 0)
+            if initial_slot_plan is not None:
+                active_queue_limit = set_active_queue_limit_for_slots(
+                    client,
+                    active_queue_limit,
+                    initial_slot_plan,
+                )
 
             rejected_counts = Counter()
             eligible_torrents = []
@@ -7160,6 +7193,16 @@ def apply_single_download(
                         rejected_counts["not_productive"] += 1
                     continue
                 productive_candidates.append(torrent)
+            if storage_constrained_mode:
+                slot_plan = smart_queue_slot_plan(
+                    storage_recovery_max_active if selection_candidates else 0,
+                    len(storage_recovery_parked_hashes),
+                )
+            else:
+                slot_plan = smart_queue_slot_plan(
+                    normal_worker_limit if selection_candidates or productive_candidates else 0,
+                    len(normal_parked_stalled_hashes),
+                )
             candidate_counts = {
                 "total": len(torrents),
                 "eligible": len(all_candidates),
@@ -7186,6 +7229,7 @@ def apply_single_download(
                 "parked_stalled_samples": park_stalled_samples,
                 "parked_stalled_max": max_parked_stalled_downloads,
             }
+            candidate_counts.update(slot_plan.as_counts())
             lifecycle_park_samples = (
                 storage_recovery_stall_samples
                 if storage_constrained_mode
@@ -7211,16 +7255,11 @@ def apply_single_download(
                     torrent_hash(torrent) for torrent in normal_parked_stalled_torrents
                     if torrent_hash(torrent)
                 ]
-                desired_queue_limit = normal_desired_queue_limit(0, len(parked_hashes))
-                if active_queue_limit != desired_queue_limit:
-                    try:
-                        client.set_active_queue_limits(desired_queue_limit)
-                        active_queue_limit = desired_queue_limit
-                    except (AttributeError, ApiError) as exc:
-                        log_warning(
-                            f"Failed to set qBittorrent active queue limit to "
-                            f"{desired_queue_limit}: {exc}",
-                        )
+                active_queue_limit = set_active_queue_limit_for_slots(
+                    client,
+                    active_queue_limit,
+                    smart_queue_slot_plan(0, len(parked_hashes)),
+                )
                 client.stop_hashes([
                     torrent_hash(torrent) for torrent in torrents
                     if torrent_hash(torrent) and torrent_hash(torrent) not in set(parked_hashes)
@@ -7251,35 +7290,22 @@ def apply_single_download(
                 and normal_parked_stalled_torrents
                 and selection_candidates
             ):
-                desired_queue_limit = normal_desired_queue_limit(
-                    normal_worker_limit,
-                    len(normal_parked_stalled_hashes),
+                active_queue_limit = set_active_queue_limit_for_slots(
+                    client,
+                    active_queue_limit,
+                    slot_plan,
                 )
-                if active_queue_limit != desired_queue_limit:
-                    try:
-                        client.set_active_queue_limits(desired_queue_limit)
-                        active_queue_limit = desired_queue_limit
-                    except (AttributeError, ApiError) as exc:
-                        log_warning(
-                            f"Failed to set qBittorrent active queue limit to "
-                            f"{desired_queue_limit}: {exc}",
-                        )
 
             if storage_constrained_mode and storage_recovery_parked_torrents and not selection_candidates:
                 parked_hashes = [
                     torrent_hash(torrent) for torrent in storage_recovery_parked_torrents
                     if torrent_hash(torrent)
                 ]
-                desired_queue_limit = max(1, len(parked_hashes))
-                if active_queue_limit != desired_queue_limit:
-                    try:
-                        client.set_active_queue_limits(desired_queue_limit)
-                        active_queue_limit = desired_queue_limit
-                    except (AttributeError, ApiError) as exc:
-                        log_warning(
-                            f"Failed to set qBittorrent active queue limit to "
-                            f"{desired_queue_limit}: {exc}",
-                        )
+                active_queue_limit = set_active_queue_limit_for_slots(
+                    client,
+                    active_queue_limit,
+                    smart_queue_slot_plan(0, len(parked_hashes)),
+                )
                 client.stop_hashes([
                     torrent_hash(torrent) for torrent in torrents
                     if torrent_hash(torrent) and torrent_hash(torrent) not in set(parked_hashes)
@@ -7312,22 +7338,11 @@ def apply_single_download(
                 ]
                 selected_hash_set = set(selected_hashes)
                 protected_hashes = selected_hash_set | storage_recovery_parked_hashes
-                desired_queue_limit = max(1, len(protected_hashes))
-                desired_queue_limit = max(storage_recovery_max_active, desired_queue_limit)
-                if storage_recovery_max_parked_stalled > 0:
-                    desired_queue_limit = min(
-                        storage_recovery_max_active + storage_recovery_max_parked_stalled,
-                        desired_queue_limit,
-                    )
-                if active_queue_limit != desired_queue_limit:
-                    try:
-                        client.set_active_queue_limits(desired_queue_limit)
-                        active_queue_limit = desired_queue_limit
-                    except (AttributeError, ApiError) as exc:
-                        log_warning(
-                            f"Failed to set qBittorrent active queue limit to "
-                            f"{desired_queue_limit}: {exc}",
-                        )
+                active_queue_limit = set_active_queue_limit_for_slots(
+                    client,
+                    active_queue_limit,
+                    slot_plan,
+                )
                 for torrent in selection_candidates:
                     health_store.record_attempt(torrent, now)
                 attempt += 1
@@ -7375,7 +7390,7 @@ def apply_single_download(
                     f"with {human_size(storage_recovery_selected_remaining_bytes)} selected bytes left "
                     f"inside {human_size(storage_fit_headroom_bytes(storage_guard, storage_state))} "
                     f"currently free; {len(storage_recovery_parked_torrents)} stalled torrent(s) parked; "
-                    f"qB active download limit {desired_queue_limit}",
+                    f"qB active download limit {slot_plan.qbt_active_download_limit}",
                     selected=", ".join(torrent_name(torrent) for torrent in selection_candidates[:5]),
                     attempt=attempt,
                     attempt_limit=max_attempts,
@@ -7788,19 +7803,15 @@ def apply_single_download(
                         normal_parked_stalled_hashes.add(item_hash)
                         normal_parked_stalled_torrents.append(torrent)
                         health_store.record_storage_recovery_no_progress(torrent, now)
-                desired_queue_limit = normal_desired_queue_limit(
+                slot_plan = smart_queue_slot_plan(
                     normal_worker_limit,
                     len(normal_parked_stalled_hashes),
                 )
-                if active_queue_limit != desired_queue_limit:
-                    try:
-                        client.set_active_queue_limits(desired_queue_limit)
-                        active_queue_limit = desired_queue_limit
-                    except (AttributeError, ApiError) as exc:
-                        log_warning(
-                            f"Failed to set qBittorrent active queue limit to "
-                            f"{desired_queue_limit}: {exc}",
-                        )
+                active_queue_limit = set_active_queue_limit_for_slots(
+                    client,
+                    active_queue_limit,
+                    slot_plan,
+                )
                 client.stop_hashes([
                     torrent_hash(torrent) for torrent in torrents
                     if torrent_hash(torrent) and torrent_hash(torrent) not in normal_parked_stalled_hashes
@@ -7814,6 +7825,7 @@ def apply_single_download(
                     candidate_counts={
                         **candidate_counts,
                         "parked_stalled": len(normal_parked_stalled_torrents),
+                        **slot_plan.as_counts(),
                     },
                     selected_torrent=None,
                     selected_torrents=[
