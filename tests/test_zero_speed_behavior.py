@@ -118,7 +118,14 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
 
                 self.assertFalse(self.guard.is_productive_torrent(torrent))
 
-        self.assertTrue(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 1}))
+        self.assertTrue(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 65_536}))
+
+    def test_productive_torrents_must_meet_slow_rate_floor(self):
+        env = {"QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC": "65536"}
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            self.assertFalse(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 1024}))
+            self.assertTrue(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 65_536}))
 
     def test_progress_reason_requires_left_delta_speed_or_downloaded_delta(self):
         before = {"amount_left": 1000, "downloaded": 100, "dlspeed": 0}

@@ -5107,10 +5107,14 @@ def is_running_torrent(torrent):
     }
 
 
+def single_download_slow_min_rate_bytes():
+    return max(1, env_int("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC", 65_536))
+
+
 def is_productive_torrent(torrent):
     if is_stopped_torrent(torrent) or is_stalled_torrent(torrent):
         return False
-    return torrent_download_speed(torrent) > 0
+    return torrent_download_speed(torrent) >= single_download_slow_min_rate_bytes()
 
 
 def should_park_stalled_torrent(torrent, health_store, required_no_progress_samples):
@@ -5765,15 +5769,29 @@ def candidate_sort_key(
         score = candidate_balanced_score(torrent, health_store, now)
     else:
         score = health_store.score(torrent, now)
+    queue_key = media_queue_order_key(
+        torrent,
+        tv_order_categories,
+        tv_order_state,
+        movie_order_categories,
+        movie_order_state,
+    )
+    if strategy == "balanced":
+        return (
+            0 if is_priority else 1,
+            -score,
+            candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
+            -min(torrent_availability(torrent), 100.0),
+            -reported_sources,
+            -torrent_connected_seeds(torrent),
+            -torrent_progress(torrent),
+            torrent_amount_left(torrent),
+            queue_key,
+            torrent_name(torrent).lower(),
+        )
     return (
         0 if is_priority else 1,
-        media_queue_order_key(
-            torrent,
-            tv_order_categories,
-            tv_order_state,
-            movie_order_categories,
-            movie_order_state,
-        ),
+        queue_key,
         -score,
         candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
         -min(torrent_availability(torrent), 100.0),
@@ -6319,7 +6337,7 @@ def apply_single_download(
         0,
         env_int("QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED", 0),
     )
-    slow_min_rate_bytes = env_int("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC", 65_536)
+    slow_min_rate_bytes = single_download_slow_min_rate_bytes()
     storage_recovery_min_rate_bytes = max(
         0,
         env_int("QBT_DOWNLOAD_STORAGE_RECOVERY_MIN_RATE_BYTES_PER_SEC", slow_min_rate_bytes),

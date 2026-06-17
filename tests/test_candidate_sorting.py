@@ -88,6 +88,25 @@ class CandidateSortingTests(unittest.TestCase):
             ),
         )
 
+    def sort_balanced_with_movie_queue(self, torrents, health_store, movie_state):
+        return sorted(
+            torrents,
+            key=lambda torrent: self.guard.candidate_sort_key(
+                torrent,
+                set(),
+                set(),
+                set(),
+                {},
+                {"movies"},
+                movie_state,
+                3,
+                1.05,
+                health_store,
+                self.now,
+                "balanced",
+            ),
+        )
+
     def test_priority_tag_sorts_before_healthier_nonpriority_candidate(self):
         priority = self.torrent(
             "priority",
@@ -287,6 +306,33 @@ class CandidateSortingTests(unittest.TestCase):
         ordered = self.sort_with_movie_queue([healthier_later, first_in_radarr], store, movie_state)
 
         self.assertEqual(["first", "later"], [item["hash"] for item in ordered])
+
+    def test_balanced_strategy_uses_health_before_movie_queue_position(self):
+        first_in_radarr = self.torrent("first", progress=0.05, amount_left=90 * 1024 * 1024 * 1024)
+        healthier_later = self.torrent("later", progress=0.75, amount_left=2 * 1024 * 1024 * 1024)
+        movie_state = {
+            "orders": {
+                "first": {
+                    "title": "first movie",
+                    "movie_id": 1,
+                    "year": 2026,
+                    "queue_position": 0,
+                    "source": "radarr",
+                },
+                "later": {
+                    "title": "later movie",
+                    "movie_id": 2,
+                    "year": 2026,
+                    "queue_position": 5,
+                    "source": "radarr",
+                },
+            }
+        }
+        store = FakeHealthStore({"first": -25.0, "later": 100.0})
+
+        ordered = self.sort_balanced_with_movie_queue([healthier_later, first_in_radarr], store, movie_state)
+
+        self.assertEqual(["later", "first"], [item["hash"] for item in ordered])
 
 
 if __name__ == "__main__":

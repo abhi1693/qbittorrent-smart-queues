@@ -126,6 +126,7 @@ Optional single-download selection tuning:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QBT_SINGLE_DOWNLOAD_SELECTION_STRATEGY` | `tiered` | Use `balanced` to score candidates with extra weight for near-complete torrents, smaller remaining downloads, shorter ETA, current seeds, and availability. |
+| `QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC` | `65536` | Minimum active download speed treated as productive in normal selection and used as the default recovery slow-torrent floor. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED` | `false` | Allow a productive active torrent to yield when a stopped candidate has a much better balanced score. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum balanced-score advantage required before preempting a productive torrent. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
