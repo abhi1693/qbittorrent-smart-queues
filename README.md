@@ -237,6 +237,11 @@ instead of pausing and cooldown-tagging them. Parked torrents stay active in
 qBittorrent so they can resume immediately if a needed peer appears, while the
 controller excludes them from replacement selection and raises qBittorrent's
 active download limit enough to start another candidate beside them.
+Internally the selector classifies every torrent into a lifecycle state:
+`candidate`, `selected-worker`, `productive`, `parked-listener`, `cooldown`,
+`retryable`, or `stale`. Worker states consume a useful download slot;
+parked-listener states keep qBittorrent listening for peers without consuming a
+worker slot.
 
 When download storage is at or below the configured reserve and torrent-fit
 checks are enabled, the controller enters a constrained recovery mode instead of

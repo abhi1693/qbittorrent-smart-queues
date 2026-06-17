@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookiejar import CookieJar
@@ -97,6 +98,33 @@ STALL_COOLDOWN_REASONS = {
     STALL_COOLDOWN_REASON_IMPORT_FAILED,
     STALL_COOLDOWN_REASON_MANUAL_HOLD,
 }
+TORRENT_LIFECYCLE_CANDIDATE = "candidate"
+TORRENT_LIFECYCLE_SELECTED_WORKER = "selected-worker"
+TORRENT_LIFECYCLE_PRODUCTIVE = "productive"
+TORRENT_LIFECYCLE_PARKED_LISTENER = "parked-listener"
+TORRENT_LIFECYCLE_COOLDOWN = "cooldown"
+TORRENT_LIFECYCLE_RETRYABLE = "retryable"
+TORRENT_LIFECYCLE_STALE = "stale"
+
+
+@dataclass(frozen=True)
+class TorrentLifecycle:
+    state: str
+    reason: str = ""
+    worker_slot: bool = False
+    listener_slot: bool = False
+    selectable: bool = True
+    retryable: bool = True
+
+    def labels(self):
+        return {
+            "state": self.state,
+            "reason": self.reason,
+            "worker_slot": self.worker_slot,
+            "listener_slot": self.listener_slot,
+            "selectable": self.selectable,
+            "retryable": self.retryable,
+        }
 
 
 def prometheus_label(value):
@@ -5111,21 +5139,132 @@ def single_download_slow_min_rate_bytes():
     return max(1, env_int("QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC", 65_536))
 
 
-def is_productive_torrent(torrent):
+def is_productive_download(torrent):
     if is_stopped_torrent(torrent) or is_stalled_torrent(torrent):
         return False
     return torrent_download_speed(torrent) >= single_download_slow_min_rate_bytes()
 
 
-def should_park_stalled_torrent(torrent, health_store, required_no_progress_samples):
-    if not is_running_torrent(torrent) or is_productive_torrent(torrent):
-        return False
+def parked_listener_reason(torrent, health_store, required_no_progress_samples):
+    if not is_running_torrent(torrent) or is_productive_download(torrent):
+        return ""
     if is_stalled_torrent(torrent):
-        return True
-    return (
-        health_store.storage_recovery_no_progress_samples(torrent)
+        return "qBittorrent reports stalled download"
+    if (
+        health_store
+        and health_store.storage_recovery_no_progress_samples(torrent)
         >= max(1, int(required_no_progress_samples))
-    )
+    ):
+        return "required no-progress samples reached"
+    return ""
+
+
+def torrent_lifecycle(
+    torrent,
+    health_store=None,
+    now=None,
+    *,
+    active_cooldown_tags=None,
+    active_cooldown_prefix="",
+    selected_hashes=None,
+    parked_hashes=None,
+    required_park_samples=1,
+    stale_after_seconds=0,
+):
+    item_hash = torrent_hash(torrent)
+    active_cooldown_tags = active_cooldown_tags or []
+    if active_cooldown_tags:
+        cooldown_reason = (
+            stall_cooldown_reason_label(active_cooldown_tags, active_cooldown_prefix)
+            if active_cooldown_prefix
+            else "active cooldown"
+        )
+        return TorrentLifecycle(
+            TORRENT_LIFECYCLE_COOLDOWN,
+            reason=cooldown_reason,
+            listener_slot=is_running_torrent(torrent),
+            selectable=False,
+            retryable=False,
+        )
+
+    if (
+        health_store
+        and now is not None
+        and stale_after_seconds > 0
+        and health_store.stale_stalled_age_seconds(torrent, now) >= stale_after_seconds
+    ):
+        return TorrentLifecycle(
+            TORRENT_LIFECYCLE_STALE,
+            reason=f"stalled for at least {human_duration(stale_after_seconds)}",
+            listener_slot=is_running_torrent(torrent),
+            selectable=False,
+            retryable=False,
+        )
+
+    selected_hashes = set(selected_hashes or [])
+    parked_hashes = set(parked_hashes or [])
+    if is_productive_download(torrent):
+        return TorrentLifecycle(
+            TORRENT_LIFECYCLE_PRODUCTIVE,
+            reason="download speed meets productive floor",
+            worker_slot=True,
+            selectable=False,
+            retryable=False,
+        )
+
+    parked_reason = ""
+    if item_hash and item_hash in parked_hashes:
+        parked_reason = "explicitly parked as listener"
+    else:
+        parked_reason = parked_listener_reason(torrent, health_store, required_park_samples)
+    if parked_reason:
+        return TorrentLifecycle(
+            TORRENT_LIFECYCLE_PARKED_LISTENER,
+            reason=parked_reason,
+            listener_slot=True,
+            selectable=False,
+            retryable=False,
+        )
+
+    if (item_hash and item_hash in selected_hashes) or is_running_torrent(torrent):
+        return TorrentLifecycle(
+            TORRENT_LIFECYCLE_SELECTED_WORKER,
+            reason="active worker awaiting progress sample",
+            worker_slot=True,
+            selectable=False,
+            retryable=False,
+        )
+
+    if health_store and item_hash:
+        entry = health_store.entry(item_hash)
+        failed_attempts = 0
+        if entry:
+            try:
+                failed_attempts = int(entry.get("failed_attempts") or 0)
+            except (TypeError, ValueError):
+                failed_attempts = 0
+        if failed_attempts > 0:
+            return TorrentLifecycle(
+                TORRENT_LIFECYCLE_RETRYABLE,
+                reason="previous failure is no longer cooling down",
+            )
+
+    return TorrentLifecycle(TORRENT_LIFECYCLE_CANDIDATE)
+
+
+def is_productive_torrent(torrent):
+    return torrent_lifecycle(torrent).state == TORRENT_LIFECYCLE_PRODUCTIVE
+
+
+def should_park_stalled_torrent(torrent, health_store, required_no_progress_samples):
+    return bool(parked_listener_reason(torrent, health_store, required_no_progress_samples))
+
+
+def lifecycle_counts(torrents, health_store, now, **kwargs):
+    counts = Counter()
+    for torrent in torrents:
+        counts[torrent_lifecycle(torrent, health_store, now, **kwargs).state] += 1
+    return {f"lifecycle_{key.replace('-', '_')}": value for key, value in sorted(counts.items())}
 
 
 def torrent_progress_reason(before, after, min_download_delta_bytes):
@@ -6660,7 +6799,15 @@ def apply_single_download(
                     if not is_running_torrent(torrent):
                         storage_recovery_slow_excluded_hashes.add(item_hash)
                         continue
-                    if is_productive_torrent(torrent):
+                    if (
+                        torrent_lifecycle(
+                            torrent,
+                            health_store,
+                            now,
+                            required_park_samples=storage_recovery_stall_samples,
+                        ).state
+                        == TORRENT_LIFECYCLE_PRODUCTIVE
+                    ):
                         continue
                     remaining_bytes = storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state)
                     if remaining_bytes is None:
@@ -6703,7 +6850,15 @@ def apply_single_download(
                         item_hash = torrent_hash(torrent)
                         if not item_hash:
                             continue
-                        if not should_park_stalled_torrent(torrent, health_store, park_stalled_samples):
+                        if (
+                            torrent_lifecycle(
+                                torrent,
+                                health_store,
+                                now,
+                                required_park_samples=park_stalled_samples,
+                            ).state
+                            != TORRENT_LIFECYCLE_PARKED_LISTENER
+                        ):
                             continue
                         if (
                             max_parked_stalled_downloads > 0
@@ -6729,7 +6884,13 @@ def apply_single_download(
 
             productive_candidates = []
             for torrent in selection_candidates:
-                if not is_productive_torrent(torrent):
+                lifecycle = torrent_lifecycle(
+                    torrent,
+                    health_store,
+                    now,
+                    required_park_samples=park_stalled_samples,
+                )
+                if lifecycle.state != TORRENT_LIFECYCLE_PRODUCTIVE:
                     if is_running_torrent(torrent) and torrent_download_speed(torrent) <= 0:
                         rejected_counts["not_productive_zero_speed"] += 1
                     else:
@@ -6762,6 +6923,21 @@ def apply_single_download(
                 "parked_stalled_samples": park_stalled_samples,
                 "parked_stalled_max": max_parked_stalled_downloads,
             }
+            lifecycle_park_samples = (
+                storage_recovery_stall_samples
+                if storage_constrained_mode
+                else park_stalled_samples
+            )
+            candidate_counts.update(
+                lifecycle_counts(
+                    available_candidates,
+                    health_store,
+                    now,
+                    required_park_samples=lifecycle_park_samples,
+                )
+            )
+            if cooldown_count:
+                candidate_counts["lifecycle_cooldown"] = cooldown_count
 
             if (
                 not storage_constrained_mode
