@@ -3380,6 +3380,17 @@ def torrent_connected_seeds(torrent):
     return torrent_int(torrent, "num_seeds")
 
 
+def torrent_connected_peers(torrent):
+    return max(
+        torrent_int(torrent, "num_leechs"),
+        torrent_int(torrent, "num_peers"),
+    )
+
+
+def torrent_has_connected_peers(torrent):
+    return torrent_connected_seeds(torrent) > 0 or torrent_connected_peers(torrent) > 0
+
+
 def torrent_reported_seeds(torrent):
     return torrent_int(torrent, "num_complete")
 
@@ -3487,6 +3498,7 @@ def torrent_decision_summary(torrent, score=None):
         "download_speed_bytes_per_sec": torrent_download_speed(torrent),
         "eta_seconds": torrent_eta_seconds(torrent),
         "connected_seeds": torrent_connected_seeds(torrent),
+        "connected_peers": torrent_connected_peers(torrent),
         "reported_seeds": torrent_reported_seeds(torrent),
         "availability": torrent_availability(torrent),
         "tags": sorted(torrent_tags(torrent)),
@@ -5222,8 +5234,15 @@ def is_productive_download(torrent):
     return torrent_download_speed(torrent) >= single_download_slow_min_rate_bytes()
 
 
-def parked_listener_reason(torrent, health_store, required_no_progress_samples):
+def parked_listener_reason(torrent, health_store, required_no_progress_samples, now=None):
     if not is_running_torrent(torrent) or is_productive_download(torrent):
+        return ""
+    if (
+        health_store
+        and now is not None
+        and hasattr(health_store, "active_selection_lease_reason")
+        and health_store.active_selection_lease_reason(torrent, now)
+    ):
         return ""
     if is_stalled_torrent(torrent):
         return "qBittorrent reports stalled download"
@@ -5293,7 +5312,7 @@ def torrent_lifecycle(
     if item_hash and item_hash in parked_hashes:
         parked_reason = "explicitly parked as listener"
     else:
-        parked_reason = parked_listener_reason(torrent, health_store, required_park_samples)
+        parked_reason = parked_listener_reason(torrent, health_store, required_park_samples, now)
     if parked_reason:
         return TorrentLifecycle(
             TORRENT_LIFECYCLE_PARKED_LISTENER,
@@ -5682,6 +5701,17 @@ class TorrentHealthStore:
             1,
             env_int("QBT_SINGLE_DOWNLOAD_STALL_BACKOFF_DECAY_STEPS", 1),
         )
+        self.selection_lease_seconds = max(
+            0,
+            env_int("QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_SECONDS", 900),
+        )
+        self.selection_lease_peer_grace_seconds = max(
+            0,
+            env_int(
+                "QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_PEER_GRACE_SECONDS",
+                self.selection_lease_seconds,
+            ),
+        )
         self.data = {"version": 1, "torrents": {}}
         self.dirty = False
         if self.enabled:
@@ -5726,6 +5756,14 @@ class TorrentHealthStore:
         torrents = self.data.setdefault("torrents", {})
         return torrents.setdefault(item_hash, {})
 
+    def update_peer_observation(self, entry, torrent, now):
+        connected_seeds = torrent_connected_seeds(torrent)
+        connected_peers = torrent_connected_peers(torrent)
+        entry["last_connected_seeds"] = connected_seeds
+        entry["last_connected_peers"] = connected_peers
+        if connected_seeds > 0 or connected_peers > 0:
+            entry["last_connected_peer_at"] = format_utc(now)
+
     def observe_torrents(self, torrents, now):
         if not self.enabled:
             return
@@ -5744,7 +5782,7 @@ class TorrentHealthStore:
             entry["last_speed_bytes_per_sec"] = torrent_download_speed(torrent)
             entry["last_amount_left_bytes"] = torrent_amount_left(torrent)
             entry["last_progress"] = torrent_progress(torrent)
-            entry["last_connected_seeds"] = torrent_connected_seeds(torrent)
+            self.update_peer_observation(entry, torrent, now)
             entry["last_reported_seeds"] = torrent_reported_seeds(torrent)
             entry["last_availability"] = torrent_availability(torrent)
             entry["predicted_completion_seconds"] = self.predicted_completion_seconds(torrent, entry)
@@ -5862,8 +5900,54 @@ class TorrentHealthStore:
         entry["category"] = torrent_category(torrent)
         entry["last_attempt_at"] = format_utc(now)
         entry["attempts"] = int(entry.get("attempts") or 0) + 1
+        if self.selection_lease_seconds > 0:
+            entry["selected_lease_started_at"] = format_utc(now)
+            entry["selected_lease_expires_at"] = format_utc(
+                now + timedelta(seconds=self.selection_lease_seconds),
+            )
+        else:
+            entry["selected_lease_started_at"] = ""
+            entry["selected_lease_expires_at"] = ""
         self.dirty = True
         self.save()
+
+    def active_selection_lease_reason(self, torrent, now):
+        if not self.enabled or self.selection_lease_seconds <= 0 or not is_running_torrent(torrent):
+            return ""
+
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return ""
+
+        lease_expires_at = parse_utc(entry.get("selected_lease_expires_at"))
+        if lease_expires_at is None or now >= lease_expires_at:
+            return ""
+
+        if is_productive_download(torrent):
+            return "selection lease active and torrent is productive"
+
+        last_productive_at = parse_utc(entry.get("last_productive_at"))
+        if last_productive_at:
+            productive_age_seconds = max(0, int((now - last_productive_at).total_seconds()))
+            if productive_age_seconds <= self.selection_lease_seconds:
+                return (
+                    "selection lease active and torrent made progress "
+                    f"{human_duration(productive_age_seconds)} ago"
+                )
+
+        if torrent_has_connected_peers(torrent):
+            return "selection lease active and peers are currently connected"
+
+        last_connected_peer_at = parse_utc(entry.get("last_connected_peer_at"))
+        if last_connected_peer_at:
+            peer_age_seconds = max(0, int((now - last_connected_peer_at).total_seconds()))
+            if peer_age_seconds <= self.selection_lease_peer_grace_seconds:
+                return (
+                    "selection lease active and peers were connected "
+                    f"{human_duration(peer_age_seconds)} ago"
+                )
+
+        return ""
 
     def record_productive(self, before, after, now, sample_seconds):
         entry = self.entry(torrent_hash(after) or torrent_hash(before))
@@ -5896,7 +5980,7 @@ class TorrentHealthStore:
         entry["storage_recovery_last_no_progress_at"] = ""
         entry["last_amount_left_bytes"] = torrent_amount_left(after)
         entry["last_speed_bytes_per_sec"] = torrent_download_speed(after)
-        entry["last_connected_seeds"] = torrent_connected_seeds(after)
+        self.update_peer_observation(entry, after, now)
         entry["last_reported_seeds"] = torrent_reported_seeds(after)
         entry["last_availability"] = torrent_availability(after)
         entry["predicted_completion_seconds"] = self.predicted_completion_seconds(after, entry)
@@ -5924,7 +6008,7 @@ class TorrentHealthStore:
             entry["ewma_speed_bytes_per_sec"] = max(0, int(previous_speed * (1.0 - self.ewma_alpha)))
         entry["last_amount_left_bytes"] = torrent_amount_left(torrent)
         entry["last_speed_bytes_per_sec"] = torrent_download_speed(torrent)
-        entry["last_connected_seeds"] = torrent_connected_seeds(torrent)
+        self.update_peer_observation(entry, torrent, now)
         entry["last_reported_seeds"] = torrent_reported_seeds(torrent)
         entry["last_availability"] = torrent_availability(torrent)
         entry["predicted_completion_seconds"] = self.predicted_completion_seconds(torrent, entry)
@@ -5988,7 +6072,7 @@ class TorrentHealthStore:
         entry["storage_recovery_last_no_progress_at"] = format_utc(now)
         entry["last_amount_left_bytes"] = torrent_amount_left(torrent)
         entry["last_speed_bytes_per_sec"] = torrent_download_speed(torrent)
-        entry["last_connected_seeds"] = torrent_connected_seeds(torrent)
+        self.update_peer_observation(entry, torrent, now)
         entry["last_reported_seeds"] = torrent_reported_seeds(torrent)
         entry["last_availability"] = torrent_availability(torrent)
         entry["predicted_completion_seconds"] = self.predicted_completion_seconds(torrent, entry)
@@ -7549,7 +7633,11 @@ def apply_single_download(
             ):
                 keep = productive_candidates[0]
                 challenger = selection_candidates[0]
-                if should_preempt_productive_torrent(
+                keep_lease_reason = health_store.active_selection_lease_reason(keep, now)
+                if keep_lease_reason:
+                    candidate_counts["selection_lease_active"] = 1
+                    candidate_counts["selection_lease_preempt_blocked"] = 1
+                elif should_preempt_productive_torrent(
                     keep,
                     challenger,
                     health_store,
@@ -7608,6 +7696,9 @@ def apply_single_download(
             if productive_candidates:
                 keep = productive_candidates[0]
                 keep_hash = torrent_hash(keep)
+                keep_lease_reason = health_store.active_selection_lease_reason(keep, now)
+                if keep_lease_reason:
+                    candidate_counts["selection_lease_active"] = 1
                 protected_hashes = {keep_hash} | normal_parked_stalled_hashes
                 stop_hashes = [
                     torrent_hash(torrent) for torrent in torrents
@@ -7627,6 +7718,7 @@ def apply_single_download(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="keep_productive",
+                    reason=keep_lease_reason or "active torrent is productive",
                     selected_torrent=scored_torrent_summary(keep),
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
@@ -7791,6 +7883,53 @@ def apply_single_download(
                     reason="did not make progress",
                 )
                 continue
+
+            leased_worker_candidates = []
+            if not storage_constrained_mode:
+                for torrent in selection_candidates:
+                    lease_reason = health_store.active_selection_lease_reason(torrent, now)
+                    if lease_reason:
+                        leased_worker_candidates.append((torrent, lease_reason))
+            if leased_worker_candidates:
+                keep, keep_lease_reason = leased_worker_candidates[0]
+                keep_hash = torrent_hash(keep)
+                protected_hashes = {keep_hash} | normal_parked_stalled_hashes
+                stop_hashes = [
+                    torrent_hash(torrent) for torrent in torrents
+                    if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
+                ]
+                client.stop_hashes(stop_hashes)
+                apply_tv_episode_file_priorities(
+                    client,
+                    keep,
+                    tv_order_categories,
+                    tv_file_priority_enabled,
+                    tv_file_priority_lookahead,
+                    tv_order_state.get("watch_priorities", {}).get(keep_hash),
+                )
+                client.top_priority([keep_hash])
+                candidate_counts["selection_lease_active"] = 1
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="keep_selection_lease",
+                    reason=keep_lease_reason,
+                    selected_torrent=scored_torrent_summary(keep),
+                    rejected_counts=dict(rejected_counts),
+                    candidate_counts=candidate_counts,
+                )
+                log_decision_info(
+                    "keep_selection_lease",
+                    f"Keeping selected torrent under lease: "
+                    f"{torrent_name(keep)} "
+                    f"({torrent_progress(keep) * 100:.2f}% complete, "
+                    f"{human_size(torrent_amount_left(keep))} left, "
+                    f"{human_rate(torrent_download_speed(keep))} down); "
+                    f"{keep_lease_reason}",
+                    selected=torrent_name(keep),
+                    reason=keep_lease_reason,
+                )
+                break
 
             stalled_candidates = [
                 torrent for torrent in selection_candidates

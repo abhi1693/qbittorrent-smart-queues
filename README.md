@@ -129,6 +129,8 @@ Optional single-download selection tuning:
 | `QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC` | `65536` | Minimum active download speed treated as productive in normal selection and used as the default recovery slow-torrent floor. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED` | `false` | Allow a productive active torrent to yield when a stopped candidate has a much better unified score. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum unified-score advantage required before preempting a productive torrent. |
+| `QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_SECONDS` | `900` | Minimum dwell lease granted when a torrent is selected. While the lease is active, a torrent that is productive or has current/recent connected peers is not preempted or replaced by a briefly higher-scoring candidate. Set to `0` to disable. |
+| `QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_PEER_GRACE_SECONDS` | lease seconds | How long recent connected peer contact keeps an active lease eligible after peers temporarily disappear. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES` | storage recovery stall samples | No-progress samples required before a non-productive running torrent is parked. qBittorrent `stalledDL`/`metaDL` torrents park immediately. |
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
@@ -254,6 +256,10 @@ health, progress, near-complete progress, remaining bytes, ETA, sources,
 availability, cooldown, storage fit, and storage remaining. In `tiered` mode the
 queue key still sorts before the score; in `balanced` mode the score is the
 primary ordering signal after explicit priority.
+Selected torrents also receive a dwell lease. During that lease, the controller
+keeps the torrent if it is still making productive progress or has current or
+recent connected peer contact, even when another candidate briefly scores
+higher. This prevents stop/requeue churn from dropping useful peer connections.
 
 When download storage is at or below the configured reserve and torrent-fit
 checks are enabled, the controller enters a constrained recovery mode instead of
