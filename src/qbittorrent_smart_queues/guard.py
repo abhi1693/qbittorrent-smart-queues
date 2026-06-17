@@ -221,6 +221,38 @@ class CandidateScore:
         return result
 
 
+def candidate_score_breakdown(score):
+    if score is None:
+        return None
+    score_dict = score.as_dict() if hasattr(score, "as_dict") else score
+    if not isinstance(score_dict, dict):
+        return score_dict
+    components = score_dict.get("components")
+    if not isinstance(components, dict):
+        components = {}
+    breakdown = {"total": score_dict.get("total")}
+    aliases = {
+        "queue": "queue_order",
+        "health": "health",
+        "progress": "progress",
+        "near_complete": "near_complete",
+        "remaining": "remaining",
+        "eta": "eta",
+        "sources": "sources",
+        "availability": "availability",
+        "progress_state": "progress_state",
+        "priority": "priority",
+        "cooldown": "cooldown",
+        "storage_fit": "storage_fit",
+        "storage_remaining": "storage_remaining",
+        "content_total": "content_total",
+    }
+    for output_name, component_name in aliases.items():
+        if component_name in components:
+            breakdown[output_name] = components[component_name]
+    return breakdown
+
+
 def prometheus_label(value):
     text = str(value or "")
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
@@ -306,10 +338,14 @@ class QueueStatusStore:
                         "effective_cap",
                         "parked_torrents",
                         "progress_torrents",
+                        "current_active_torrent",
                         "rejected_counts",
+                        "rejected_torrents",
+                        "runner_up_torrent",
                         "selected_torrent",
                         "selected_torrents",
                         "storage",
+                        "winner_torrent",
                     ):
                         if key not in next_event and key in previous_event:
                             next_event[key] = previous_event[key]
@@ -449,6 +485,9 @@ class QueueStatusStore:
         progress_torrents = last_event.get("progress_torrents")
         if not isinstance(progress_torrents, list):
             progress_torrents = []
+        winner_torrent = last_event.get("winner_torrent")
+        runner_up_torrent = last_event.get("runner_up_torrent")
+        current_active_torrent = last_event.get("current_active_torrent")
         max_torrent_metrics = max(1, env_int("QBT_STATUS_METRICS_MAX_TORRENTS", 12))
         torrent_info_samples = []
         torrent_numeric_samples = {
@@ -459,6 +498,9 @@ class QueueStatusStore:
         }
         for role, torrent_items in (
             ("selected", selected_torrents),
+            ("winner", [winner_torrent] if winner_torrent else []),
+            ("runner_up", [runner_up_torrent] if runner_up_torrent else []),
+            ("current_active", [current_active_torrent] if current_active_torrent else []),
             ("parked", parked_torrents),
             ("progress", progress_torrents),
         ):
@@ -519,6 +561,9 @@ class QueueStatusStore:
             "Recent decision torrent counts by role.",
             [
                 ({"role": "selected"}, len(selected_torrents)),
+                ({"role": "winner"}, 1 if winner_torrent else 0),
+                ({"role": "runner_up"}, 1 if runner_up_torrent else 0),
+                ({"role": "current_active"}, 1 if current_active_torrent else 0),
                 ({"role": "parked"}, len(parked_torrents)),
                 ({"role": "progress"}, len(progress_torrents)),
             ],
@@ -946,13 +991,52 @@ def decision_log_message(event, fields):
     action = fields.get("action")
     selected = fields.get("selected_torrent")
     selected_name = selected.get("name") if isinstance(selected, dict) else ""
+    winner = fields.get("winner_torrent")
+    winner_name = winner.get("name") if isinstance(winner, dict) else ""
+    winner_breakdown = winner.get("score_breakdown") if isinstance(winner, dict) else {}
+    if not isinstance(winner_breakdown, dict):
+        winner_breakdown = {}
+    winner_score = None
+    if winner_breakdown:
+        winner_score = winner_breakdown.get("total")
+    runner_up = fields.get("runner_up_torrent")
+    runner_up_name = runner_up.get("name") if isinstance(runner_up, dict) else ""
+    runner_up_score = None
+    if isinstance(runner_up, dict) and isinstance(runner_up.get("score_breakdown"), dict):
+        runner_up_score = runner_up["score_breakdown"].get("total")
+    current_active = fields.get("current_active_torrent")
+    current_active_name = current_active.get("name") if isinstance(current_active, dict) else ""
+    current_active_score = None
+    if isinstance(current_active, dict) and isinstance(current_active.get("score_breakdown"), dict):
+        current_active_score = current_active["score_breakdown"].get("total")
     reason = fields.get("reason")
 
     parts = []
     if action:
         parts.append(str(action))
-    if selected_name:
+    if winner_name:
+        parts.append(f"winner={winner_name}")
+        if winner_score is not None:
+            parts.append(f"winner_score={winner_score}")
+        for label, key in (
+            ("queue", "queue"),
+            ("health", "health"),
+            ("progress", "progress"),
+            ("speed", "observed_download_speed_bytes_per_sec"),
+        ):
+            value = winner_breakdown.get(key)
+            if value is not None:
+                parts.append(f"{label}={value}")
+    elif selected_name:
         parts.append(f"selected={selected_name}")
+    if runner_up_name:
+        parts.append(f"runner_up={runner_up_name}")
+        if runner_up_score is not None:
+            parts.append(f"runner_up_score={runner_up_score}")
+    if current_active_name:
+        parts.append(f"current_active={current_active_name}")
+        if current_active_score is not None:
+            parts.append(f"current_active_score={current_active_score}")
     if reason:
         parts.append(f"reason={reason}")
     return " ".join(parts) or event
@@ -3539,6 +3623,13 @@ def torrent_decision_summary(torrent, score=None):
     }
     if score is not None:
         summary["score"] = score.as_dict() if hasattr(score, "as_dict") else score
+        score_breakdown = candidate_score_breakdown(score)
+        if isinstance(score_breakdown, dict):
+            score_breakdown = dict(score_breakdown)
+            score_breakdown["observed_download_speed_bytes_per_sec"] = summary[
+                "download_speed_bytes_per_sec"
+            ]
+        summary["score_breakdown"] = score_breakdown
     return summary
 
 
@@ -7428,6 +7519,52 @@ def apply_single_download(
                     score_for(torrent, storage_scoring=storage_scoring),
                 )
 
+            def current_active_summary(storage_scoring=False):
+                active_torrents = [
+                    torrent for torrent in torrents
+                    if is_running_torrent(torrent)
+                ]
+                if not active_torrents:
+                    return None
+                active_torrents.sort(
+                    key=lambda torrent: (
+                        0 if is_productive_download(torrent) else 1,
+                        score_for(torrent, storage_scoring=storage_scoring).sort_key,
+                    )
+                )
+                return scored_torrent_summary(active_torrents[0], storage_scoring=storage_scoring)
+
+            def runner_up_summary(winner, candidate_pool, storage_scoring=False):
+                winner_hash = torrent_hash(winner) if winner else ""
+                for candidate in candidate_pool or []:
+                    candidate_hash = torrent_hash(candidate)
+                    if winner_hash and candidate_hash == winner_hash:
+                        continue
+                    return scored_torrent_summary(candidate, storage_scoring=storage_scoring)
+                return None
+
+            def decision_competition_context(winner=None, candidate_pool=None, storage_scoring=False):
+                return {
+                    "winner_torrent": scored_torrent_summary(winner, storage_scoring=storage_scoring)
+                    if winner
+                    else None,
+                    "runner_up_torrent": runner_up_summary(
+                        winner,
+                        candidate_pool or [],
+                        storage_scoring=storage_scoring,
+                    ),
+                    "current_active_torrent": current_active_summary(storage_scoring=storage_scoring),
+                }
+
+            def scored_rejections(torrents_to_reject, reason, storage_scoring=False, limit=5):
+                return [
+                    {
+                        "torrent": scored_torrent_summary(torrent, storage_scoring=storage_scoring),
+                        "reason": reason,
+                    }
+                    for torrent in list(torrents_to_reject or [])[:limit]
+                ]
+
             all_candidates = sorted(
                 eligible_torrents,
                 key=lambda torrent: score_for(torrent).sort_key,
@@ -7718,6 +7855,7 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(candidate_pool=normal_parked_stalled_torrents),
                     action="keep_parked_stalled",
                     reason="stalled torrents remain active while waiting for replacement candidates",
                     selected_torrent=None,
@@ -7764,6 +7902,10 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        candidate_pool=storage_recovery_parked_torrents,
+                        storage_scoring=True,
+                    ),
                     action="keep_storage_recovery_parked",
                     reason="storage recovery has parked stalled torrents but no fitting replacement workers",
                     selected_torrent=None,
@@ -7823,6 +7965,11 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=selection_candidates[0],
+                        candidate_pool=selection_candidates,
+                        storage_scoring=True,
+                    ),
                     action="storage_recovery_batch",
                     reason="download storage is below reserve; running smallest fitting torrents",
                     selected_torrent=scored_torrent_summary(selection_candidates[0], storage_scoring=True),
@@ -7862,6 +8009,11 @@ def apply_single_download(
                         emit_decision_log(
                             "qbt_guard_decision",
                             **decision_base_context(run_decision_context, client, storage_state),
+                            **decision_competition_context(
+                                winner=selection_candidates[0],
+                                candidate_pool=selection_candidates,
+                                storage_scoring=True,
+                            ),
                             action="stop_storage_recovery_for_storage",
                             reason=storage_state["reason"],
                             selected_torrents=[
@@ -7941,6 +8093,11 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=selection_candidates[0],
+                        candidate_pool=selection_candidates,
+                        storage_scoring=True,
+                    ),
                     action="keep_storage_recovery_batch",
                     reason=(
                         "storage recovery batch remains selected; repeated no-progress "
@@ -8039,6 +8196,10 @@ def apply_single_download(
                     emit_decision_log(
                         "qbt_guard_decision",
                         **decision_base_context(run_decision_context, client, storage_state),
+                        **decision_competition_context(
+                            winner=challenger,
+                            candidate_pool=[challenger, keep] + selection_candidates[1:],
+                        ),
                         action="preempt_productive",
                         reason=reason,
                         selected_torrent=torrent_decision_summary(challenger, challenger_score),
@@ -8084,6 +8245,10 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=keep,
+                        candidate_pool=selection_candidates,
+                    ),
                     action="keep_productive",
                     reason=keep_lease_reason or "active torrent is productive",
                     selected_torrent=scored_torrent_summary(keep),
@@ -8119,6 +8284,10 @@ def apply_single_download(
                             emit_decision_log(
                                 "qbt_guard_decision",
                                 **decision_base_context(run_decision_context, client, storage_state),
+                                **decision_competition_context(
+                                    winner=keep_refreshed or keep,
+                                    candidate_pool=selection_candidates,
+                                ),
                                 action="stop_kept_for_storage",
                                 reason=storage_state["reason"],
                                 selected_torrent=scored_torrent_summary(keep_refreshed or keep),
@@ -8144,6 +8313,10 @@ def apply_single_download(
                     emit_decision_log(
                         "qbt_guard_decision",
                         **decision_base_context(run_decision_context, client, storage_state),
+                        **decision_competition_context(
+                            winner=keep_refreshed,
+                            candidate_pool=selection_candidates,
+                        ),
                         action="confirm_kept_productive",
                         reason=progress_classification.reason,
                         selected_torrent=scored_torrent_summary(keep_refreshed),
@@ -8170,6 +8343,11 @@ def apply_single_download(
                     emit_decision_log(
                         "qbt_guard_decision",
                         **decision_base_context(run_decision_context, client, storage_state),
+                        **decision_competition_context(
+                            winner=keep_refreshed,
+                            candidate_pool=selection_candidates,
+                            storage_scoring=True,
+                        ),
                         action="keep_storage_constrained_until_stalled",
                         reason="storage-constrained candidate has not stalled",
                         selected_torrent=scored_torrent_summary(keep_refreshed, storage_scoring=True),
@@ -8202,6 +8380,10 @@ def apply_single_download(
                     emit_decision_log(
                         "qbt_guard_decision",
                         **decision_base_context(run_decision_context, client, storage_state),
+                        **decision_competition_context(
+                            winner=parked_torrent,
+                            candidate_pool=selection_candidates,
+                        ),
                         action="park_kept_no_progress",
                         reason=progress_classification.reason,
                         selected_torrent=scored_torrent_summary(parked_torrent),
@@ -8243,6 +8425,11 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=keep_refreshed or keep,
+                        candidate_pool=selection_candidates,
+                        storage_scoring=storage_constrained_mode,
+                    ),
                     action="stop_kept_no_progress",
                     reason=progress_classification.reason,
                     selected_torrent=scored_torrent_summary(keep_refreshed or keep),
@@ -8290,6 +8477,10 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=keep,
+                        candidate_pool=selection_candidates,
+                    ),
                     action="keep_selection_lease",
                     reason=keep_lease_reason,
                     selected_torrent=scored_torrent_summary(keep),
@@ -8369,15 +8560,16 @@ def apply_single_download(
                         emit_decision_log(
                             "qbt_guard_decision",
                             **decision_base_context(run_decision_context, client, storage_state),
+                            **decision_competition_context(candidate_pool=selection_candidates),
                             action="stop_stalled_candidates",
                             reason="stalled torrents classified as non-listener failures",
                             rejected_counts=dict(rejected_counts),
                             candidate_counts=candidate_counts,
                             selected_torrent=None,
-                            rejected_torrents=[
-                                scored_torrent_summary(torrent)
-                                for torrent in terminal_stalled_candidates[:5]
-                            ],
+                            rejected_torrents=scored_rejections(
+                                terminal_stalled_candidates,
+                                "stalled torrents classified as non-listener failures",
+                            ),
                         )
                         log_decision_info(
                             "stop_stalled_candidates",
@@ -8412,6 +8604,7 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(candidate_pool=parked_stalled_candidates),
                     action="keep_stalled_candidates",
                     reason="stalled torrents remain active and will be skipped for replacement selection",
                     rejected_counts=dict(rejected_counts),
@@ -8441,15 +8634,20 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        candidate_pool=stalled_candidates,
+                        storage_scoring=storage_constrained_mode,
+                    ),
                     action="stop_stalled_candidates",
                     reason="stalled without download speed",
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
                     selected_torrent=None,
-                    rejected_torrents=[
-                        scored_torrent_summary(torrent)
-                        for torrent in stalled_candidates[:5]
-                    ],
+                    rejected_torrents=scored_rejections(
+                        stalled_candidates,
+                        "stalled without download speed",
+                        storage_scoring=storage_constrained_mode,
+                    ),
                 )
                 for torrent in stalled_candidates:
                     attempted_hashes.add(torrent_hash(torrent))
@@ -8492,6 +8690,7 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(candidate_pool=candidates or all_candidates),
                     action="stop_no_available_candidates",
                     reason=no_available_reason,
                     rejected_counts=dict(rejected_counts),
@@ -8576,6 +8775,10 @@ def apply_single_download(
             emit_decision_log(
                 "qbt_guard_decision",
                 **decision_base_context(run_decision_context, client, storage_state),
+                **decision_competition_context(
+                    winner=selected,
+                    candidate_pool=selection_candidates,
+                ),
                 action="try_candidate",
                 selected_torrent=scored_torrent_summary(selected),
                 rejected_counts=dict(rejected_counts),
@@ -8615,6 +8818,10 @@ def apply_single_download(
                         emit_decision_log(
                             "qbt_guard_decision",
                             **decision_base_context(run_decision_context, client, storage_state),
+                            **decision_competition_context(
+                                winner=selected_refreshed or selected,
+                                candidate_pool=selection_candidates,
+                            ),
                             action="stop_selected_for_storage",
                             reason=storage_state["reason"],
                             selected_torrent=scored_torrent_summary(selected_refreshed or selected),
@@ -8640,6 +8847,10 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=selected_refreshed,
+                        candidate_pool=selection_candidates,
+                    ),
                     action="confirm_selected_productive",
                     reason=progress_classification.reason,
                     selected_torrent=scored_torrent_summary(selected_refreshed),
@@ -8669,6 +8880,11 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=selected_refreshed,
+                        candidate_pool=selection_candidates,
+                        storage_scoring=True,
+                    ),
                     action="keep_storage_constrained_until_stalled",
                     reason="storage-constrained candidate has not stalled",
                     selected_torrent=scored_torrent_summary(selected_refreshed, storage_scoring=True),
@@ -8701,6 +8917,10 @@ def apply_single_download(
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=parked_torrent,
+                        candidate_pool=selection_candidates,
+                    ),
                     action="park_selected_no_progress",
                     reason=progress_classification.reason,
                     selected_torrent=scored_torrent_summary(parked_torrent),
@@ -8741,6 +8961,11 @@ def apply_single_download(
             emit_decision_log(
                 "qbt_guard_decision",
                 **decision_base_context(run_decision_context, client, storage_state),
+                **decision_competition_context(
+                    winner=selected_refreshed or selected,
+                    candidate_pool=selection_candidates,
+                    storage_scoring=storage_constrained_mode,
+                ),
                 action="stop_selected_no_progress",
                 reason=progress_classification.reason,
                 selected_torrent=scored_torrent_summary(selected_refreshed or selected),

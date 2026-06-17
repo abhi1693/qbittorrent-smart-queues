@@ -35,6 +35,36 @@ class StatusEndpointTests(unittest.TestCase):
                     "connected_seeds": 0,
                     "reported_seeds": 1,
                 },
+                winner_torrent={
+                    "hash": "abc123",
+                    "name": "Example.S01E01",
+                    "category": "tv",
+                    "state": "stalledDL",
+                    "progress": 0.5,
+                    "amount_left_bytes": 1048576,
+                    "download_speed_bytes_per_sec": 0,
+                    "availability": 0.5,
+                },
+                runner_up_torrent={
+                    "hash": "runner123",
+                    "name": "Runner.S01E02",
+                    "category": "tv",
+                    "state": "stoppedDL",
+                    "progress": 0.4,
+                    "amount_left_bytes": 4096,
+                    "download_speed_bytes_per_sec": 0,
+                    "availability": 1.0,
+                },
+                current_active_torrent={
+                    "hash": "active123",
+                    "name": "Active.S01E03",
+                    "category": "tv",
+                    "state": "downloading",
+                    "progress": 0.2,
+                    "amount_left_bytes": 8192,
+                    "download_speed_bytes_per_sec": 100,
+                    "availability": 1.0,
+                },
                 parked_torrents=[
                     {
                         "hash": "parked123",
@@ -71,6 +101,8 @@ class StatusEndpointTests(unittest.TestCase):
         snapshot = self.guard.QUEUE_STATUS.snapshot()
         self.assertEqual("try_candidate", snapshot["last_event"]["action"])
         self.assertEqual("Example.S01E01", snapshot["last_event"]["selected_torrent"]["name"])
+        self.assertEqual("Runner.S01E02", snapshot["last_event"]["runner_up_torrent"]["name"])
+        self.assertEqual("Active.S01E03", snapshot["last_event"]["current_active_torrent"]["name"])
 
         metrics = self.guard.QUEUE_STATUS.prometheus_metrics()
         self.assertIn('qbt_guard_last_decision_info{action="try_candidate"', metrics)
@@ -82,6 +114,9 @@ class StatusEndpointTests(unittest.TestCase):
         self.assertIn('qbt_guard_effective_cap_bytes_per_sec{type="download"} 0.0', metrics)
         self.assertIn('qbt_guard_storage_bytes{type="headroom"} 40000.0', metrics)
         self.assertIn('qbt_guard_decision_torrent_count{role="parked"} 1.0', metrics)
+        self.assertIn('qbt_guard_decision_torrent_count{role="winner"} 1.0', metrics)
+        self.assertIn('qbt_guard_decision_torrent_count{role="runner_up"} 1.0', metrics)
+        self.assertIn('qbt_guard_decision_torrent_count{role="current_active"} 1.0', metrics)
         self.assertIn('qbt_guard_torrent_info{category="tv",hash="parked123"', metrics)
         self.assertIn('qbt_guard_candidate_count{type="available"} 3.0', metrics)
         self.assertIn('qbt_guard_rejected_count{reason="cooldown"} 1.0', metrics)

@@ -74,6 +74,18 @@ class LoggingTests(unittest.TestCase):
             self.guard.emit_decision_log(
                 "qbt_guard_decision",
                 action="keep_productive",
+                winner_torrent={
+                    "name": "Winner",
+                    "score_breakdown": {
+                        "total": 93.0,
+                        "queue": 20.0,
+                        "health": 40.0,
+                        "progress": 18.0,
+                        "observed_download_speed_bytes_per_sec": 15,
+                    },
+                },
+                runner_up_torrent={"name": "Runner", "score_breakdown": {"total": 81.5}},
+                current_active_torrent={"name": "Active", "score_breakdown": {"total": 70.0}},
                 rejected_counts={"complete": 2},
             )
 
@@ -81,6 +93,14 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual("INFO", record["level"])
         self.assertEqual("qbt_guard_decision", record["event"])
         self.assertEqual("keep_productive", record["action"])
+        self.assertIn("winner=Winner", record["message"])
+        self.assertIn("winner_score=93.0", record["message"])
+        self.assertIn("queue=20.0", record["message"])
+        self.assertIn("health=40.0", record["message"])
+        self.assertIn("progress=18.0", record["message"])
+        self.assertIn("speed=15", record["message"])
+        self.assertIn("runner_up=Runner", record["message"])
+        self.assertIn("current_active=Active", record["message"])
         self.assertEqual({"complete": 2}, record["rejected_counts"])
 
     def test_decision_logs_can_be_disabled_with_legacy_env(self):
