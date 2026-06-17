@@ -98,6 +98,18 @@ STALL_COOLDOWN_REASONS = {
     STALL_COOLDOWN_REASON_IMPORT_FAILED,
     STALL_COOLDOWN_REASON_MANUAL_HOLD,
 }
+PROGRESS_CLASS_MISSING_FINAL_PIECE = "missing-final-piece"
+PROGRESS_CLASS_METADATA_WAIT = "metadata-wait"
+PROGRESS_CLASS_NO_CONNECTED_PEERS = "no-connected-peers"
+PROGRESS_CLASS_SLOW_PROGRESSING = "slow-progressing"
+PROGRESS_CLASS_TRACKER_DEAD = "tracker-dead"
+PROGRESS_CLASS_ACTIVELY_PROGRESSING = "actively-progressing"
+PROGRESS_LISTENER_CLASSES = {
+    PROGRESS_CLASS_MISSING_FINAL_PIECE,
+    PROGRESS_CLASS_METADATA_WAIT,
+    PROGRESS_CLASS_NO_CONNECTED_PEERS,
+    PROGRESS_CLASS_SLOW_PROGRESSING,
+}
 TORRENT_LIFECYCLE_CANDIDATE = "candidate"
 TORRENT_LIFECYCLE_SELECTED_WORKER = "selected-worker"
 TORRENT_LIFECYCLE_PRODUCTIVE = "productive"
@@ -125,6 +137,14 @@ class TorrentLifecycle:
             "selectable": self.selectable,
             "retryable": self.retryable,
         }
+
+
+@dataclass(frozen=True)
+class TorrentProgressClassification:
+    state: str
+    reason: str
+    cooldown_reason: str = STALL_COOLDOWN_REASON_NO_PROGRESS
+    park_as_listener: bool = False
 
 
 @dataclass(frozen=True)
@@ -3399,6 +3419,20 @@ def torrent_availability(torrent):
     return torrent_float(torrent, "availability")
 
 
+def torrent_has_swarm_telemetry(torrent):
+    return any(
+        key in torrent
+        for key in (
+            "availability",
+            "num_complete",
+            "num_incomplete",
+            "num_seeds",
+            "num_leechs",
+            "num_peers",
+        )
+    )
+
+
 def tracker_int(tracker, key):
     try:
         return max(0, int(tracker.get(key) or 0))
@@ -5200,14 +5234,8 @@ def is_stalled_torrent(torrent):
 
 
 def tracker_dead_cooldown_reason(torrent):
-    if (
-        is_stalled_torrent(torrent)
-        and torrent_connected_seeds(torrent) <= 0
-        and torrent_reported_seeds(torrent) <= 0
-        and torrent_availability(torrent) <= 0
-    ):
-        return STALL_COOLDOWN_REASON_TRACKER_DEAD
-    return STALL_COOLDOWN_REASON_NO_PROGRESS
+    classification = torrent_progress_classification(None, torrent, 1)
+    return classification.cooldown_reason
 
 
 def is_running_torrent(torrent):
@@ -5244,14 +5272,15 @@ def parked_listener_reason(torrent, health_store, required_no_progress_samples, 
         and health_store.active_selection_lease_reason(torrent, now)
     ):
         return ""
+    classification = torrent_progress_classification(None, torrent, 1)
     if is_stalled_torrent(torrent):
-        return "qBittorrent reports stalled download"
+        return classification.reason if classification.park_as_listener else ""
     if (
         health_store
         and health_store.storage_recovery_no_progress_samples(torrent)
         >= max(1, int(required_no_progress_samples))
     ):
-        return "required no-progress samples reached"
+        return classification.reason if classification.park_as_listener else ""
     return ""
 
 
@@ -5402,6 +5431,109 @@ def torrent_progress_reason(before, after, min_download_delta_bytes):
             )
 
     return ""
+
+
+def torrent_progress_classification(before, after, min_download_delta_bytes, sample_seconds=0):
+    progress_reason = ""
+    if before:
+        progress_reason = torrent_progress_reason(before, after, min_download_delta_bytes)
+    if progress_reason:
+        return TorrentProgressClassification(
+            PROGRESS_CLASS_ACTIVELY_PROGRESSING,
+            progress_reason,
+        )
+
+    state = torrent_state(after)
+    progress = torrent_progress(after)
+    availability = torrent_availability(after)
+    amount_left = torrent_amount_left(after)
+    connected_sources = torrent_connected_seeds(after) + torrent_connected_peers(after)
+    reported_sources = torrent_reported_seeds(after)
+    has_swarm_telemetry = torrent_has_swarm_telemetry(after)
+    min_final_progress = max(
+        0.0,
+        min(1.0, env_float("QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MIN_PROGRESS", 0.999)),
+    )
+    min_final_availability = max(
+        0.0,
+        env_float("QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MIN_AVAILABILITY", 0.95),
+    )
+    max_final_availability = max(
+        min_final_availability,
+        env_float("QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MAX_AVAILABILITY", 1.0),
+    )
+
+    if state == "metaDL":
+        return TorrentProgressClassification(
+            PROGRESS_CLASS_METADATA_WAIT,
+            "waiting for torrent metadata",
+            cooldown_reason=STALL_COOLDOWN_REASON_METADATA,
+            park_as_listener=True,
+        )
+
+    if (
+        progress >= min_final_progress
+        and amount_left > 0
+        and min_final_availability <= availability < max_final_availability
+    ):
+        return TorrentProgressClassification(
+            PROGRESS_CLASS_MISSING_FINAL_PIECE,
+            (
+                f"missing final pieces at {progress * 100:.2f}% complete "
+                f"with availability {availability:.3f}"
+            ),
+            cooldown_reason=STALL_COOLDOWN_REASON_NO_PROGRESS,
+            park_as_listener=True,
+        )
+
+    if (
+        has_swarm_telemetry
+        and connected_sources <= 0
+        and reported_sources <= 0
+        and availability <= 0
+    ):
+        return TorrentProgressClassification(
+            PROGRESS_CLASS_TRACKER_DEAD,
+            "no connected peers, reported seeds, or available pieces",
+            cooldown_reason=STALL_COOLDOWN_REASON_TRACKER_DEAD,
+            park_as_listener=False,
+        )
+
+    if connected_sources <= 0:
+        return TorrentProgressClassification(
+            PROGRESS_CLASS_NO_CONNECTED_PEERS,
+            "no connected peers; waiting for peer discovery",
+            cooldown_reason=STALL_COOLDOWN_REASON_NO_PROGRESS,
+            park_as_listener=True,
+        )
+
+    delta_bytes = torrent_progress_delta_bytes(before or after, after) if before else 0
+    sample_seconds = max(1, int(sample_seconds or 1))
+    observed_speed = max(
+        torrent_download_speed(after),
+        math.floor(max(0, delta_bytes) / sample_seconds),
+    )
+    if observed_speed > 0 or connected_sources > 0:
+        return TorrentProgressClassification(
+            PROGRESS_CLASS_SLOW_PROGRESSING,
+            (
+                f"connected peers present but progress is below "
+                f"{human_size(max(1, int(min_download_delta_bytes)))} sample floor"
+            ),
+            cooldown_reason=STALL_COOLDOWN_REASON_NO_PROGRESS,
+            park_as_listener=True,
+        )
+
+    return TorrentProgressClassification(
+        PROGRESS_CLASS_NO_CONNECTED_PEERS,
+        "no measured progress",
+        cooldown_reason=STALL_COOLDOWN_REASON_NO_PROGRESS,
+        park_as_listener=True,
+    )
+
+
+def progress_class_count_key(progress_class):
+    return f"progress_{str(progress_class or 'unknown').replace('-', '_')}"
 
 
 def storage_recovery_progress_reason(
@@ -5560,6 +5692,19 @@ def candidate_content_score_components(torrent, health_store, now):
     sources = max(torrent_connected_seeds(torrent), torrent_reported_seeds(torrent))
     components["sources"] = min(20.0, sources * 2.0)
     components["availability"] = min(15.0, torrent_availability(torrent) * 5.0)
+    progress_class = (
+        health_store.recent_progress_class(torrent, now)
+        if health_store and hasattr(health_store, "recent_progress_class")
+        else ""
+    )
+    components["progress_state"] = {
+        PROGRESS_CLASS_ACTIVELY_PROGRESSING: 8.0,
+        PROGRESS_CLASS_SLOW_PROGRESSING: -8.0,
+        PROGRESS_CLASS_MISSING_FINAL_PIECE: -35.0,
+        PROGRESS_CLASS_NO_CONNECTED_PEERS: -30.0,
+        PROGRESS_CLASS_METADATA_WAIT: -40.0,
+        PROGRESS_CLASS_TRACKER_DEAD: -75.0,
+    }.get(progress_class, 0.0)
     components["content_total"] = max(-150.0, min(200.0, sum(components.values())))
     return components
 
@@ -5996,6 +6141,9 @@ class TorrentHealthStore:
         entry["successful_attempts"] = int(entry.get("successful_attempts") or 0) + 1
         entry["consecutive_failures"] = 0
         entry["last_failure_reason"] = ""
+        entry["last_progress_class"] = PROGRESS_CLASS_ACTIVELY_PROGRESSING
+        entry["last_progress_class_reason"] = "made measurable progress"
+        entry["last_progress_class_at"] = format_utc(now)
         entry["cooldown_reason"] = ""
         entry["cooldown_scope"] = ""
         entry["cooldown_next_retry_at"] = ""
@@ -6029,6 +6177,13 @@ class TorrentHealthStore:
         entry["last_failure_at"] = format_utc(now)
         entry["last_failure_reason"] = str(reason or "not productive")
         entry["last_cooldown_reason"] = cooldown_reason
+        entry["last_progress_class"] = (
+            PROGRESS_CLASS_TRACKER_DEAD
+            if cooldown_reason == STALL_COOLDOWN_REASON_TRACKER_DEAD
+            else PROGRESS_CLASS_NO_CONNECTED_PEERS
+        )
+        entry["last_progress_class_reason"] = str(reason or "not productive")
+        entry["last_progress_class_at"] = format_utc(now)
         entry["failed_attempts"] = int(entry.get("failed_attempts") or 0) + 1
         entry["consecutive_failures"] = int(entry.get("consecutive_failures") or 0) + 1
         if self.no_progress_backoff_reason(cooldown_reason):
@@ -6158,23 +6313,40 @@ class TorrentHealthStore:
             "cooldown_seconds": self.cooldown_seconds_for_torrent(torrent, base_seconds, reason),
         }
 
-    def record_storage_recovery_no_progress(self, torrent, now):
+    def record_storage_recovery_no_progress(self, torrent, now, classification=None):
         entry = self.entry(torrent_hash(torrent))
         if entry is None:
             return
 
+        if classification is None:
+            classification = torrent_progress_classification(None, torrent, 1)
         entry["name"] = torrent_name(torrent)
         entry["category"] = torrent_category(torrent)
         entry["storage_recovery_no_progress_samples"] = (
             int(entry.get("storage_recovery_no_progress_samples") or 0) + 1
         )
         entry["storage_recovery_last_no_progress_at"] = format_utc(now)
+        entry["last_progress_class"] = classification.state
+        entry["last_progress_class_reason"] = classification.reason
+        entry["last_progress_class_at"] = format_utc(now)
         entry["last_amount_left_bytes"] = torrent_amount_left(torrent)
         entry["last_speed_bytes_per_sec"] = torrent_download_speed(torrent)
         self.update_peer_observation(entry, torrent, now)
         entry["last_reported_seeds"] = torrent_reported_seeds(torrent)
         entry["last_availability"] = torrent_availability(torrent)
         entry["predicted_completion_seconds"] = self.predicted_completion_seconds(torrent, entry)
+        self.dirty = True
+        self.save()
+
+    def record_progress_classification(self, torrent, now, classification):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None or classification is None:
+            return
+        entry["name"] = torrent_name(torrent)
+        entry["category"] = torrent_category(torrent)
+        entry["last_progress_class"] = classification.state
+        entry["last_progress_class_reason"] = classification.reason
+        entry["last_progress_class_at"] = format_utc(now)
         self.dirty = True
         self.save()
 
@@ -6186,6 +6358,21 @@ class TorrentHealthStore:
             return max(0, int(entry.get("storage_recovery_no_progress_samples") or 0))
         except (TypeError, ValueError):
             return 0
+
+    def recent_progress_class(self, torrent, now):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return ""
+        progress_class = str(entry.get("last_progress_class") or "").strip()
+        if not progress_class:
+            return ""
+        observed_at = parse_utc(entry.get("last_progress_class_at"))
+        if observed_at is None:
+            return progress_class
+        max_age_seconds = max(0, env_int("QBT_NO_PROGRESS_CLASS_SCORE_MAX_AGE_SECONDS", 86_400))
+        if max_age_seconds > 0 and (now - observed_at).total_seconds() > max_age_seconds:
+            return ""
+        return progress_class
 
     def stale_stalled_since(self, torrent):
         entry = self.entry(torrent_hash(torrent))
@@ -6292,6 +6479,10 @@ class TorrentHealthStore:
         tracker_text = ""
         backoff_text = ""
         cooldown_text = ""
+        progress_class_text = ""
+        progress_class = str(entry.get("last_progress_class") or "").strip()
+        if progress_class:
+            progress_class_text = f", progress class {progress_class}"
         cooldown_state = self.active_cooldown_state(torrent, now)
         if cooldown_state:
             cooldown_text = (
@@ -6329,6 +6520,7 @@ class TorrentHealthStore:
         return (
             f"; health score {score:.1f}, ewma {human_rate(speed)}, "
             f"ETA {predicted_text}, consecutive failures {failures}"
+            f"{progress_class_text}"
             f"{cooldown_text}"
             f"{backoff_text}"
             f"{tracker_text}"
@@ -7410,6 +7602,17 @@ def apply_single_download(
                         ):
                             normal_parked_stalled_deferred_count += 1
                             continue
+                        classification = torrent_progress_classification(
+                            None,
+                            torrent,
+                            normal_progress_min_bytes(torrent),
+                        )
+                        rejected_counts[progress_class_count_key(classification.state)] += 1
+                        health_store.record_progress_classification(
+                            torrent,
+                            now,
+                            classification,
+                        )
                         normal_parked_stalled_torrents.append(torrent)
                         normal_parked_stalled_hashes.add(item_hash)
                     rejected_counts["parked_stalled"] += len(normal_parked_stalled_torrents)
@@ -7931,27 +8134,29 @@ def apply_single_download(
                                 reason=storage_state["reason"],
                             )
                             break
-                progress_reason = ""
-                if keep_refreshed:
-                    progress_reason = torrent_progress_reason(
-                        keep,
-                        keep_refreshed,
-                        normal_progress_min_bytes(keep),
-                    )
-                if progress_reason:
+                progress_classification = torrent_progress_classification(
+                    keep,
+                    keep_refreshed or keep,
+                    normal_progress_min_bytes(keep),
+                    stall_check_seconds,
+                )
+                if progress_classification.state == PROGRESS_CLASS_ACTIVELY_PROGRESSING:
                     emit_decision_log(
                         "qbt_guard_decision",
                         **decision_base_context(run_decision_context, client, storage_state),
                         action="confirm_kept_productive",
-                        reason=progress_reason,
+                        reason=progress_classification.reason,
                         selected_torrent=scored_torrent_summary(keep_refreshed),
                         rejected_counts=dict(rejected_counts),
-                        candidate_counts=candidate_counts,
+                        candidate_counts={
+                            **candidate_counts,
+                            progress_class_count_key(progress_classification.state): 1,
+                        },
                     )
                     log_debug(
                         f"Kept torrent is active after "
                         f"{stall_check_seconds}s: "
-                        f"{torrent_name(keep_refreshed)}; {progress_reason}"
+                        f"{torrent_name(keep_refreshed)}; {progress_classification.reason}"
                     )
                     health_store.record_productive(
                         keep,
@@ -7983,23 +8188,28 @@ def apply_single_download(
                     )
                     break
 
-                if not storage_constrained_mode and park_stalled_downloads_enabled:
+                if (
+                    not storage_constrained_mode
+                    and park_stalled_downloads_enabled
+                    and progress_classification.park_as_listener
+                ):
                     parked_torrent = keep_refreshed or keep
                     health_store.record_storage_recovery_no_progress(
                         parked_torrent,
                         datetime.now(timezone.utc),
+                        classification=progress_classification,
                     )
                     emit_decision_log(
                         "qbt_guard_decision",
                         **decision_base_context(run_decision_context, client, storage_state),
                         action="park_kept_no_progress",
-                        reason=(
-                            "did not make progress; keeping active so it can resume "
-                            "immediately if peers return"
-                        ),
+                        reason=progress_classification.reason,
                         selected_torrent=scored_torrent_summary(parked_torrent),
                         parked_torrents=[scored_torrent_summary(parked_torrent)],
-                        rejected_counts={"no_progress_after_wait": 1},
+                        rejected_counts={
+                            "no_progress_after_wait": 1,
+                            progress_class_count_key(progress_classification.state): 1,
+                        },
                         candidate_counts=candidate_counts,
                     )
                     log_decision_info(
@@ -8007,17 +8217,17 @@ def apply_single_download(
                         f"Keeping no-progress torrent active after {stall_check_seconds}s: "
                         f"{torrent_name(parked_torrent)}",
                         selected=torrent_name(parked_torrent),
-                        reason="did not make progress",
+                        reason=progress_classification.reason,
                     )
                     break
 
                 client.stop_hashes([keep_hash])
                 attempted_hashes.add(keep_hash)
-                cooldown_reason = tracker_dead_cooldown_reason(keep_refreshed or keep)
+                cooldown_reason = progress_classification.cooldown_reason
                 health_store.record_failure(
                     keep_refreshed or keep,
                     datetime.now(timezone.utc),
-                    "did not make progress",
+                    progress_classification.reason,
                     cooldown_reason=cooldown_reason,
                     cooldown_scope="storage" if storage_constrained_mode else "normal",
                 )
@@ -8034,9 +8244,12 @@ def apply_single_download(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="stop_kept_no_progress",
-                    reason="did not make progress",
+                    reason=progress_classification.reason,
                     selected_torrent=scored_torrent_summary(keep_refreshed or keep),
-                    rejected_counts={"no_progress_after_wait": 1},
+                    rejected_counts={
+                        "no_progress_after_wait": 1,
+                        progress_class_count_key(progress_classification.state): 1,
+                    },
                     candidate_counts=candidate_counts,
                 )
                 log_decision_info(
@@ -8045,7 +8258,7 @@ def apply_single_download(
                     f"{stall_check_seconds}s: "
                     f"{torrent_name(keep_refreshed or keep)}",
                     selected=torrent_name(keep_refreshed or keep),
-                    reason="did not make progress",
+                    reason=progress_classification.reason,
                 )
                 continue
 
@@ -8101,12 +8314,88 @@ def apply_single_download(
                 if is_running_torrent(torrent) and is_stalled_torrent(torrent)
             ]
             if stalled_candidates and not storage_constrained_mode and park_stalled_downloads_enabled:
+                parked_stalled_candidates = []
+                terminal_stalled_candidates = []
+                stalled_classifications = {}
                 for torrent in stalled_candidates:
+                    classification = torrent_progress_classification(
+                        None,
+                        torrent,
+                        normal_progress_min_bytes(torrent),
+                    )
+                    stalled_classifications[torrent_hash(torrent)] = classification
+                    if classification.park_as_listener:
+                        parked_stalled_candidates.append(torrent)
+                    else:
+                        terminal_stalled_candidates.append(torrent)
+                if terminal_stalled_candidates:
+                    terminal_hashes = [
+                        torrent_hash(torrent) for torrent in terminal_stalled_candidates
+                        if torrent_hash(torrent)
+                    ]
+                    client.stop_hashes(terminal_hashes)
+                    for torrent in terminal_stalled_candidates:
+                        classification = stalled_classifications.get(torrent_hash(torrent))
+                        attempted_hashes.add(torrent_hash(torrent))
+                        health_store.record_failure(
+                            torrent,
+                            now,
+                            classification.reason if classification else "stalled without download speed",
+                            cooldown_reason=(
+                                classification.cooldown_reason
+                                if classification
+                                else STALL_COOLDOWN_REASON_NO_PROGRESS
+                            ),
+                            cooldown_scope="normal",
+                        )
+                        add_stall_cooldown_tag(
+                            client,
+                            torrent,
+                            stall_tag_prefix,
+                            now,
+                            stall_cooldown_seconds,
+                            (
+                                classification.cooldown_reason
+                                if classification
+                                else STALL_COOLDOWN_REASON_NO_PROGRESS
+                            ),
+                            health_store=health_store,
+                        )
+                        if classification:
+                            rejected_counts[progress_class_count_key(classification.state)] += 1
+                    if not parked_stalled_candidates:
+                        rejected_counts["stalled_zero_speed"] += len(terminal_stalled_candidates)
+                        candidate_counts["stalled"] = len(terminal_stalled_candidates)
+                        emit_decision_log(
+                            "qbt_guard_decision",
+                            **decision_base_context(run_decision_context, client, storage_state),
+                            action="stop_stalled_candidates",
+                            reason="stalled torrents classified as non-listener failures",
+                            rejected_counts=dict(rejected_counts),
+                            candidate_counts=candidate_counts,
+                            selected_torrent=None,
+                            rejected_torrents=[
+                                scored_torrent_summary(torrent)
+                                for torrent in terminal_stalled_candidates[:5]
+                            ],
+                        )
+                        log_decision_info(
+                            "stop_stalled_candidates",
+                            f"Stopped {len(terminal_stalled_candidates)} stalled torrent(s) "
+                            "classified as non-listener failures",
+                            count=len(terminal_stalled_candidates),
+                        )
+                        continue
+                for torrent in parked_stalled_candidates:
                     item_hash = torrent_hash(torrent)
                     if item_hash:
                         normal_parked_stalled_hashes.add(item_hash)
                         normal_parked_stalled_torrents.append(torrent)
-                        health_store.record_storage_recovery_no_progress(torrent, now)
+                        health_store.record_storage_recovery_no_progress(
+                            torrent,
+                            now,
+                            classification=stalled_classifications.get(item_hash),
+                        )
                 slot_plan = smart_queue_slot_plan(
                     normal_worker_limit,
                     len(normal_parked_stalled_hashes),
@@ -8134,14 +8423,14 @@ def apply_single_download(
                     selected_torrent=None,
                     selected_torrents=[
                         scored_torrent_summary(torrent)
-                        for torrent in stalled_candidates[:5]
+                        for torrent in parked_stalled_candidates[:5]
                     ],
                 )
                 log_decision_info(
                     "keep_stalled_candidates",
-                    f"Keeping {len(stalled_candidates)} stalled torrent(s) active "
+                    f"Keeping {len(parked_stalled_candidates)} stalled torrent(s) active "
                     "instead of pausing them",
-                    count=len(stalled_candidates),
+                    count=len(parked_stalled_candidates),
                 )
                 break
             if stalled_candidates:
@@ -8341,30 +8630,32 @@ def apply_single_download(
                             reason=storage_state["reason"],
                         )
                         break
-            progress_reason = ""
-            if selected_refreshed:
-                progress_reason = torrent_progress_reason(
-                    selected,
-                    selected_refreshed,
-                    normal_progress_min_bytes(selected),
-                )
-            if progress_reason:
+            progress_classification = torrent_progress_classification(
+                selected,
+                selected_refreshed or selected,
+                normal_progress_min_bytes(selected),
+                stall_check_seconds,
+            )
+            if progress_classification.state == PROGRESS_CLASS_ACTIVELY_PROGRESSING:
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="confirm_selected_productive",
-                    reason=progress_reason,
+                    reason=progress_classification.reason,
                     selected_torrent=scored_torrent_summary(selected_refreshed),
                     rejected_counts=dict(rejected_counts),
-                    candidate_counts=candidate_counts,
+                    candidate_counts={
+                        **candidate_counts,
+                        progress_class_count_key(progress_classification.state): 1,
+                    },
                 )
                 log_decision_info(
                     "confirm_selected_productive",
                     f"Selected torrent is active after "
                     f"{stall_check_seconds}s: "
-                    f"{torrent_name(selected_refreshed)}; {progress_reason}",
+                    f"{torrent_name(selected_refreshed)}; {progress_classification.reason}",
                     selected=torrent_name(selected_refreshed),
-                    reason=progress_reason,
+                    reason=progress_classification.reason,
                 )
                 health_store.record_productive(
                     selected,
@@ -8396,23 +8687,28 @@ def apply_single_download(
                 )
                 break
 
-            if not storage_constrained_mode and park_stalled_downloads_enabled:
+            if (
+                not storage_constrained_mode
+                and park_stalled_downloads_enabled
+                and progress_classification.park_as_listener
+            ):
                 parked_torrent = selected_refreshed or selected
                 health_store.record_storage_recovery_no_progress(
                     parked_torrent,
                     datetime.now(timezone.utc),
+                    classification=progress_classification,
                 )
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="park_selected_no_progress",
-                    reason=(
-                        "did not make progress; keeping active so it can resume "
-                        "immediately if peers return"
-                    ),
+                    reason=progress_classification.reason,
                     selected_torrent=scored_torrent_summary(parked_torrent),
                     parked_torrents=[scored_torrent_summary(parked_torrent)],
-                    rejected_counts={"no_progress_after_wait": 1},
+                    rejected_counts={
+                        "no_progress_after_wait": 1,
+                        progress_class_count_key(progress_classification.state): 1,
+                    },
                     candidate_counts=candidate_counts,
                 )
                 log_decision_info(
@@ -8420,16 +8716,16 @@ def apply_single_download(
                     f"Keeping selected torrent active after {stall_check_seconds}s without progress: "
                     f"{torrent_name(parked_torrent)}",
                     selected=torrent_name(parked_torrent),
-                    reason="did not make progress",
+                    reason=progress_classification.reason,
                 )
                 break
 
             client.stop_hashes([selected_hash])
-            cooldown_reason = tracker_dead_cooldown_reason(selected_refreshed or selected)
+            cooldown_reason = progress_classification.cooldown_reason
             health_store.record_failure(
                 selected_refreshed or selected,
                 datetime.now(timezone.utc),
-                "did not make progress",
+                progress_classification.reason,
                 cooldown_reason=cooldown_reason,
                 cooldown_scope="storage" if storage_constrained_mode else "normal",
             )
@@ -8446,9 +8742,12 @@ def apply_single_download(
                 "qbt_guard_decision",
                 **decision_base_context(run_decision_context, client, storage_state),
                 action="stop_selected_no_progress",
-                reason="did not make progress",
+                reason=progress_classification.reason,
                 selected_torrent=scored_torrent_summary(selected_refreshed or selected),
-                rejected_counts={"no_progress_after_wait": 1},
+                rejected_counts={
+                    "no_progress_after_wait": 1,
+                    progress_class_count_key(progress_classification.state): 1,
+                },
                 candidate_counts=candidate_counts,
             )
             log_decision_info(
@@ -8456,7 +8755,7 @@ def apply_single_download(
                 f"Stopped torrent because it did not make progress after "
                 f"{stall_check_seconds}s: {torrent_name(selected_refreshed or selected)}",
                 selected=torrent_name(selected_refreshed or selected),
-                reason="did not make progress",
+                reason=progress_classification.reason,
             )
 
 

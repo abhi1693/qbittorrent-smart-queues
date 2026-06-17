@@ -171,6 +171,97 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             ),
         )
 
+    def test_progress_classification_distinguishes_no_progress_modes(self):
+        before = {"amount_left": 1000, "downloaded": 100, "dlspeed": 0, "progress": 0.5}
+
+        active = self.guard.torrent_progress_classification(
+            before,
+            {"amount_left": 800, "downloaded": 300, "dlspeed": 0, "progress": 0.6},
+            min_download_delta_bytes=100,
+            sample_seconds=60,
+        )
+        self.assertEqual(self.guard.PROGRESS_CLASS_ACTIVELY_PROGRESSING, active.state)
+        self.assertFalse(active.park_as_listener)
+
+        slow = self.guard.torrent_progress_classification(
+            before,
+            {
+                "amount_left": 950,
+                "downloaded": 150,
+                "dlspeed": 1024,
+                "progress": 0.55,
+                "num_seeds": 1,
+            },
+            min_download_delta_bytes=100,
+            sample_seconds=60,
+        )
+        self.assertEqual(self.guard.PROGRESS_CLASS_SLOW_PROGRESSING, slow.state)
+        self.assertTrue(slow.park_as_listener)
+
+        missing_piece = self.guard.torrent_progress_classification(
+            {
+                "state": "stalledDL",
+                "amount_left": 10,
+                "downloaded": 990,
+                "dlspeed": 0,
+                "progress": 0.999,
+            },
+            {
+                "state": "stalledDL",
+                "amount_left": 10,
+                "downloaded": 990,
+                "dlspeed": 0,
+                "progress": 0.999,
+                "availability": 0.999,
+                "num_seeds": 0,
+                "num_complete": 0,
+            },
+            min_download_delta_bytes=100,
+            sample_seconds=60,
+        )
+        self.assertEqual(self.guard.PROGRESS_CLASS_MISSING_FINAL_PIECE, missing_piece.state)
+        self.assertTrue(missing_piece.park_as_listener)
+
+        metadata = self.guard.torrent_progress_classification(
+            None,
+            {"state": "metaDL", "dlspeed": 0, "progress": 0.0},
+            min_download_delta_bytes=100,
+        )
+        self.assertEqual(self.guard.PROGRESS_CLASS_METADATA_WAIT, metadata.state)
+        self.assertEqual("metadata", metadata.cooldown_reason)
+        self.assertTrue(metadata.park_as_listener)
+
+        no_peers = self.guard.torrent_progress_classification(
+            None,
+            {
+                "state": "stalledDL",
+                "dlspeed": 0,
+                "progress": 0.16,
+                "availability": 1.0,
+                "num_seeds": 0,
+                "num_complete": 3,
+            },
+            min_download_delta_bytes=100,
+        )
+        self.assertEqual(self.guard.PROGRESS_CLASS_NO_CONNECTED_PEERS, no_peers.state)
+        self.assertTrue(no_peers.park_as_listener)
+
+        tracker_dead = self.guard.torrent_progress_classification(
+            None,
+            {
+                "state": "stalledDL",
+                "dlspeed": 0,
+                "progress": 0.16,
+                "availability": 0,
+                "num_seeds": 0,
+                "num_complete": 0,
+            },
+            min_download_delta_bytes=100,
+        )
+        self.assertEqual(self.guard.PROGRESS_CLASS_TRACKER_DEAD, tracker_dead.state)
+        self.assertEqual("tracker-dead", tracker_dead.cooldown_reason)
+        self.assertFalse(tracker_dead.park_as_listener)
+
     def test_adaptive_progress_threshold_scales_with_size_and_age(self):
         now = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
         floor = 1024 * 1024
@@ -296,6 +387,136 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertFalse(any("zero" in hashes for hashes in client.stopped))
         self.assertEqual(0, client.stop_all_calls)
         self.assertEqual([], client.added_tags)
+
+    def test_missing_final_piece_is_parked_as_listener_after_no_progress(self):
+        class MissingPieceFakeQbtClient(FakeQbtClient):
+            def start_hashes(self, hashes):
+                super().start_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] in hashes:
+                        torrent["state"] = "stalledDL"
+                        torrent["progress"] = 0.999
+                        torrent["availability"] = 0.999
+                        torrent["num_seeds"] = 0
+                        torrent["num_complete"] = 0
+
+        client = MissingPieceFakeQbtClient([
+            {
+                "hash": "final-piece",
+                "name": "Marvels.Agents.of.S.H.I.E.L.D.S01.1080p",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 10 * 1024 * 1024,
+                "downloaded": 1000,
+                "progress": 0.999,
+                "availability": 0.999,
+                "num_seeds": 0,
+                "num_complete": 0,
+                "tags": "",
+            },
+        ])
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "60",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(self.guard.time, "sleep"):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        park_event = next(item for item in decision_events if item.get("action") == "park_selected_no_progress")
+
+        self.assertEqual("final-piece", park_event["selected_torrent"]["hash"])
+        self.assertIn("missing final pieces", park_event["reason"])
+        self.assertEqual(1, park_event["rejected_counts"]["progress_missing_final_piece"])
+        self.assertFalse(any("final-piece" in hashes for hashes in client.stopped))
+        self.assertEqual([], client.added_tags)
+
+    def test_tracker_dead_no_progress_is_stopped_even_when_parking_enabled(self):
+        class TrackerDeadFakeQbtClient(FakeQbtClient):
+            def start_hashes(self, hashes):
+                super().start_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] in hashes:
+                        torrent["state"] = "stalledDL"
+                        torrent["progress"] = 0.16
+                        torrent["availability"] = 0
+                        torrent["num_seeds"] = 0
+                        torrent["num_complete"] = 0
+
+        client = TrackerDeadFakeQbtClient([
+            {
+                "hash": "dead",
+                "name": "Dead.At.Sixteen.Percent.1080p",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 80 * 1024 * 1024 * 1024,
+                "downloaded": 1000,
+                "progress": 0.16,
+                "availability": 0,
+                "num_seeds": 0,
+                "num_complete": 0,
+                "tags": "",
+            },
+        ])
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "60",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env["QBT_TORRENT_HEALTH_STATE_PATH"] = f"{tmpdir}/torrent-health.json"
+            with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(self.guard.time, "sleep"):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.guard.apply_single_download(
+                        [client],
+                        usage_bytes=0,
+                        monthly_limit_bytes=1000,
+                        download_limit=1024,
+                        limit_reason="unit test",
+                        storage_guard=FakeStorageGuard(),
+                    )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        stop_event = next(item for item in decision_events if item.get("action") == "stop_selected_no_progress")
+
+        self.assertEqual("dead", stop_event["selected_torrent"]["hash"])
+        self.assertIn("no connected peers", stop_event["reason"])
+        self.assertEqual(1, stop_event["rejected_counts"]["progress_tracker_dead"])
+        self.assertIn(["dead"], client.stopped)
+        self.assertTrue(any("dead" in hashes for hashes, _tags in client.added_tags))
 
     def test_apply_single_download_parks_stalled_torrent_and_runs_replacement(self):
         client = FakeQbtClient([

@@ -131,6 +131,10 @@ Optional single-download selection tuning:
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum unified-score advantage required before preempting a productive torrent. |
 | `QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_SECONDS` | `900` | Minimum dwell lease granted when a torrent is selected. While the lease is active, a torrent that is productive or has current/recent connected peers is not preempted or replaced by a briefly higher-scoring candidate. Set to `0` to disable. |
 | `QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_PEER_GRACE_SECONDS` | lease seconds | How long recent connected peer contact keeps an active lease eligible after peers temporarily disappear. |
+| `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MIN_PROGRESS` | `0.999` | Progress threshold for classifying a no-progress torrent as `missing-final-piece`. |
+| `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MIN_AVAILABILITY` | `0.95` | Lower availability bound for `missing-final-piece` classification. |
+| `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MAX_AVAILABILITY` | `1.0` | Upper availability bound for `missing-final-piece` classification. |
+| `QBT_NO_PROGRESS_CLASS_SCORE_MAX_AGE_SECONDS` | `86400` | How long the last no-progress class influences candidate scoring. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES` | storage recovery stall samples | No-progress samples required before a non-productive running torrent is parked. qBittorrent `stalledDL`/`metaDL` torrents park immediately. |
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
@@ -247,6 +251,12 @@ Internally the selector classifies every torrent into a lifecycle state:
 `retryable`, or `stale`. Worker states consume a useful download slot;
 parked-listener states keep qBittorrent listening for peers without consuming a
 worker slot.
+No-progress samples are also classified as `actively-progressing`,
+`slow-progressing`, `missing-final-piece`, `metadata-wait`,
+`no-connected-peers`, or `tracker-dead`. Listener-worthy classes stay parked and
+out of normal worker competition. `tracker-dead` means there are no connected
+peers, no reported seeds, and no available pieces, so it is stopped and put into
+health-state cooldown rather than occupying a listener slot.
 
 Selection decisions use the same scoring model in normal mode, uncapped windows,
 preemption checks, and storage recovery. Decision logs include the chosen
