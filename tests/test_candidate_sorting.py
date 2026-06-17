@@ -13,6 +13,18 @@ class FakeHealthStore:
         return self.scores.get(torrent.get("hash"), 0.0)
 
 
+class FakeStorageClient:
+    def __init__(self, files):
+        self.files = files
+
+    def torrent_files(self, item_hash):
+        return [dict(item) for item in self.files.get(item_hash, [])]
+
+
+class FakeStorageGuard:
+    require_torrent_fit = True
+
+
 class CandidateSortingTests(unittest.TestCase):
     def setUp(self):
         self.guard = importlib.import_module("qbittorrent_smart_queues.guard")
@@ -253,6 +265,100 @@ class CandidateSortingTests(unittest.TestCase):
         )
 
         self.assertEqual(["priority", "almost-done"], [item["hash"] for item in ordered])
+
+    def test_candidate_score_exposes_unified_components(self):
+        gib = 1024 * 1024 * 1024
+        torrent = self.torrent(
+            "score",
+            category="movies",
+            tags="priority",
+            progress=0.92,
+            amount_left=512 * 1024 * 1024,
+            eta=3600,
+            availability=2.0,
+            num_seeds=3,
+            num_complete=7,
+        )
+        movie_state = {
+            "orders": {
+                "score": {
+                    "title": "score movie",
+                    "movie_id": 1,
+                    "year": 2026,
+                    "queue_position": 3,
+                    "source": "radarr",
+                },
+            },
+        }
+        storage_state = {
+            "enabled": True,
+            "stop": True,
+            "reason": "reserve reached",
+            "free_bytes": 2 * gib,
+            "reserve_bytes": 3 * gib,
+            "headroom_bytes": 0,
+        }
+
+        score = self.guard.candidate_score(
+            torrent,
+            {"priority"},
+            set(),
+            set(),
+            {},
+            {"movies"},
+            movie_state,
+            3,
+            1.05,
+            FakeHealthStore({"score": 12.5}),
+            self.now,
+            strategy="balanced",
+            storage_client=FakeStorageClient({
+                "score": [
+                    {"name": "score.mkv", "size": gib, "progress": 0.5, "priority": 1},
+                ],
+            }),
+            storage_guard=FakeStorageGuard(),
+            storage_state=storage_state,
+            active_cooldown_tags={"quota-stalled-no-progress-29990101T000000Z"},
+            active_cooldown_prefix="quota-stalled",
+        )
+        score_dict = score.as_dict()
+        components = score_dict["components"]
+
+        for name in (
+            "availability",
+            "content_total",
+            "cooldown",
+            "eta",
+            "health",
+            "near_complete",
+            "priority",
+            "progress",
+            "queue_order",
+            "remaining",
+            "sources",
+            "storage_fit",
+            "storage_remaining",
+        ):
+            self.assertIn(name, components)
+        self.assertEqual(1000.0, components["priority"])
+        self.assertEqual(-1000.0, components["cooldown"])
+        self.assertEqual(100.0, components["storage_fit"])
+        self.assertLess(components["queue_order"], 0)
+        self.assertTrue(score_dict["storage_fits"])
+        self.assertEqual(512 * 1024 * 1024, score_dict["storage_remaining_bytes"])
+        expected_total = sum(
+            score.components[name]
+            for name in (
+                "content_total",
+                "priority",
+                "queue_order",
+                "cooldown",
+                "storage_fit",
+                "storage_remaining",
+            )
+        )
+        self.assertAlmostEqual(expected_total, score.total)
 
     def test_preemption_uses_balanced_score_margin(self):
         current = self.torrent(

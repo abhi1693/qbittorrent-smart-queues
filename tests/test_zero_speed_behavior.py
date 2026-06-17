@@ -599,6 +599,11 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual([["small", "large"]], client.started)
         self.assertEqual([(5, None)], client.queue_limits)
         self.assertEqual("small", try_event["selected_torrent"]["hash"])
+        selected_score = try_event["selected_torrent"]["score"]
+        self.assertTrue(selected_score["storage_fits"])
+        self.assertIn("storage_fit", selected_score["components"])
+        self.assertIn("storage_remaining", selected_score["components"])
+        self.assertIn("queue_order", selected_score["components"])
         self.assertEqual(["small", "large"], [
             item["hash"] for item in try_event["selected_torrents"]
         ])
@@ -1024,6 +1029,11 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         try_event = next(item for item in decision_events if item.get("action") == "try_candidate")
 
         self.assertEqual("challenger", preempt_event["selected_torrent"]["hash"])
+        self.assertIn("score", preempt_event["selected_torrent"])
+        self.assertIn("content_total", preempt_event["selected_torrent"]["score"]["components"])
+        self.assertIn("queue_order", preempt_event["selected_torrent"]["score"]["components"])
+        self.assertIn("candidate score", preempt_event["reason"])
+        self.assertIn("score", preempt_event["rejected_torrents"][0]["torrent"])
         self.assertEqual(1, preempt_event["rejected_counts"]["preempted_productive"])
         self.assertEqual("challenger", try_event["selected_torrent"]["hash"])
         self.assertIn(["current"], client.stopped)

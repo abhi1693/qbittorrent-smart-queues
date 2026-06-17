@@ -125,10 +125,10 @@ Optional single-download selection tuning:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QBT_SINGLE_DOWNLOAD_SELECTION_STRATEGY` | `tiered` | Use `balanced` to score candidates with extra weight for near-complete torrents, smaller remaining downloads, shorter ETA, current seeds, and availability. |
+| `QBT_SINGLE_DOWNLOAD_SELECTION_STRATEGY` | `tiered` | `tiered` keeps Arr/queue order as the primary sort key. `balanced` lets the unified score weigh queue order with health, progress, ETA, sources, availability, priority, cooldown, and storage-fit components. |
 | `QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC` | `65536` | Minimum active download speed treated as productive in normal selection and used as the default recovery slow-torrent floor. |
-| `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED` | `false` | Allow a productive active torrent to yield when a stopped candidate has a much better balanced score. |
-| `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum balanced-score advantage required before preempting a productive torrent. |
+| `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED` | `false` | Allow a productive active torrent to yield when a stopped candidate has a much better unified score. |
+| `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum unified-score advantage required before preempting a productive torrent. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES` | storage recovery stall samples | No-progress samples required before a non-productive running torrent is parked. qBittorrent `stalledDL`/`metaDL` torrents park immediately. |
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
@@ -242,6 +242,14 @@ Internally the selector classifies every torrent into a lifecycle state:
 `retryable`, or `stale`. Worker states consume a useful download slot;
 parked-listener states keep qBittorrent listening for peers without consuming a
 worker slot.
+
+Selection decisions use the same scoring model in normal mode, uncapped windows,
+preemption checks, and storage recovery. Decision logs include the chosen
+torrent's `score` object with visible components for priority, queue order,
+health, progress, near-complete progress, remaining bytes, ETA, sources,
+availability, cooldown, storage fit, and storage remaining. In `tiered` mode the
+queue key still sorts before the score; in `balanced` mode the score is the
+primary ordering signal after explicit priority.
 
 When download storage is at or below the configured reserve and torrent-fit
 checks are enabled, the controller enters a constrained recovery mode instead of

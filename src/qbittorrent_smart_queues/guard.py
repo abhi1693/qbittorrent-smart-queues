@@ -127,6 +127,41 @@ class TorrentLifecycle:
         }
 
 
+@dataclass(frozen=True)
+class CandidateScore:
+    strategy: str
+    total: float
+    components: dict
+    sort_key: tuple
+    queue_key: tuple = ()
+    storage_remaining_bytes: int | None = None
+    storage_fits: bool | None = None
+
+    def as_dict(self):
+        components = {}
+        for key, value in sorted(self.components.items()):
+            if isinstance(value, bool) or value is None:
+                components[key] = value
+            elif isinstance(value, int):
+                components[key] = value
+            elif isinstance(value, float):
+                components[key] = round(value, 3)
+            else:
+                components[key] = value
+        result = {
+            "strategy": self.strategy,
+            "total": round(float(self.total), 3),
+            "components": components,
+        }
+        if self.queue_key:
+            result["queue_key"] = repr(self.queue_key)
+        if self.storage_remaining_bytes is not None:
+            result["storage_remaining_bytes"] = self.storage_remaining_bytes
+        if self.storage_fits is not None:
+            result["storage_fits"] = self.storage_fits
+        return result
+
+
 def prometheus_label(value):
     text = str(value or "")
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
@@ -3399,10 +3434,10 @@ def tracker_health_summary(trackers):
     return summary
 
 
-def torrent_decision_summary(torrent):
+def torrent_decision_summary(torrent, score=None):
     if not torrent:
         return None
-    return {
+    summary = {
         "hash": torrent_hash(torrent),
         "name": torrent_name(torrent),
         "category": torrent_category(torrent),
@@ -3417,6 +3452,9 @@ def torrent_decision_summary(torrent):
         "availability": torrent_availability(torrent),
         "tags": sorted(torrent_tags(torrent)),
     }
+    if score is not None:
+        summary["score"] = score.as_dict() if hasattr(score, "as_dict") else score
+    return summary
 
 
 def storage_decision_summary(storage_state):
@@ -5359,46 +5397,226 @@ def selection_strategy():
     return "tiered"
 
 
-def candidate_balanced_score(torrent, health_store, now):
-    score = health_store.score(torrent, now)
+def candidate_queue_rank(queue_key):
+    try:
+        media_group = int(queue_key[0])
+    except (IndexError, TypeError, ValueError):
+        return 1250.0
+
+    detail = queue_key[1] if isinstance(queue_key, tuple) and len(queue_key) > 1 else ()
+    known_penalty = 0.0
+    position = 999.0
+    if media_group == 0 and isinstance(detail, tuple) and detail:
+        try:
+            known_rank = int(detail[0])
+        except (TypeError, ValueError):
+            known_rank = 2
+        known_penalty = min(max(known_rank, 0), 2) * 100.0
+        if known_rank == 0:
+            series_rank = detail[3] if len(detail) > 3 else ()
+            if isinstance(series_rank, tuple) and series_rank:
+                try:
+                    position = int(series_rank[0])
+                except (TypeError, ValueError):
+                    position = 999.0
+            try:
+                season = min(max(int(detail[4]) if len(detail) > 4 else 999, 0), 999)
+                episode = min(max(int(detail[5]) if len(detail) > 5 else 999, 0), 999)
+                position = min(position, 999.0) + (season / 100.0) + (episode / 10000.0)
+            except (TypeError, ValueError):
+                pass
+    elif media_group == 1 and isinstance(detail, tuple):
+        try:
+            known_rank = int(detail[0])
+        except (IndexError, TypeError, ValueError):
+            known_rank = 2
+        known_penalty = min(max(known_rank, 0), 2) * 100.0
+        try:
+            position = int(detail[1])
+        except (IndexError, TypeError, ValueError):
+            position = 999.0
+    else:
+        known_penalty = 200.0
+
+    media_penalty = 150.0 if media_group >= 2 else 0.0
+    return media_penalty + known_penalty + min(max(float(position), 0.0), 999.0)
+
+
+def candidate_content_score_components(torrent, health_store, now):
+    health_score = health_store.score(torrent, now) if health_store else 0.0
+    components = {"health": health_score}
 
     progress = torrent_progress(torrent)
-    score += min(40.0, progress * 40.0)
+    components["progress"] = min(40.0, progress * 40.0)
     if progress >= 0.90:
-        score += 30.0
+        components["near_complete"] = 30.0
     elif progress >= 0.75:
-        score += 18.0
+        components["near_complete"] = 18.0
     elif progress >= 0.50:
-        score += 8.0
+        components["near_complete"] = 8.0
+    else:
+        components["near_complete"] = 0.0
 
     remaining = torrent_amount_left(torrent)
     gib = 1024 * 1024 * 1024
+    components["remaining"] = 0.0
     if remaining > 0:
         if remaining <= 2 * gib:
-            score += 25.0
+            components["remaining"] = 25.0
         elif remaining <= 5 * gib:
-            score += 18.0
+            components["remaining"] = 18.0
         elif remaining <= 15 * gib:
-            score += 10.0
+            components["remaining"] = 10.0
         elif remaining >= 75 * gib:
-            score -= 10.0
+            components["remaining"] = -10.0
 
     eta = torrent_eta_seconds(torrent)
+    components["eta"] = 0.0
     if eta is not None and eta > 0:
         if eta <= 6 * 3600:
-            score += 20.0
+            components["eta"] = 20.0
         elif eta <= 24 * 3600:
-            score += 12.0
+            components["eta"] = 12.0
         elif eta <= 2 * 24 * 3600:
-            score += 6.0
+            components["eta"] = 6.0
         elif eta >= 7 * 24 * 3600:
-            score -= 12.0
+            components["eta"] = -12.0
 
     sources = max(torrent_connected_seeds(torrent), torrent_reported_seeds(torrent))
-    score += min(20.0, sources * 2.0)
-    score += min(15.0, torrent_availability(torrent) * 5.0)
+    components["sources"] = min(20.0, sources * 2.0)
+    components["availability"] = min(15.0, torrent_availability(torrent) * 5.0)
+    components["content_total"] = max(-150.0, min(200.0, sum(components.values())))
+    return components
 
-    return max(-150.0, min(200.0, score))
+
+def candidate_score(
+    torrent,
+    priority_tags,
+    priority_categories,
+    tv_order_categories,
+    tv_order_state,
+    movie_order_categories,
+    movie_order_state,
+    healthy_min_seeds,
+    healthy_min_availability,
+    health_store,
+    now,
+    strategy=None,
+    storage_client=None,
+    storage_guard=None,
+    storage_state=None,
+    active_cooldown_tags=None,
+    active_cooldown_prefix="",
+):
+    strategy = strategy or selection_strategy()
+    is_priority = bool(torrent_priority_reason(torrent, priority_tags or set(), priority_categories or set()))
+    queue_key = media_queue_order_key(
+        torrent,
+        tv_order_categories or set(),
+        tv_order_state or {},
+        movie_order_categories or set(),
+        movie_order_state or {},
+    )
+    queue_rank = candidate_queue_rank(queue_key)
+    queue_weight = 0.05 if strategy == "balanced" else 0.25
+    cooldown_tags = [
+        tag for tag in (active_cooldown_tags or [])
+        if not active_cooldown_prefix or str(tag).startswith(active_cooldown_prefix)
+    ]
+
+    components = candidate_content_score_components(torrent, health_store, now)
+    components["priority"] = 1000.0 if is_priority else 0.0
+    components["queue_order"] = -queue_rank * queue_weight
+    components["cooldown"] = -1000.0 if cooldown_tags else 0.0
+
+    storage_remaining_bytes = None
+    storage_fits = None
+    if storage_guard and storage_state:
+        if storage_client is None and getattr(storage_guard, "require_torrent_fit", False):
+            storage_remaining_bytes = None
+        else:
+            storage_remaining_bytes = storage_verified_remaining_bytes(
+                storage_client,
+                torrent,
+                storage_guard,
+                storage_state,
+            )
+        storage_fits = (
+            storage_remaining_bytes is not None
+            and storage_remaining_bytes <= storage_fit_headroom_bytes(storage_guard, storage_state)
+        )
+        components["storage_fit"] = 100.0 if storage_fits else -100.0
+        if storage_remaining_bytes is None:
+            components["storage_remaining"] = -100.0
+        else:
+            gib = 1024 * 1024 * 1024
+            components["storage_remaining"] = -min(60.0, math.log2((storage_remaining_bytes / gib) + 1.0) * 12.0)
+    else:
+        components["storage_fit"] = 0.0
+        components["storage_remaining"] = 0.0
+
+    total_component_names = (
+        "content_total",
+        "priority",
+        "queue_order",
+        "cooldown",
+        "storage_fit",
+        "storage_remaining",
+    )
+    total = sum(float(components.get(name, 0.0)) for name in total_component_names)
+    if storage_guard and storage_state:
+        storage_sort_remaining = storage_remaining_bytes if storage_remaining_bytes is not None else sys.maxsize
+        sort_key = (
+            0 if storage_fits else 1,
+            storage_sort_remaining,
+            0 if is_priority else 1,
+            -total,
+            candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
+            torrent_name(torrent).lower(),
+        )
+    elif strategy == "balanced":
+        reported_sources = max(torrent_connected_seeds(torrent), torrent_reported_seeds(torrent))
+        sort_key = (
+            0 if is_priority else 1,
+            -total,
+            candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
+            -min(torrent_availability(torrent), 100.0),
+            -reported_sources,
+            -torrent_connected_seeds(torrent),
+            -torrent_progress(torrent),
+            torrent_amount_left(torrent),
+            queue_key,
+            torrent_name(torrent).lower(),
+        )
+    else:
+        reported_sources = max(torrent_connected_seeds(torrent), torrent_reported_seeds(torrent))
+        sort_key = (
+            0 if is_priority else 1,
+            queue_key,
+            -total,
+            candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
+            -min(torrent_availability(torrent), 100.0),
+            -reported_sources,
+            -torrent_connected_seeds(torrent),
+            -torrent_progress(torrent),
+            torrent_amount_left(torrent),
+            torrent_name(torrent).lower(),
+        )
+
+    return CandidateScore(
+        strategy=strategy,
+        total=total,
+        components=components,
+        sort_key=sort_key,
+        queue_key=queue_key,
+        storage_remaining_bytes=storage_remaining_bytes,
+        storage_fits=storage_fits,
+    )
+
+
+def candidate_balanced_score(torrent, health_store, now):
+    components = candidate_content_score_components(torrent, health_store, now)
+    return components["content_total"]
 
 
 class TorrentHealthStore:
@@ -5901,57 +6119,73 @@ def candidate_sort_key(
     now,
     strategy=None,
 ):
-    strategy = strategy or selection_strategy()
-    is_priority = bool(torrent_priority_reason(torrent, priority_tags, priority_categories))
-    reported_sources = max(torrent_connected_seeds(torrent), torrent_reported_seeds(torrent))
-    if strategy == "balanced":
-        score = candidate_balanced_score(torrent, health_store, now)
-    else:
-        score = health_store.score(torrent, now)
-    queue_key = media_queue_order_key(
+    return candidate_score(
         torrent,
+        priority_tags,
+        priority_categories,
         tv_order_categories,
         tv_order_state,
         movie_order_categories,
         movie_order_state,
-    )
-    if strategy == "balanced":
-        return (
-            0 if is_priority else 1,
-            -score,
-            candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
-            -min(torrent_availability(torrent), 100.0),
-            -reported_sources,
-            -torrent_connected_seeds(torrent),
-            -torrent_progress(torrent),
-            torrent_amount_left(torrent),
-            queue_key,
-            torrent_name(torrent).lower(),
-        )
-    return (
-        0 if is_priority else 1,
-        queue_key,
-        -score,
-        candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability),
-        -min(torrent_availability(torrent), 100.0),
-        -reported_sources,
-        -torrent_connected_seeds(torrent),
-        -torrent_progress(torrent),
-        torrent_amount_left(torrent),
-        torrent_name(torrent).lower(),
-    )
+        healthy_min_seeds,
+        healthy_min_availability,
+        health_store,
+        now,
+        strategy,
+    ).sort_key
 
 
-def should_preempt_productive_torrent(current, challenger, health_store, now, score_margin):
+def should_preempt_productive_torrent(
+    current,
+    challenger,
+    health_store,
+    now,
+    score_margin,
+    priority_tags=None,
+    priority_categories=None,
+    tv_order_categories=None,
+    tv_order_state=None,
+    movie_order_categories=None,
+    movie_order_state=None,
+    healthy_min_seeds=3,
+    healthy_min_availability=1.05,
+    strategy=None,
+):
     if not current or not challenger:
         return False
     if torrent_hash(current) == torrent_hash(challenger):
         return False
     if is_running_torrent(challenger):
         return False
-    current_score = candidate_balanced_score(current, health_store, now)
-    challenger_score = candidate_balanced_score(challenger, health_store, now)
-    return challenger_score >= current_score + max(0.0, float(score_margin))
+    current_score = candidate_score(
+        current,
+        priority_tags or set(),
+        priority_categories or set(),
+        tv_order_categories or set(),
+        tv_order_state or {},
+        movie_order_categories or set(),
+        movie_order_state or {},
+        healthy_min_seeds,
+        healthy_min_availability,
+        health_store,
+        now,
+        strategy or "balanced",
+    )
+    challenger_score = candidate_score(
+        challenger,
+        priority_tags or set(),
+        priority_categories or set(),
+        tv_order_categories or set(),
+        tv_order_state or {},
+        movie_order_categories or set(),
+        movie_order_state or {},
+        healthy_min_seeds,
+        healthy_min_availability,
+        health_store,
+        now,
+        strategy or "balanced",
+    )
+    return challenger_score.total >= current_score.total + max(0.0, float(score_margin))
 
 
 def selected_storage_remaining_state(client, torrent):
@@ -6041,10 +6275,23 @@ def storage_recovery_batch(
     max_active,
     initial_remaining_bytes=0,
     excluded_hashes=None,
+    score_context=None,
 ):
     max_active = max(1, int(max_active))
     fit_bytes = storage_fit_headroom_bytes(storage_guard, storage_state)
     excluded_hashes = set(excluded_hashes or [])
+    score_context = dict(score_context or {})
+    if score_context:
+        candidates = sorted(
+            candidates,
+            key=lambda torrent: candidate_score(
+                torrent,
+                storage_client=client,
+                storage_guard=storage_guard,
+                storage_state=storage_state,
+                **score_context,
+            ).sort_key,
+        )
     selected = []
     selected_remaining_bytes = max(0, int(initial_remaining_bytes or 0))
     deferred_count = 0
@@ -6678,22 +6925,40 @@ def apply_single_download(
                 jellyfin_watch,
             )
             movie_order_state = build_movie_order_state(torrents, movie_order_categories, radarr_queue)
+            score_context = {
+                "priority_tags": priority_tags,
+                "priority_categories": priority_categories,
+                "tv_order_categories": tv_order_categories,
+                "tv_order_state": tv_order_state,
+                "movie_order_categories": movie_order_categories,
+                "movie_order_state": movie_order_state,
+                "healthy_min_seeds": healthy_min_seeds,
+                "healthy_min_availability": healthy_min_availability,
+                "health_store": health_store,
+                "now": now,
+                "strategy": selection_strategy_name,
+            }
+
+            def score_for(torrent, storage_scoring=False, active_cooldown_tags=None):
+                return candidate_score(
+                    torrent,
+                    storage_client=client if storage_scoring else None,
+                    storage_guard=storage_guard if storage_scoring else None,
+                    storage_state=storage_state if storage_scoring else None,
+                    active_cooldown_tags=active_cooldown_tags,
+                    active_cooldown_prefix=stall_tag_prefix,
+                    **score_context,
+                )
+
+            def scored_torrent_summary(torrent, storage_scoring=False):
+                return torrent_decision_summary(
+                    torrent,
+                    score_for(torrent, storage_scoring=storage_scoring),
+                )
+
             all_candidates = sorted(
                 eligible_torrents,
-                key=lambda torrent: candidate_sort_key(
-                    torrent,
-                    priority_tags,
-                    priority_categories,
-                    tv_order_categories,
-                    tv_order_state,
-                    movie_order_categories,
-                    movie_order_state,
-                    healthy_min_seeds,
-                    healthy_min_availability,
-                    health_store,
-                    now,
-                    selection_strategy_name,
-                ),
+                key=lambda torrent: score_for(torrent).sort_key,
             )
             candidates = []
             storage_blocked_count = 0
@@ -6723,10 +6988,7 @@ def apply_single_download(
 
             if storage_constrained_mode:
                 candidates.sort(
-                    key=lambda torrent: (
-                        storage_recovery_sort_remaining_bytes(client, torrent, storage_guard, storage_state),
-                        torrent_name(torrent).lower(),
-                    )
+                    key=lambda torrent: score_for(torrent, storage_scoring=True).sort_key,
                 )
 
             available_candidates = []
@@ -6838,6 +7100,7 @@ def apply_single_download(
                     storage_recovery_max_active,
                     initial_remaining_bytes=storage_recovery_parked_remaining_bytes,
                     excluded_hashes=storage_recovery_parked_hashes | storage_recovery_slow_excluded_hashes,
+                    score_context=score_context,
                 )
                 rejected_counts["parked_storage_recovery_stalled"] += len(storage_recovery_parked_torrents)
                 rejected_counts["deferred_storage_recovery_parked"] += storage_recovery_parked_deferred_count
@@ -6969,7 +7232,7 @@ def apply_single_download(
                     reason="stalled torrents remain active while waiting for replacement candidates",
                     selected_torrent=None,
                     selected_torrents=[
-                        torrent_decision_summary(torrent)
+                        scored_torrent_summary(torrent)
                         for torrent in normal_parked_stalled_torrents
                     ],
                     rejected_counts=dict(rejected_counts),
@@ -7028,7 +7291,7 @@ def apply_single_download(
                     reason="storage recovery has parked stalled torrents but no fitting replacement workers",
                     selected_torrent=None,
                     selected_torrents=[
-                        torrent_decision_summary(torrent)
+                        scored_torrent_summary(torrent, storage_scoring=True)
                         for torrent in storage_recovery_parked_torrents
                     ],
                     rejected_counts=dict(rejected_counts),
@@ -7096,9 +7359,9 @@ def apply_single_download(
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="storage_recovery_batch",
                     reason="download storage is below reserve; running smallest fitting torrents",
-                    selected_torrent=torrent_decision_summary(selection_candidates[0]),
+                    selected_torrent=scored_torrent_summary(selection_candidates[0], storage_scoring=True),
                     selected_torrents=[
-                        torrent_decision_summary(torrent)
+                        scored_torrent_summary(torrent, storage_scoring=True)
                         for torrent in storage_recovery_parked_torrents + selection_candidates
                     ],
                     rejected_counts=dict(rejected_counts),
@@ -7136,7 +7399,10 @@ def apply_single_download(
                             action="stop_storage_recovery_for_storage",
                             reason=storage_state["reason"],
                             selected_torrents=[
-                                torrent_decision_summary(refreshed.get(torrent_hash(torrent)) or torrent)
+                                scored_torrent_summary(
+                                    refreshed.get(torrent_hash(torrent)) or torrent,
+                                    storage_scoring=True,
+                                )
                                 for torrent in selection_candidates
                             ],
                             rejected_counts={"storage_stop": 1},
@@ -7180,7 +7446,7 @@ def apply_single_download(
                     if progress_reason:
                         progress_events.append(
                             {
-                                "torrent": torrent_decision_summary(selected_refreshed),
+                                "torrent": scored_torrent_summary(selected_refreshed, storage_scoring=True),
                                 "reason": progress_reason,
                             }
                         )
@@ -7214,17 +7480,20 @@ def apply_single_download(
                         "storage recovery batch remains selected; repeated no-progress "
                         "members will be parked and replacement workers selected next poll"
                     ),
-                    selected_torrent=torrent_decision_summary(selection_candidates[0]),
+                    selected_torrent=scored_torrent_summary(selection_candidates[0], storage_scoring=True),
                     selected_torrents=[
-                        torrent_decision_summary(refreshed.get(torrent_hash(torrent)) or torrent)
+                        scored_torrent_summary(
+                            refreshed.get(torrent_hash(torrent)) or torrent,
+                            storage_scoring=True,
+                        )
                         for torrent in storage_recovery_parked_torrents + selection_candidates
                     ],
                     parked_torrents=[
-                        torrent_decision_summary(torrent)
+                        scored_torrent_summary(torrent, storage_scoring=True)
                         for torrent in storage_recovery_parked_torrents + parked_after_sample
                     ],
                     slow_excluded_torrents=[
-                        torrent_decision_summary(torrent)
+                        scored_torrent_summary(torrent, storage_scoring=True)
                         for torrent in slow_excluded_after_sample
                     ],
                     progress_torrents=progress_events[:5],
@@ -7271,13 +7540,22 @@ def apply_single_download(
                     health_store,
                     now,
                     preempt_productive_score_margin,
+                    priority_tags=priority_tags,
+                    priority_categories=priority_categories,
+                    tv_order_categories=tv_order_categories,
+                    tv_order_state=tv_order_state,
+                    movie_order_categories=movie_order_categories,
+                    movie_order_state=movie_order_state,
+                    healthy_min_seeds=healthy_min_seeds,
+                    healthy_min_availability=healthy_min_availability,
+                    strategy=selection_strategy_name,
                 ):
                     keep_hash = torrent_hash(keep)
-                    challenger_score = candidate_balanced_score(challenger, health_store, now)
-                    keep_score = candidate_balanced_score(keep, health_store, now)
+                    challenger_score = score_for(challenger)
+                    keep_score = score_for(keep)
                     reason = (
-                        f"candidate balanced score {challenger_score:.1f} beats "
-                        f"productive torrent score {keep_score:.1f} by at least "
+                        f"candidate score {challenger_score.total:.1f} beats "
+                        f"productive torrent score {keep_score.total:.1f} by at least "
                         f"{preempt_productive_score_margin:.1f}"
                     )
                     client.stop_hashes([keep_hash])
@@ -7293,12 +7571,12 @@ def apply_single_download(
                         **decision_base_context(run_decision_context, client, storage_state),
                         action="preempt_productive",
                         reason=reason,
-                        selected_torrent=torrent_decision_summary(challenger),
+                        selected_torrent=torrent_decision_summary(challenger, challenger_score),
                         rejected_counts=dict(rejected_counts),
                         candidate_counts=candidate_counts,
                         rejected_torrents=[
                             {
-                                "torrent": torrent_decision_summary(keep),
+                                "torrent": torrent_decision_summary(keep, keep_score),
                                 "reason": reason,
                             },
                         ],
@@ -7334,7 +7612,7 @@ def apply_single_download(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="keep_productive",
-                    selected_torrent=torrent_decision_summary(keep),
+                    selected_torrent=scored_torrent_summary(keep),
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
                 )
@@ -7369,7 +7647,7 @@ def apply_single_download(
                                 **decision_base_context(run_decision_context, client, storage_state),
                                 action="stop_kept_for_storage",
                                 reason=storage_state["reason"],
-                                selected_torrent=torrent_decision_summary(keep_refreshed or keep),
+                                selected_torrent=scored_torrent_summary(keep_refreshed or keep),
                                 rejected_counts={"storage_stop": 1},
                                 candidate_counts=candidate_counts,
                             )
@@ -7395,7 +7673,7 @@ def apply_single_download(
                         **decision_base_context(run_decision_context, client, storage_state),
                         action="confirm_kept_productive",
                         reason=progress_reason,
-                        selected_torrent=torrent_decision_summary(keep_refreshed),
+                        selected_torrent=scored_torrent_summary(keep_refreshed),
                         rejected_counts=dict(rejected_counts),
                         candidate_counts=candidate_counts,
                     )
@@ -7418,7 +7696,7 @@ def apply_single_download(
                         **decision_base_context(run_decision_context, client, storage_state),
                         action="keep_storage_constrained_until_stalled",
                         reason="storage-constrained candidate has not stalled",
-                        selected_torrent=torrent_decision_summary(keep_refreshed),
+                        selected_torrent=scored_torrent_summary(keep_refreshed, storage_scoring=True),
                         rejected_counts=dict(rejected_counts),
                         candidate_counts=candidate_counts,
                     )
@@ -7448,8 +7726,8 @@ def apply_single_download(
                             "did not make progress; keeping active so it can resume "
                             "immediately if peers return"
                         ),
-                        selected_torrent=torrent_decision_summary(parked_torrent),
-                        parked_torrents=[torrent_decision_summary(parked_torrent)],
+                        selected_torrent=scored_torrent_summary(parked_torrent),
+                        parked_torrents=[scored_torrent_summary(parked_torrent)],
                         rejected_counts={"no_progress_after_wait": 1},
                         candidate_counts=candidate_counts,
                     )
@@ -7485,7 +7763,7 @@ def apply_single_download(
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="stop_kept_no_progress",
                     reason="did not make progress",
-                    selected_torrent=torrent_decision_summary(keep_refreshed or keep),
+                    selected_torrent=scored_torrent_summary(keep_refreshed or keep),
                     rejected_counts={"no_progress_after_wait": 1},
                     candidate_counts=candidate_counts,
                 )
@@ -7539,7 +7817,7 @@ def apply_single_download(
                     },
                     selected_torrent=None,
                     selected_torrents=[
-                        torrent_decision_summary(torrent)
+                        scored_torrent_summary(torrent)
                         for torrent in stalled_candidates[:5]
                     ],
                 )
@@ -7564,7 +7842,7 @@ def apply_single_download(
                     candidate_counts=candidate_counts,
                     selected_torrent=None,
                     rejected_torrents=[
-                        torrent_decision_summary(torrent)
+                        scored_torrent_summary(torrent)
                         for torrent in stalled_candidates[:5]
                     ],
                 )
@@ -7693,7 +7971,7 @@ def apply_single_download(
                 "qbt_guard_decision",
                 **decision_base_context(run_decision_context, client, storage_state),
                 action="try_candidate",
-                selected_torrent=torrent_decision_summary(selected),
+                selected_torrent=scored_torrent_summary(selected),
                 rejected_counts=dict(rejected_counts),
                 candidate_counts=candidate_counts,
                 attempt=attempt,
@@ -7733,7 +8011,7 @@ def apply_single_download(
                             **decision_base_context(run_decision_context, client, storage_state),
                             action="stop_selected_for_storage",
                             reason=storage_state["reason"],
-                            selected_torrent=torrent_decision_summary(selected_refreshed or selected),
+                            selected_torrent=scored_torrent_summary(selected_refreshed or selected),
                             rejected_counts={"storage_stop": 1},
                             candidate_counts=candidate_counts,
                         )
@@ -7759,7 +8037,7 @@ def apply_single_download(
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="confirm_selected_productive",
                     reason=progress_reason,
-                    selected_torrent=torrent_decision_summary(selected_refreshed),
+                    selected_torrent=scored_torrent_summary(selected_refreshed),
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
                 )
@@ -7785,7 +8063,7 @@ def apply_single_download(
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="keep_storage_constrained_until_stalled",
                     reason="storage-constrained candidate has not stalled",
-                    selected_torrent=torrent_decision_summary(selected_refreshed),
+                    selected_torrent=scored_torrent_summary(selected_refreshed, storage_scoring=True),
                     rejected_counts=dict(rejected_counts),
                     candidate_counts=candidate_counts,
                 )
@@ -7815,8 +8093,8 @@ def apply_single_download(
                         "did not make progress; keeping active so it can resume "
                         "immediately if peers return"
                     ),
-                    selected_torrent=torrent_decision_summary(parked_torrent),
-                    parked_torrents=[torrent_decision_summary(parked_torrent)],
+                    selected_torrent=scored_torrent_summary(parked_torrent),
+                    parked_torrents=[scored_torrent_summary(parked_torrent)],
                     rejected_counts={"no_progress_after_wait": 1},
                     candidate_counts=candidate_counts,
                 )
@@ -7851,7 +8129,7 @@ def apply_single_download(
                 **decision_base_context(run_decision_context, client, storage_state),
                 action="stop_selected_no_progress",
                 reason="did not make progress",
-                selected_torrent=torrent_decision_summary(selected_refreshed or selected),
+                selected_torrent=scored_torrent_summary(selected_refreshed or selected),
                 rejected_counts={"no_progress_after_wait": 1},
                 candidate_counts=candidate_counts,
             )
