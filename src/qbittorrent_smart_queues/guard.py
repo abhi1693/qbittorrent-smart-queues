@@ -6871,6 +6871,608 @@ def storage_torrent_block_reason(client, torrent, storage_guard, storage_state):
     )
 
 
+SMART_QUEUE_POLICY_STAGES = (
+    "observe",
+    "classify",
+    "filter",
+    "score",
+    "allocate_slots",
+    "act",
+    "record",
+)
+
+
+@dataclass(frozen=True)
+class SmartQueuePolicyObservation:
+    torrents: list
+    storage_constrained_mode: bool
+    tv_order_state: dict
+    movie_order_state: dict
+    score_context: dict
+
+
+@dataclass(frozen=True)
+class SmartQueuePolicyClassification:
+    eligible_torrents: list
+    rejected_counts: Counter
+    tracker_health_observed: int
+
+
+@dataclass(frozen=True)
+class SmartQueuePolicyFilterResult:
+    all_candidates: list
+    candidates: list
+    available_candidates: list
+    cooldown_count: int
+    storage_blocked_count: int
+    storage_blocked_examples: list
+    tv_order_blocked_count: int
+    tv_order_blocked_examples: list
+
+
+@dataclass(frozen=True)
+class SmartQueuePolicyScoreResult:
+    watch_priority_candidates: list
+    priority_candidates: list
+    storage_recovery_parked_torrents: list
+    storage_recovery_parked_hashes: set
+    storage_recovery_parked_remaining_bytes: int
+    storage_recovery_parked_deferred_count: int
+    storage_recovery_slow_excluded_hashes: set
+    storage_recovery_selected_remaining_bytes: int
+    storage_recovery_deferred_count: int
+    normal_parked_stalled_torrents: list
+    normal_parked_stalled_hashes: set
+    normal_parked_stalled_deferred_count: int
+    selection_candidates: list
+    productive_candidates: list
+
+
+@dataclass(frozen=True)
+class SmartQueuePolicyAllocation:
+    slot_plan: SmartQueueSlotPlan
+
+
+@dataclass(frozen=True)
+class SmartQueuePolicyActionPlan:
+    action: str
+
+
+@dataclass(frozen=True)
+class SmartQueuePolicyResult:
+    stages: tuple
+    observation: SmartQueuePolicyObservation
+    classification: SmartQueuePolicyClassification
+    filters: SmartQueuePolicyFilterResult
+    scoring: SmartQueuePolicyScoreResult
+    allocation: SmartQueuePolicyAllocation
+    action_plan: SmartQueuePolicyActionPlan
+    rejected_counts: Counter
+    candidate_counts: dict
+
+
+class SmartQueuePolicyEngine:
+    stages = SMART_QUEUE_POLICY_STAGES
+
+    def __init__(
+        self,
+        *,
+        client,
+        torrents,
+        health_store,
+        now,
+        storage_guard,
+        storage_state,
+        storage_constrained_mode,
+        min_progress,
+        max_remaining_bytes,
+        categories,
+        tracker_health_max_candidates,
+        tracker_health_min_refresh_seconds,
+        tv_order_categories,
+        movie_order_categories,
+        sonarr_queue,
+        jellyfin_watch,
+        radarr_queue,
+        priority_tags,
+        priority_categories,
+        healthy_min_seeds,
+        healthy_min_availability,
+        selection_strategy_name,
+        attempted_hashes,
+        stall_tag_prefix,
+        stall_cooldown_seconds,
+        storage_recovery_max_active,
+        storage_recovery_stall_samples,
+        storage_recovery_max_parked_stalled,
+        storage_recovery_min_rate_bytes,
+        park_stalled_downloads_enabled,
+        park_stalled_samples,
+        max_parked_stalled_downloads,
+        normal_worker_limit,
+        normal_progress_min_bytes,
+    ):
+        self.client = client
+        self.torrents = list(torrents or [])
+        self.health_store = health_store
+        self.now = now
+        self.storage_guard = storage_guard
+        self.storage_state = storage_state
+        self.storage_constrained_mode = bool(storage_constrained_mode)
+        self.min_progress = min_progress
+        self.max_remaining_bytes = max_remaining_bytes
+        self.categories = categories
+        self.tracker_health_max_candidates = tracker_health_max_candidates
+        self.tracker_health_min_refresh_seconds = tracker_health_min_refresh_seconds
+        self.tv_order_categories = tv_order_categories
+        self.movie_order_categories = movie_order_categories
+        self.sonarr_queue = sonarr_queue
+        self.jellyfin_watch = jellyfin_watch
+        self.radarr_queue = radarr_queue
+        self.priority_tags = priority_tags
+        self.priority_categories = priority_categories
+        self.healthy_min_seeds = healthy_min_seeds
+        self.healthy_min_availability = healthy_min_availability
+        self.selection_strategy_name = selection_strategy_name
+        self.attempted_hashes = set(attempted_hashes or [])
+        self.stall_tag_prefix = stall_tag_prefix
+        self.stall_cooldown_seconds = stall_cooldown_seconds
+        self.storage_recovery_max_active = storage_recovery_max_active
+        self.storage_recovery_stall_samples = storage_recovery_stall_samples
+        self.storage_recovery_max_parked_stalled = storage_recovery_max_parked_stalled
+        self.storage_recovery_min_rate_bytes = storage_recovery_min_rate_bytes
+        self.park_stalled_downloads_enabled = park_stalled_downloads_enabled
+        self.park_stalled_samples = park_stalled_samples
+        self.max_parked_stalled_downloads = max_parked_stalled_downloads
+        self.normal_worker_limit = normal_worker_limit
+        self.normal_progress_min_bytes = normal_progress_min_bytes
+
+    def observe(self):
+        self.health_store.observe_torrents(self.torrents, self.now)
+        tv_order_state = build_tv_order_state(
+            self.torrents,
+            self.tv_order_categories,
+            self.sonarr_queue,
+            self.jellyfin_watch,
+        )
+        movie_order_state = build_movie_order_state(
+            self.torrents,
+            self.movie_order_categories,
+            self.radarr_queue,
+        )
+        return SmartQueuePolicyObservation(
+            torrents=self.torrents,
+            storage_constrained_mode=self.storage_constrained_mode,
+            tv_order_state=tv_order_state,
+            movie_order_state=movie_order_state,
+            score_context={
+                "priority_tags": self.priority_tags,
+                "priority_categories": self.priority_categories,
+                "tv_order_categories": self.tv_order_categories,
+                "tv_order_state": tv_order_state,
+                "movie_order_categories": self.movie_order_categories,
+                "movie_order_state": movie_order_state,
+                "healthy_min_seeds": self.healthy_min_seeds,
+                "healthy_min_availability": self.healthy_min_availability,
+                "health_store": self.health_store,
+                "now": self.now,
+                "strategy": self.selection_strategy_name,
+            },
+        )
+
+    def classify(self, observation):
+        rejected_counts = Counter()
+        eligible_torrents = []
+        for torrent in observation.torrents:
+            reject_reason = single_download_reject_reason(
+                torrent,
+                self.min_progress,
+                self.max_remaining_bytes,
+                self.categories,
+            )
+            if reject_reason:
+                rejected_counts[reject_reason] += 1
+            else:
+                eligible_torrents.append(torrent)
+
+        tracker_health_observed = self.health_store.observe_tracker_health(
+            self.client,
+            eligible_torrents,
+            self.now,
+            self.tracker_health_max_candidates,
+            self.tracker_health_min_refresh_seconds,
+        )
+        return SmartQueuePolicyClassification(
+            eligible_torrents=eligible_torrents,
+            rejected_counts=rejected_counts,
+            tracker_health_observed=tracker_health_observed,
+        )
+
+    def score_for(self, observation, torrent, storage_scoring=False, active_cooldown_tags=None):
+        return candidate_score(
+            torrent,
+            storage_client=self.client if storage_scoring else None,
+            storage_guard=self.storage_guard if storage_scoring else None,
+            storage_state=self.storage_state if storage_scoring else None,
+            active_cooldown_tags=active_cooldown_tags,
+            active_cooldown_prefix=self.stall_tag_prefix,
+            **observation.score_context,
+        )
+
+    def filter(self, observation, classification):
+        rejected_counts = classification.rejected_counts
+        all_candidates = sorted(
+            classification.eligible_torrents,
+            key=lambda torrent: self.score_for(observation, torrent).sort_key,
+        )
+        candidates = []
+        storage_blocked_count = 0
+        storage_blocked_examples = []
+        tv_order_blocked_count = 0
+        tv_order_blocked_examples = []
+        for torrent in all_candidates:
+            storage_reason = storage_torrent_block_reason(
+                self.client,
+                torrent,
+                self.storage_guard,
+                self.storage_state,
+            )
+            if storage_reason:
+                rejected_counts["storage_headroom"] += 1
+                storage_blocked_count += 1
+                if len(storage_blocked_examples) < 3:
+                    storage_blocked_examples.append(f"{torrent_name(torrent)}: {storage_reason}")
+                continue
+            tv_order_reason = tv_queue_order_block_reason(
+                torrent,
+                self.tv_order_categories,
+                observation.tv_order_state,
+            )
+            if tv_order_reason:
+                rejected_counts["tv_queue_order_blocked"] += 1
+                tv_order_blocked_count += 1
+                if len(tv_order_blocked_examples) < 3:
+                    tv_order_blocked_examples.append(f"{torrent_name(torrent)}: {tv_order_reason}")
+                continue
+            candidates.append(torrent)
+
+        if observation.storage_constrained_mode:
+            candidates.sort(
+                key=lambda torrent: self.score_for(
+                    observation,
+                    torrent,
+                    storage_scoring=True,
+                ).sort_key,
+            )
+
+        available_candidates = []
+        cooldown_count = 0
+        for torrent in candidates:
+            candidate_hash = torrent_hash(torrent)
+            if candidate_hash in self.attempted_hashes:
+                rejected_counts["attempted_this_run"] += 1
+                continue
+            cooldown_state = {}
+            if (
+                not observation.storage_constrained_mode
+                and hasattr(self.health_store, "active_cooldown_state")
+            ):
+                cooldown_state = self.health_store.active_cooldown_state(
+                    torrent,
+                    self.now,
+                    scope="normal",
+                )
+            active_stall_tag_prefix = "" if observation.storage_constrained_mode else self.stall_tag_prefix
+            if active_stall_tag_prefix:
+                clear_expired_stall_tags(
+                    self.client,
+                    torrent,
+                    active_stall_tag_prefix,
+                    self.now,
+                    self.stall_cooldown_seconds,
+                    health_store=self.health_store,
+                    canonical_cooldown_state=cooldown_state,
+                )
+            if cooldown_state:
+                cooldown_reason = cooldown_state.get("reason") or "unknown"
+                rejected_counts["cooldown"] += 1
+                rejected_counts[f"cooldown_{cooldown_reason.replace('-', '_')}"] += 1
+                cooldown_count += 1
+                log_info(
+                    f"Skipping torrent in stall cooldown "
+                    f"({cooldown_reason}, retry in "
+                    f"{human_duration(cooldown_state.get('remaining_seconds', 0))}) "
+                    f"{torrent_name(torrent)}"
+                )
+                continue
+            available_candidates.append(torrent)
+
+        return SmartQueuePolicyFilterResult(
+            all_candidates=all_candidates,
+            candidates=candidates,
+            available_candidates=available_candidates,
+            cooldown_count=cooldown_count,
+            storage_blocked_count=storage_blocked_count,
+            storage_blocked_examples=storage_blocked_examples,
+            tv_order_blocked_count=tv_order_blocked_count,
+            tv_order_blocked_examples=tv_order_blocked_examples,
+        )
+
+    def score(self, observation, classification, filters):
+        rejected_counts = classification.rejected_counts
+        watch_priority_candidates = [
+            torrent for torrent in filters.available_candidates
+            if torrent_hash(torrent) in observation.tv_order_state.get("watch_priorities", {})
+        ]
+        priority_candidates = [
+            torrent for torrent in filters.available_candidates
+            if torrent_priority_reason(torrent, self.priority_tags, self.priority_categories)
+        ]
+        storage_recovery_parked_torrents = []
+        storage_recovery_parked_hashes = set()
+        storage_recovery_parked_remaining_bytes = 0
+        storage_recovery_parked_deferred_count = 0
+        storage_recovery_slow_excluded_hashes = set()
+        storage_recovery_selected_remaining_bytes = 0
+        storage_recovery_deferred_count = 0
+        normal_parked_stalled_torrents = []
+        normal_parked_stalled_hashes = set()
+        normal_parked_stalled_deferred_count = 0
+
+        if observation.storage_constrained_mode:
+            fit_bytes = storage_fit_headroom_bytes(self.storage_guard, self.storage_state)
+            for torrent in filters.available_candidates:
+                item_hash = torrent_hash(torrent)
+                if not item_hash:
+                    continue
+                if self.health_store.storage_recovery_no_progress_samples(torrent) < self.storage_recovery_stall_samples:
+                    continue
+                if is_running_torrent(torrent) and is_slow_storage_recovery_torrent(
+                    torrent,
+                    self.storage_recovery_min_rate_bytes,
+                ):
+                    storage_recovery_slow_excluded_hashes.add(item_hash)
+                    continue
+                if not is_running_torrent(torrent):
+                    storage_recovery_slow_excluded_hashes.add(item_hash)
+                    continue
+                if (
+                    torrent_lifecycle(
+                        torrent,
+                        self.health_store,
+                        self.now,
+                        required_park_samples=self.storage_recovery_stall_samples,
+                    ).state
+                    == TORRENT_LIFECYCLE_PRODUCTIVE
+                ):
+                    continue
+                remaining_bytes = storage_verified_remaining_bytes(
+                    self.client,
+                    torrent,
+                    self.storage_guard,
+                    self.storage_state,
+                )
+                if remaining_bytes is None:
+                    storage_recovery_parked_deferred_count += 1
+                    continue
+                if (
+                    self.storage_recovery_max_parked_stalled > 0
+                    and len(storage_recovery_parked_torrents) >= self.storage_recovery_max_parked_stalled
+                ):
+                    storage_recovery_parked_deferred_count += 1
+                    continue
+                if storage_recovery_parked_remaining_bytes + remaining_bytes > fit_bytes:
+                    storage_recovery_parked_deferred_count += 1
+                    continue
+                storage_recovery_parked_torrents.append(torrent)
+                storage_recovery_parked_hashes.add(item_hash)
+                storage_recovery_parked_remaining_bytes += remaining_bytes
+
+            (
+                selection_candidates,
+                storage_recovery_selected_remaining_bytes,
+                storage_recovery_deferred_count,
+            ) = storage_recovery_batch(
+                self.client,
+                filters.available_candidates,
+                self.storage_guard,
+                self.storage_state,
+                self.storage_recovery_max_active,
+                initial_remaining_bytes=storage_recovery_parked_remaining_bytes,
+                excluded_hashes=storage_recovery_parked_hashes | storage_recovery_slow_excluded_hashes,
+                score_context=observation.score_context,
+            )
+            rejected_counts["parked_storage_recovery_stalled"] += len(storage_recovery_parked_torrents)
+            rejected_counts["deferred_storage_recovery_parked"] += storage_recovery_parked_deferred_count
+            rejected_counts["excluded_slow_storage_recovery"] += len(storage_recovery_slow_excluded_hashes)
+            rejected_counts["deferred_by_storage_recovery_batch"] += storage_recovery_deferred_count
+        else:
+            if self.park_stalled_downloads_enabled:
+                for torrent in filters.candidates:
+                    item_hash = torrent_hash(torrent)
+                    if not item_hash:
+                        continue
+                    if (
+                        torrent_lifecycle(
+                            torrent,
+                            self.health_store,
+                            self.now,
+                            required_park_samples=self.park_stalled_samples,
+                        ).state
+                        != TORRENT_LIFECYCLE_PARKED_LISTENER
+                    ):
+                        continue
+                    if (
+                        self.max_parked_stalled_downloads > 0
+                        and len(normal_parked_stalled_torrents) >= self.max_parked_stalled_downloads
+                    ):
+                        normal_parked_stalled_deferred_count += 1
+                        continue
+                    progress_classification = torrent_progress_classification(
+                        None,
+                        torrent,
+                        self.normal_progress_min_bytes(torrent),
+                    )
+                    rejected_counts[progress_class_count_key(progress_classification.state)] += 1
+                    self.health_store.record_progress_classification(
+                        torrent,
+                        self.now,
+                        progress_classification,
+                    )
+                    normal_parked_stalled_torrents.append(torrent)
+                    normal_parked_stalled_hashes.add(item_hash)
+                rejected_counts["parked_stalled"] += len(normal_parked_stalled_torrents)
+                rejected_counts["deferred_parked_stalled"] += normal_parked_stalled_deferred_count
+            base_selection_candidates = (
+                watch_priority_candidates
+                or priority_candidates
+                or filters.available_candidates
+            )
+            selection_candidates = [
+                torrent for torrent in base_selection_candidates
+                if torrent_hash(torrent) not in normal_parked_stalled_hashes
+            ]
+
+        if not observation.storage_constrained_mode and watch_priority_candidates:
+            rejected_counts["deferred_by_watch_activity"] += (
+                len(filters.available_candidates) - len(watch_priority_candidates)
+            )
+        elif not observation.storage_constrained_mode and priority_candidates:
+            rejected_counts["deferred_by_priority"] += len(filters.available_candidates) - len(priority_candidates)
+
+        productive_candidates = []
+        for torrent in selection_candidates:
+            lifecycle = torrent_lifecycle(
+                torrent,
+                self.health_store,
+                self.now,
+                required_park_samples=self.park_stalled_samples,
+            )
+            if lifecycle.state != TORRENT_LIFECYCLE_PRODUCTIVE:
+                if is_running_torrent(torrent) and torrent_download_speed(torrent) <= 0:
+                    rejected_counts["not_productive_zero_speed"] += 1
+                else:
+                    rejected_counts["not_productive"] += 1
+                continue
+            productive_candidates.append(torrent)
+
+        return SmartQueuePolicyScoreResult(
+            watch_priority_candidates=watch_priority_candidates,
+            priority_candidates=priority_candidates,
+            storage_recovery_parked_torrents=storage_recovery_parked_torrents,
+            storage_recovery_parked_hashes=storage_recovery_parked_hashes,
+            storage_recovery_parked_remaining_bytes=storage_recovery_parked_remaining_bytes,
+            storage_recovery_parked_deferred_count=storage_recovery_parked_deferred_count,
+            storage_recovery_slow_excluded_hashes=storage_recovery_slow_excluded_hashes,
+            storage_recovery_selected_remaining_bytes=storage_recovery_selected_remaining_bytes,
+            storage_recovery_deferred_count=storage_recovery_deferred_count,
+            normal_parked_stalled_torrents=normal_parked_stalled_torrents,
+            normal_parked_stalled_hashes=normal_parked_stalled_hashes,
+            normal_parked_stalled_deferred_count=normal_parked_stalled_deferred_count,
+            selection_candidates=selection_candidates,
+            productive_candidates=productive_candidates,
+        )
+
+    def allocate_slots(self, observation, scoring):
+        if observation.storage_constrained_mode:
+            slot_plan = smart_queue_slot_plan(
+                self.storage_recovery_max_active if scoring.selection_candidates else 0,
+                len(scoring.storage_recovery_parked_hashes),
+            )
+        else:
+            slot_plan = smart_queue_slot_plan(
+                self.normal_worker_limit if scoring.selection_candidates or scoring.productive_candidates else 0,
+                len(scoring.normal_parked_stalled_hashes),
+            )
+        return SmartQueuePolicyAllocation(slot_plan=slot_plan)
+
+    def act(self, observation, filters, scoring):
+        if observation.storage_constrained_mode and scoring.selection_candidates:
+            return SmartQueuePolicyActionPlan("storage_recovery_batch")
+        if observation.storage_constrained_mode and scoring.storage_recovery_parked_torrents:
+            return SmartQueuePolicyActionPlan("keep_storage_recovery_parked")
+        if scoring.productive_candidates:
+            return SmartQueuePolicyActionPlan("keep_productive")
+        if scoring.normal_parked_stalled_torrents and not scoring.selection_candidates:
+            return SmartQueuePolicyActionPlan("keep_parked_stalled")
+        if filters.available_candidates and scoring.selection_candidates:
+            return SmartQueuePolicyActionPlan("try_candidate")
+        return SmartQueuePolicyActionPlan("stop_no_available_candidates")
+
+    def record(self, observation, classification, filters, scoring, allocation, action_plan):
+        rejected_counts = classification.rejected_counts
+        candidate_counts = {
+            "total": len(observation.torrents),
+            "eligible": len(filters.all_candidates),
+            "after_storage": len(filters.candidates),
+            "tv_queue_order_blocked": filters.tv_order_blocked_count,
+            "available": len(filters.available_candidates),
+            "selection_pool": len(scoring.selection_candidates),
+            "priority": len(scoring.priority_candidates),
+            "watch_priority": len(scoring.watch_priority_candidates),
+            "watched_tv_episode_torrents": len(observation.tv_order_state.get("watch_priorities", {})),
+            "productive": len(scoring.productive_candidates),
+            "slow": 0,
+            "selection_strategy": self.selection_strategy_name,
+            "storage_constrained": observation.storage_constrained_mode,
+            "tracker_health_observed": classification.tracker_health_observed,
+            "storage_recovery_max_active": self.storage_recovery_max_active,
+            "storage_recovery_selected_remaining_bytes": scoring.storage_recovery_selected_remaining_bytes,
+            "storage_recovery_parked_stalled": len(scoring.storage_recovery_parked_torrents),
+            "storage_recovery_parked_remaining_bytes": scoring.storage_recovery_parked_remaining_bytes,
+            "storage_recovery_stall_samples": self.storage_recovery_stall_samples,
+            "storage_recovery_min_rate_bytes_per_sec": self.storage_recovery_min_rate_bytes,
+            "storage_recovery_slow_excluded": len(scoring.storage_recovery_slow_excluded_hashes),
+            "parked_stalled": len(scoring.normal_parked_stalled_torrents),
+            "parked_stalled_samples": self.park_stalled_samples,
+            "parked_stalled_max": self.max_parked_stalled_downloads,
+            "policy_stage_count": len(self.stages),
+        }
+        candidate_counts.update(allocation.slot_plan.as_counts())
+        lifecycle_park_samples = (
+            self.storage_recovery_stall_samples
+            if observation.storage_constrained_mode
+            else self.park_stalled_samples
+        )
+        candidate_counts.update(
+            lifecycle_counts(
+                filters.available_candidates,
+                self.health_store,
+                self.now,
+                required_park_samples=lifecycle_park_samples,
+            )
+        )
+        if filters.cooldown_count:
+            candidate_counts["lifecycle_cooldown"] = filters.cooldown_count
+        return SmartQueuePolicyResult(
+            stages=self.stages,
+            observation=observation,
+            classification=classification,
+            filters=filters,
+            scoring=scoring,
+            allocation=allocation,
+            action_plan=action_plan,
+            rejected_counts=rejected_counts,
+            candidate_counts=candidate_counts,
+        )
+
+    def run(self):
+        observation = self.observe()
+        classification = self.classify(observation)
+        filters = self.filter(observation, classification)
+        scoring = self.score(observation, classification, filters)
+        allocation = self.allocate_slots(observation, scoring)
+        action_plan = self.act(observation, filters, scoring)
+        return self.record(
+            observation,
+            classification,
+            filters,
+            scoring,
+            allocation,
+            action_plan,
+        )
+
+
 def normalize_stall_cooldown_reason(reason):
     normalized = str(reason or STALL_COOLDOWN_REASON_NO_PROGRESS).strip().lower()
     normalized = normalized.replace("_", "-")
@@ -7425,7 +8027,6 @@ def apply_single_download(
 
             now = datetime.now(timezone.utc)
             torrents = single_download_torrents(client)
-            health_store.observe_torrents(torrents, now)
             if storage_guard:
                 storage_state = storage_guard.snapshot()
                 if storage_state.get("stop"):
@@ -7459,48 +8060,67 @@ def apply_single_download(
                     initial_slot_plan,
                 )
 
-            rejected_counts = Counter()
-            eligible_torrents = []
-            for torrent in torrents:
-                reject_reason = single_download_reject_reason(
-                    torrent,
-                    min_progress,
-                    max_remaining_bytes,
-                    categories,
-                )
-                if reject_reason:
-                    rejected_counts[reject_reason] += 1
-                else:
-                    eligible_torrents.append(torrent)
+            policy_result = SmartQueuePolicyEngine(
+                client=client,
+                torrents=torrents,
+                health_store=health_store,
+                now=now,
+                storage_guard=storage_guard,
+                storage_state=storage_state,
+                storage_constrained_mode=storage_constrained_mode,
+                min_progress=min_progress,
+                max_remaining_bytes=max_remaining_bytes,
+                categories=categories,
+                tracker_health_max_candidates=tracker_health_max_candidates,
+                tracker_health_min_refresh_seconds=tracker_health_min_refresh_seconds,
+                tv_order_categories=tv_order_categories,
+                movie_order_categories=movie_order_categories,
+                sonarr_queue=sonarr_queue,
+                jellyfin_watch=jellyfin_watch,
+                radarr_queue=radarr_queue,
+                priority_tags=priority_tags,
+                priority_categories=priority_categories,
+                healthy_min_seeds=healthy_min_seeds,
+                healthy_min_availability=healthy_min_availability,
+                selection_strategy_name=selection_strategy_name,
+                attempted_hashes=attempted_hashes,
+                stall_tag_prefix=stall_tag_prefix,
+                stall_cooldown_seconds=stall_cooldown_seconds,
+                storage_recovery_max_active=storage_recovery_max_active,
+                storage_recovery_stall_samples=storage_recovery_stall_samples,
+                storage_recovery_max_parked_stalled=storage_recovery_max_parked_stalled,
+                storage_recovery_min_rate_bytes=storage_recovery_min_rate_bytes,
+                park_stalled_downloads_enabled=park_stalled_downloads_enabled,
+                park_stalled_samples=park_stalled_samples,
+                max_parked_stalled_downloads=max_parked_stalled_downloads,
+                normal_worker_limit=normal_worker_limit,
+                normal_progress_min_bytes=normal_progress_min_bytes,
+            ).run()
 
-            tracker_health_observed = health_store.observe_tracker_health(
-                client,
-                eligible_torrents,
-                now,
-                tracker_health_max_candidates,
-                tracker_health_min_refresh_seconds,
-            )
-
-            tv_order_state = build_tv_order_state(
-                torrents,
-                tv_order_categories,
-                sonarr_queue,
-                jellyfin_watch,
-            )
-            movie_order_state = build_movie_order_state(torrents, movie_order_categories, radarr_queue)
-            score_context = {
-                "priority_tags": priority_tags,
-                "priority_categories": priority_categories,
-                "tv_order_categories": tv_order_categories,
-                "tv_order_state": tv_order_state,
-                "movie_order_categories": movie_order_categories,
-                "movie_order_state": movie_order_state,
-                "healthy_min_seeds": healthy_min_seeds,
-                "healthy_min_availability": healthy_min_availability,
-                "health_store": health_store,
-                "now": now,
-                "strategy": selection_strategy_name,
-            }
+            observation = policy_result.observation
+            filters = policy_result.filters
+            scoring = policy_result.scoring
+            rejected_counts = policy_result.rejected_counts
+            all_candidates = filters.all_candidates
+            candidates = filters.candidates
+            available_candidates = filters.available_candidates
+            cooldown_count = filters.cooldown_count
+            storage_blocked_count = filters.storage_blocked_count
+            storage_blocked_examples = filters.storage_blocked_examples
+            tv_order_blocked_count = filters.tv_order_blocked_count
+            tv_order_blocked_examples = filters.tv_order_blocked_examples
+            tv_order_state = observation.tv_order_state
+            movie_order_state = observation.movie_order_state
+            score_context = observation.score_context
+            storage_recovery_parked_torrents = scoring.storage_recovery_parked_torrents
+            storage_recovery_parked_hashes = scoring.storage_recovery_parked_hashes
+            storage_recovery_selected_remaining_bytes = scoring.storage_recovery_selected_remaining_bytes
+            normal_parked_stalled_torrents = scoring.normal_parked_stalled_torrents
+            normal_parked_stalled_hashes = scoring.normal_parked_stalled_hashes
+            selection_candidates = scoring.selection_candidates
+            productive_candidates = scoring.productive_candidates
+            slot_plan = policy_result.allocation.slot_plan
+            candidate_counts = policy_result.candidate_counts
 
             def score_for(torrent, storage_scoring=False, active_cooldown_tags=None):
                 return candidate_score(
@@ -7564,275 +8184,6 @@ def apply_single_download(
                     }
                     for torrent in list(torrents_to_reject or [])[:limit]
                 ]
-
-            all_candidates = sorted(
-                eligible_torrents,
-                key=lambda torrent: score_for(torrent).sort_key,
-            )
-            candidates = []
-            storage_blocked_count = 0
-            storage_blocked_examples = []
-            tv_order_blocked_count = 0
-            tv_order_blocked_examples = []
-            for torrent in all_candidates:
-                storage_reason = storage_torrent_block_reason(client, torrent, storage_guard, storage_state)
-                if storage_reason:
-                    rejected_counts["storage_headroom"] += 1
-                    storage_blocked_count += 1
-                    if len(storage_blocked_examples) < 3:
-                        storage_blocked_examples.append(f"{torrent_name(torrent)}: {storage_reason}")
-                    continue
-                tv_order_reason = tv_queue_order_block_reason(
-                    torrent,
-                    tv_order_categories,
-                    tv_order_state,
-                )
-                if tv_order_reason:
-                    rejected_counts["tv_queue_order_blocked"] += 1
-                    tv_order_blocked_count += 1
-                    if len(tv_order_blocked_examples) < 3:
-                        tv_order_blocked_examples.append(f"{torrent_name(torrent)}: {tv_order_reason}")
-                    continue
-                candidates.append(torrent)
-
-            if storage_constrained_mode:
-                candidates.sort(
-                    key=lambda torrent: score_for(torrent, storage_scoring=True).sort_key,
-                )
-
-            available_candidates = []
-            cooldown_count = 0
-            for torrent in candidates:
-                candidate_hash = torrent_hash(torrent)
-                if candidate_hash in attempted_hashes:
-                    rejected_counts["attempted_this_run"] += 1
-                    continue
-                cooldown_state = {}
-                if (
-                    not storage_constrained_mode
-                    and hasattr(health_store, "active_cooldown_state")
-                ):
-                    cooldown_state = health_store.active_cooldown_state(torrent, now, scope="normal")
-                active_stall_tag_prefix = "" if storage_constrained_mode else stall_tag_prefix
-                if active_stall_tag_prefix:
-                    clear_expired_stall_tags(
-                        client,
-                        torrent,
-                        active_stall_tag_prefix,
-                        now,
-                        stall_cooldown_seconds,
-                        health_store=health_store,
-                        canonical_cooldown_state=cooldown_state,
-                    )
-                if cooldown_state:
-                    cooldown_reason = cooldown_state.get("reason") or "unknown"
-                    rejected_counts["cooldown"] += 1
-                    rejected_counts[f"cooldown_{cooldown_reason.replace('-', '_')}"] += 1
-                    cooldown_count += 1
-                    log_info(
-                        f"Skipping torrent in stall cooldown "
-                        f"({cooldown_reason}, retry in "
-                        f"{human_duration(cooldown_state.get('remaining_seconds', 0))}) "
-                        f"{torrent_name(torrent)}"
-                    )
-                    continue
-                available_candidates.append(torrent)
-
-            watch_priority_candidates = [
-                torrent for torrent in available_candidates
-                if torrent_hash(torrent) in tv_order_state.get("watch_priorities", {})
-            ]
-            priority_candidates = [
-                torrent for torrent in available_candidates
-                if torrent_priority_reason(torrent, priority_tags, priority_categories)
-            ]
-            storage_recovery_parked_torrents = []
-            storage_recovery_parked_hashes = set()
-            storage_recovery_parked_remaining_bytes = 0
-            storage_recovery_parked_deferred_count = 0
-            storage_recovery_slow_excluded_hashes = set()
-            normal_parked_stalled_torrents = []
-            normal_parked_stalled_hashes = set()
-            normal_parked_stalled_deferred_count = 0
-            if storage_constrained_mode:
-                fit_bytes = storage_fit_headroom_bytes(storage_guard, storage_state)
-                for torrent in available_candidates:
-                    item_hash = torrent_hash(torrent)
-                    if not item_hash:
-                        continue
-                    if health_store.storage_recovery_no_progress_samples(torrent) < storage_recovery_stall_samples:
-                        continue
-                    if is_running_torrent(torrent) and is_slow_storage_recovery_torrent(
-                        torrent,
-                        storage_recovery_min_rate_bytes,
-                    ):
-                        storage_recovery_slow_excluded_hashes.add(item_hash)
-                        continue
-                    if not is_running_torrent(torrent):
-                        storage_recovery_slow_excluded_hashes.add(item_hash)
-                        continue
-                    if (
-                        torrent_lifecycle(
-                            torrent,
-                            health_store,
-                            now,
-                            required_park_samples=storage_recovery_stall_samples,
-                        ).state
-                        == TORRENT_LIFECYCLE_PRODUCTIVE
-                    ):
-                        continue
-                    remaining_bytes = storage_verified_remaining_bytes(client, torrent, storage_guard, storage_state)
-                    if remaining_bytes is None:
-                        storage_recovery_parked_deferred_count += 1
-                        continue
-                    if (
-                        storage_recovery_max_parked_stalled > 0
-                        and len(storage_recovery_parked_torrents) >= storage_recovery_max_parked_stalled
-                    ):
-                        storage_recovery_parked_deferred_count += 1
-                        continue
-                    if storage_recovery_parked_remaining_bytes + remaining_bytes > fit_bytes:
-                        storage_recovery_parked_deferred_count += 1
-                        continue
-                    storage_recovery_parked_torrents.append(torrent)
-                    storage_recovery_parked_hashes.add(item_hash)
-                    storage_recovery_parked_remaining_bytes += remaining_bytes
-
-                (
-                    selection_candidates,
-                    storage_recovery_selected_remaining_bytes,
-                    storage_recovery_deferred_count,
-                ) = storage_recovery_batch(
-                    client,
-                    available_candidates,
-                    storage_guard,
-                    storage_state,
-                    storage_recovery_max_active,
-                    initial_remaining_bytes=storage_recovery_parked_remaining_bytes,
-                    excluded_hashes=storage_recovery_parked_hashes | storage_recovery_slow_excluded_hashes,
-                    score_context=score_context,
-                )
-                rejected_counts["parked_storage_recovery_stalled"] += len(storage_recovery_parked_torrents)
-                rejected_counts["deferred_storage_recovery_parked"] += storage_recovery_parked_deferred_count
-                rejected_counts["excluded_slow_storage_recovery"] += len(storage_recovery_slow_excluded_hashes)
-                rejected_counts["deferred_by_storage_recovery_batch"] += storage_recovery_deferred_count
-            else:
-                storage_recovery_selected_remaining_bytes = 0
-                if park_stalled_downloads_enabled:
-                    for torrent in candidates:
-                        item_hash = torrent_hash(torrent)
-                        if not item_hash:
-                            continue
-                        if (
-                            torrent_lifecycle(
-                                torrent,
-                                health_store,
-                                now,
-                                required_park_samples=park_stalled_samples,
-                            ).state
-                            != TORRENT_LIFECYCLE_PARKED_LISTENER
-                        ):
-                            continue
-                        if (
-                            max_parked_stalled_downloads > 0
-                            and len(normal_parked_stalled_torrents) >= max_parked_stalled_downloads
-                        ):
-                            normal_parked_stalled_deferred_count += 1
-                            continue
-                        classification = torrent_progress_classification(
-                            None,
-                            torrent,
-                            normal_progress_min_bytes(torrent),
-                        )
-                        rejected_counts[progress_class_count_key(classification.state)] += 1
-                        health_store.record_progress_classification(
-                            torrent,
-                            now,
-                            classification,
-                        )
-                        normal_parked_stalled_torrents.append(torrent)
-                        normal_parked_stalled_hashes.add(item_hash)
-                    rejected_counts["parked_stalled"] += len(normal_parked_stalled_torrents)
-                    rejected_counts["deferred_parked_stalled"] += normal_parked_stalled_deferred_count
-                base_selection_candidates = watch_priority_candidates or priority_candidates or available_candidates
-                selection_candidates = [
-                    torrent for torrent in base_selection_candidates
-                    if torrent_hash(torrent) not in normal_parked_stalled_hashes
-                ]
-            if not storage_constrained_mode and watch_priority_candidates:
-                rejected_counts["deferred_by_watch_activity"] += (
-                    len(available_candidates) - len(watch_priority_candidates)
-                )
-            elif not storage_constrained_mode and priority_candidates:
-                rejected_counts["deferred_by_priority"] += len(available_candidates) - len(priority_candidates)
-
-            productive_candidates = []
-            for torrent in selection_candidates:
-                lifecycle = torrent_lifecycle(
-                    torrent,
-                    health_store,
-                    now,
-                    required_park_samples=park_stalled_samples,
-                )
-                if lifecycle.state != TORRENT_LIFECYCLE_PRODUCTIVE:
-                    if is_running_torrent(torrent) and torrent_download_speed(torrent) <= 0:
-                        rejected_counts["not_productive_zero_speed"] += 1
-                    else:
-                        rejected_counts["not_productive"] += 1
-                    continue
-                productive_candidates.append(torrent)
-            if storage_constrained_mode:
-                slot_plan = smart_queue_slot_plan(
-                    storage_recovery_max_active if selection_candidates else 0,
-                    len(storage_recovery_parked_hashes),
-                )
-            else:
-                slot_plan = smart_queue_slot_plan(
-                    normal_worker_limit if selection_candidates or productive_candidates else 0,
-                    len(normal_parked_stalled_hashes),
-                )
-            candidate_counts = {
-                "total": len(torrents),
-                "eligible": len(all_candidates),
-                "after_storage": len(candidates),
-                "tv_queue_order_blocked": tv_order_blocked_count,
-                "available": len(available_candidates),
-                "selection_pool": len(selection_candidates),
-                "priority": len(priority_candidates),
-                "watch_priority": len(watch_priority_candidates),
-                "watched_tv_episode_torrents": len(tv_order_state.get("watch_priorities", {})),
-                "productive": len(productive_candidates),
-                "slow": 0,
-                "selection_strategy": selection_strategy_name,
-                "storage_constrained": storage_constrained_mode,
-                "tracker_health_observed": tracker_health_observed,
-                "storage_recovery_max_active": storage_recovery_max_active,
-                "storage_recovery_selected_remaining_bytes": storage_recovery_selected_remaining_bytes,
-                "storage_recovery_parked_stalled": len(storage_recovery_parked_torrents),
-                "storage_recovery_parked_remaining_bytes": storage_recovery_parked_remaining_bytes,
-                "storage_recovery_stall_samples": storage_recovery_stall_samples,
-                "storage_recovery_min_rate_bytes_per_sec": storage_recovery_min_rate_bytes,
-                "storage_recovery_slow_excluded": len(storage_recovery_slow_excluded_hashes),
-                "parked_stalled": len(normal_parked_stalled_torrents),
-                "parked_stalled_samples": park_stalled_samples,
-                "parked_stalled_max": max_parked_stalled_downloads,
-            }
-            candidate_counts.update(slot_plan.as_counts())
-            lifecycle_park_samples = (
-                storage_recovery_stall_samples
-                if storage_constrained_mode
-                else park_stalled_samples
-            )
-            candidate_counts.update(
-                lifecycle_counts(
-                    available_candidates,
-                    health_store,
-                    now,
-                    required_park_samples=lifecycle_park_samples,
-                )
-            )
-            if cooldown_count:
-                candidate_counts["lifecycle_cooldown"] = cooldown_count
 
             if (
                 not storage_constrained_mode
