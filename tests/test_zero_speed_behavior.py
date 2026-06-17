@@ -1049,6 +1049,114 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertIn(["challenger"], client.started)
         self.assertNotIn(["current"], client.started)
 
+    def test_tag_only_cooldown_does_not_block_normal_selection(self):
+        torrent = {
+            "hash": "tagged",
+            "name": "Tagged.Cooldown.Movie.1080p",
+            "category": "movies",
+            "state": "stoppedDL",
+            "dlspeed": 0,
+            "amount_left": 4 * 1024 * 1024 * 1024,
+            "downloaded": 100,
+            "progress": 0.5,
+            "availability": 1.0,
+            "num_seeds": 1,
+            "num_complete": 1,
+            "tags": "quota-stalled-no-progress-29990101T000000Z",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+                "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+                "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+                "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_TORRENT_HEALTH_STATE_PATH": f"{tmpdir}/torrent-health.json",
+                "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+                "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+                "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+                "QBT_LOG_FORMAT": "json",
+                "QBT_DECISION_LOG_LEVEL": "info",
+            }
+            client = FakeQbtClient([torrent])
+            with mock.patch.dict("os.environ", env, clear=False):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                )
+
+        self.assertIn(["tagged"], client.started)
+        self.assertEqual(0, client.stop_all_calls)
+
+    def test_health_cooldown_blocks_normal_selection_without_tag(self):
+        torrent = {
+            "hash": "cooling",
+            "name": "Canonical.Cooldown.Movie.1080p",
+            "category": "movies",
+            "state": "stoppedDL",
+            "dlspeed": 0,
+            "amount_left": 4 * 1024 * 1024 * 1024,
+            "downloaded": 100,
+            "progress": 0.5,
+            "availability": 1.0,
+            "num_seeds": 1,
+            "num_complete": 1,
+            "tags": "",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+                "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+                "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+                "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_TORRENT_HEALTH_STATE_PATH": f"{tmpdir}/torrent-health.json",
+                "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+                "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+                "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+                "QBT_LOG_FORMAT": "json",
+                "QBT_DECISION_LOG_LEVEL": "info",
+            }
+            with mock.patch.dict("os.environ", env, clear=False):
+                health_store = self.guard.TorrentHealthStore()
+                health_store.record_failure(
+                    torrent,
+                    datetime.now(timezone.utc),
+                    "did not make progress",
+                    cooldown_reason="no-progress",
+                )
+                client = FakeQbtClient([torrent])
+
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.guard.apply_single_download(
+                        [client],
+                        usage_bytes=0,
+                        monthly_limit_bytes=1000,
+                        download_limit=1024,
+                        limit_reason="unit test",
+                        storage_guard=FakeStorageGuard(),
+                    )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        no_available = next(
+            item for item in decision_events
+            if item.get("action") == "stop_no_available_candidates"
+        )
+
+        self.assertEqual([], client.started)
+        self.assertEqual(1, client.stop_all_calls)
+        self.assertEqual(1, no_available["rejected_counts"]["cooldown"])
+        self.assertEqual(1, no_available["rejected_counts"]["cooldown_no_progress"])
+
     def test_selection_lease_blocks_productive_preemption_with_connected_peer(self):
         current = {
             "hash": "current",

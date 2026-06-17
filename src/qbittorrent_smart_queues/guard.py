@@ -5168,7 +5168,7 @@ def cleanup_qbt_clients(clients):
                 health_store,
                 datetime.now(timezone.utc),
             )
-        cleanup_stall_tags(client)
+        cleanup_stall_tags(client, health_store=health_store)
 
 
 def is_single_download_candidate(torrent, min_progress, max_remaining_bytes, categories):
@@ -5269,6 +5269,23 @@ def torrent_lifecycle(
 ):
     item_hash = torrent_hash(torrent)
     active_cooldown_tags = active_cooldown_tags or []
+    if (
+        health_store
+        and now is not None
+        and hasattr(health_store, "active_cooldown_state")
+    ):
+        cooldown_state = health_store.active_cooldown_state(torrent, now, scope="normal")
+        if cooldown_state:
+            return TorrentLifecycle(
+                TORRENT_LIFECYCLE_COOLDOWN,
+                reason=(
+                    f"{cooldown_state.get('reason', 'unknown')} until "
+                    f"{cooldown_state.get('next_retry_at', 'unknown')}"
+                ),
+                listener_slot=is_running_torrent(torrent),
+                selectable=False,
+                retryable=False,
+            )
     if active_cooldown_tags:
         cooldown_reason = (
             stall_cooldown_reason_label(active_cooldown_tags, active_cooldown_prefix)
@@ -5581,11 +5598,18 @@ def candidate_score(
         tag for tag in (active_cooldown_tags or [])
         if not active_cooldown_prefix or str(tag).startswith(active_cooldown_prefix)
     ]
+    cooldown_state = {}
+    if (
+        not storage_guard
+        and health_store is not None
+        and hasattr(health_store, "active_cooldown_state")
+    ):
+        cooldown_state = health_store.active_cooldown_state(torrent, now, scope="normal")
 
     components = candidate_content_score_components(torrent, health_store, now)
     components["priority"] = 1000.0 if is_priority else 0.0
     components["queue_order"] = -queue_rank * queue_weight
-    components["cooldown"] = -1000.0 if cooldown_tags else 0.0
+    components["cooldown"] = -1000.0 if cooldown_tags or cooldown_state else 0.0
 
     storage_remaining_bytes = None
     storage_fits = None
@@ -5972,6 +5996,12 @@ class TorrentHealthStore:
         entry["successful_attempts"] = int(entry.get("successful_attempts") or 0) + 1
         entry["consecutive_failures"] = 0
         entry["last_failure_reason"] = ""
+        entry["cooldown_reason"] = ""
+        entry["cooldown_scope"] = ""
+        entry["cooldown_next_retry_at"] = ""
+        entry["cooldown_seconds"] = 0
+        entry["cooldown_failure_count"] = 0
+        entry["cooldown_cleared_at"] = format_utc(now)
         backoff_level = int(entry.get("no_progress_backoff_level") or 0)
         if backoff_level > 0:
             entry["no_progress_backoff_level"] = max(0, backoff_level - self.stall_backoff_decay_steps)
@@ -5987,12 +6017,13 @@ class TorrentHealthStore:
         self.dirty = True
         self.save()
 
-    def record_failure(self, torrent, now, reason, cooldown_reason=None):
+    def record_failure(self, torrent, now, reason, cooldown_reason=None, cooldown_scope="normal"):
         entry = self.entry(torrent_hash(torrent))
         if entry is None:
             return
 
         cooldown_reason = normalize_stall_cooldown_reason(cooldown_reason or reason)
+        cooldown_scope = "storage" if str(cooldown_scope or "").strip().lower() == "storage" else "normal"
         entry["name"] = torrent_name(torrent)
         entry["category"] = torrent_category(torrent)
         entry["last_failure_at"] = format_utc(now)
@@ -6003,6 +6034,33 @@ class TorrentHealthStore:
         if self.no_progress_backoff_reason(cooldown_reason):
             entry["no_progress_backoff_level"] = int(entry.get("no_progress_backoff_level") or 0) + 1
             entry["no_progress_backoff_last_failure_at"] = format_utc(now)
+        previous_cooldown_next_retry_at = parse_utc(entry.get("cooldown_next_retry_at"))
+        continuing_cooldown = (
+            previous_cooldown_next_retry_at is not None
+            and previous_cooldown_next_retry_at > now
+            and entry.get("cooldown_reason") == cooldown_reason
+            and entry.get("cooldown_scope") == cooldown_scope
+        )
+        if not continuing_cooldown:
+            entry["cooldown_first_seen_at"] = format_utc(now)
+            entry["cooldown_failure_count"] = 1
+        else:
+            entry["cooldown_failure_count"] = int(entry.get("cooldown_failure_count") or 0) + 1
+        base_cooldown_seconds = env_int("QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS", 3600)
+        canonical_cooldown_seconds = self.cooldown_seconds_for_torrent(
+            torrent,
+            base_cooldown_seconds,
+            cooldown_reason,
+        )
+        entry["cooldown_reason"] = cooldown_reason
+        entry["cooldown_scope"] = cooldown_scope
+        entry["cooldown_last_tried_at"] = format_utc(now)
+        entry["cooldown_seconds"] = canonical_cooldown_seconds
+        entry["cooldown_next_retry_at"] = (
+            format_utc(now + timedelta(seconds=canonical_cooldown_seconds))
+            if canonical_cooldown_seconds > 0
+            else ""
+        )
         previous_speed = float(entry.get("ewma_speed_bytes_per_sec") or 0)
         if previous_speed > 0:
             entry["ewma_speed_bytes_per_sec"] = max(0, int(previous_speed * (1.0 - self.ewma_alpha)))
@@ -6014,6 +6072,47 @@ class TorrentHealthStore:
         entry["predicted_completion_seconds"] = self.predicted_completion_seconds(torrent, entry)
         self.dirty = True
         self.save()
+
+    def cooldown_state(self, torrent, now, scope=None):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return {}
+
+        cooldown_scope = str(entry.get("cooldown_scope") or "normal").strip().lower() or "normal"
+        if scope and cooldown_scope != str(scope).strip().lower():
+            return {}
+
+        next_retry_at = parse_utc(entry.get("cooldown_next_retry_at"))
+        if next_retry_at is None:
+            return {}
+
+        reason = normalize_stall_cooldown_reason(entry.get("cooldown_reason") or entry.get("last_cooldown_reason"))
+        remaining_seconds = max(0, int((next_retry_at - now).total_seconds()))
+        try:
+            failure_count = max(0, int(entry.get("cooldown_failure_count") or 0))
+        except (TypeError, ValueError):
+            failure_count = 0
+        try:
+            cooldown_seconds = max(0, int(entry.get("cooldown_seconds") or 0))
+        except (TypeError, ValueError):
+            cooldown_seconds = 0
+        return {
+            "active": next_retry_at > now,
+            "reason": reason,
+            "scope": cooldown_scope,
+            "failure_count": failure_count,
+            "first_seen_at": entry.get("cooldown_first_seen_at") or "",
+            "last_tried_at": entry.get("cooldown_last_tried_at") or entry.get("last_failure_at") or "",
+            "next_retry_at": format_utc(next_retry_at),
+            "remaining_seconds": remaining_seconds,
+            "cooldown_seconds": cooldown_seconds,
+        }
+
+    def active_cooldown_state(self, torrent, now, scope=None):
+        state = self.cooldown_state(torrent, now, scope=scope)
+        if state and state.get("active"):
+            return state
+        return {}
 
     def no_progress_backoff_reason(self, reason):
         normalized = normalize_stall_cooldown_reason(reason)
@@ -6192,6 +6291,13 @@ class TorrentHealthStore:
         failures = int(entry.get("consecutive_failures") or 0)
         tracker_text = ""
         backoff_text = ""
+        cooldown_text = ""
+        cooldown_state = self.active_cooldown_state(torrent, now)
+        if cooldown_state:
+            cooldown_text = (
+                f", cooldown {cooldown_state.get('reason') or 'unknown'} "
+                f"retry in {human_duration(cooldown_state.get('remaining_seconds', 0))}"
+            )
         backoff_level = self.no_progress_backoff_level(torrent)
         if backoff_level > 0:
             base_cooldown_seconds = env_int("QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS", 3600)
@@ -6223,6 +6329,7 @@ class TorrentHealthStore:
         return (
             f"; health score {score:.1f}, ewma {human_rate(speed)}, "
             f"ETA {predicted_text}, consecutive failures {failures}"
+            f"{cooldown_text}"
             f"{backoff_text}"
             f"{tracker_text}"
         )
@@ -6595,14 +6702,49 @@ def stall_cooldown_reason_label(tags, prefix):
     )
 
 
-def clear_expired_stall_tags(client, torrent, prefix, now, cooldown_seconds, health_store=None):
-    active_tags, expired_tags = stall_cooldown_tags(
-        torrent,
-        prefix,
-        now,
-        cooldown_seconds,
-        health_store=health_store,
-    )
+def stall_tag_matches_canonical_cooldown(details, cooldown_state):
+    if not details or not cooldown_state:
+        return False
+    if details["reason"] != cooldown_state.get("reason"):
+        return False
+    first_seen_at = parse_utc(cooldown_state.get("first_seen_at"))
+    if first_seen_at and details["time"] < first_seen_at:
+        return False
+    next_retry_at = parse_utc(cooldown_state.get("next_retry_at"))
+    if next_retry_at and details["time"] > next_retry_at:
+        return False
+    return True
+
+
+def clear_expired_stall_tags(
+    client,
+    torrent,
+    prefix,
+    now,
+    cooldown_seconds,
+    health_store=None,
+    canonical_cooldown_state=None,
+):
+    if canonical_cooldown_state is not None:
+        active_tags = []
+        expired_tags = []
+        active_reason = canonical_cooldown_state.get("reason") if canonical_cooldown_state else ""
+        for tag in torrent_tags(torrent):
+            details = parse_stall_cooldown_tag_details(tag, prefix)
+            if details is None:
+                continue
+            if active_reason and stall_tag_matches_canonical_cooldown(details, canonical_cooldown_state):
+                active_tags.append(tag)
+            else:
+                expired_tags.append(tag)
+    else:
+        active_tags, expired_tags = stall_cooldown_tags(
+            torrent,
+            prefix,
+            now,
+            cooldown_seconds,
+            health_store=health_store,
+        )
     if expired_tags:
         try:
             client.remove_tags([torrent_hash(torrent)], expired_tags)
@@ -6654,7 +6796,7 @@ def add_stall_cooldown_tag(client, torrent, prefix, now, cooldown_seconds, reaso
         )
 
 
-def cleanup_stall_tags(client):
+def cleanup_stall_tags(client, health_store=None):
     stall_tag_prefix = os.environ.get("QBT_SINGLE_DOWNLOAD_STALL_TAG_PREFIX", "quota-stalled").strip()
     storage_stall_tag_prefix = os.environ.get(
         "QBT_SINGLE_DOWNLOAD_STORAGE_STALL_TAG_PREFIX",
@@ -6684,12 +6826,33 @@ def cleanup_stall_tags(client):
     for torrent in torrents:
         item_hash = torrent_hash(torrent)
         for prefix in stall_tag_prefixes:
+            canonical_cooldown_state = None
+            if health_store is not None and hasattr(health_store, "active_cooldown_state"):
+                canonical_cooldown_state = health_store.active_cooldown_state(torrent, now)
             active_tags, expired_tags = stall_cooldown_tags(
                 torrent,
                 prefix,
                 now,
                 stall_cooldown_seconds,
+                health_store=health_store,
             )
+            if canonical_cooldown_state is not None:
+                canonical_reason = canonical_cooldown_state.get("reason") if canonical_cooldown_state else ""
+                active_tags = [
+                    tag for tag in active_tags
+                    if (
+                        canonical_reason
+                        and stall_tag_matches_canonical_cooldown(
+                            parse_stall_cooldown_tag_details(tag, prefix),
+                            canonical_cooldown_state,
+                        )
+                    )
+                ]
+                expired_tags = [
+                    tag for tag in torrent_tags(torrent)
+                    if parse_stall_cooldown_tag_details(tag, prefix) is not None
+                    and tag not in active_tags
+                ]
             active_stall_tags.update(active_tags)
             if item_hash and expired_tags:
                 expired_tag_assignments.append((torrent, expired_tags))
@@ -7115,32 +7278,33 @@ def apply_single_download(
                 if candidate_hash in attempted_hashes:
                     rejected_counts["attempted_this_run"] += 1
                     continue
+                cooldown_state = {}
+                if (
+                    not storage_constrained_mode
+                    and hasattr(health_store, "active_cooldown_state")
+                ):
+                    cooldown_state = health_store.active_cooldown_state(torrent, now, scope="normal")
                 active_stall_tag_prefix = "" if storage_constrained_mode else stall_tag_prefix
-                active_tags = []
                 if active_stall_tag_prefix:
-                    active_tags = clear_expired_stall_tags(
+                    clear_expired_stall_tags(
                         client,
                         torrent,
                         active_stall_tag_prefix,
                         now,
                         stall_cooldown_seconds,
                         health_store=health_store,
+                        canonical_cooldown_state=cooldown_state,
                     )
-                if active_tags:
+                if cooldown_state:
+                    cooldown_reason = cooldown_state.get("reason") or "unknown"
                     rejected_counts["cooldown"] += 1
-                    for reason, count in stall_cooldown_tag_reason_counts(
-                        active_tags,
-                        active_stall_tag_prefix,
-                    ).items():
-                        rejected_counts[f"cooldown_{reason.replace('-', '_')}"] += count
+                    rejected_counts[f"cooldown_{cooldown_reason.replace('-', '_')}"] += 1
                     cooldown_count += 1
-                    cooldown_reasons = stall_cooldown_reason_label(
-                        active_tags,
-                        active_stall_tag_prefix,
-                    )
                     log_info(
                         f"Skipping torrent in stall cooldown "
-                        f"({cooldown_reasons}) {torrent_name(torrent)}"
+                        f"({cooldown_reason}, retry in "
+                        f"{human_duration(cooldown_state.get('remaining_seconds', 0))}) "
+                        f"{torrent_name(torrent)}"
                     )
                     continue
                 available_candidates.append(torrent)
@@ -7855,6 +8019,7 @@ def apply_single_download(
                     datetime.now(timezone.utc),
                     "did not make progress",
                     cooldown_reason=cooldown_reason,
+                    cooldown_scope="storage" if storage_constrained_mode else "normal",
                 )
                 add_stall_cooldown_tag(
                     client,
@@ -8005,6 +8170,7 @@ def apply_single_download(
                         now,
                         "stalled without download speed",
                         cooldown_reason=cooldown_reason,
+                        cooldown_scope="storage" if storage_constrained_mode else "normal",
                     )
                     add_stall_cooldown_tag(
                         client,
@@ -8265,6 +8431,7 @@ def apply_single_download(
                 datetime.now(timezone.utc),
                 "did not make progress",
                 cooldown_reason=cooldown_reason,
+                cooldown_scope="storage" if storage_constrained_mode else "normal",
             )
             add_stall_cooldown_tag(
                 client,

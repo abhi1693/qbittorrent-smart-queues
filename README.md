@@ -136,10 +136,10 @@ Optional single-download selection tuning:
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS` | `3600` | Base cooldown for torrents that fail a single-download attempt. |
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_NO_PROGRESS_SECONDS` | base cooldown | Cooldown for torrents that run but do not move enough bytes during the sample. |
-| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_METADATA_SECONDS` | min(base, 1800) | Cooldown honored for manually/future-applied metadata wait tags. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_METADATA_SECONDS` | min(base, 1800) | Reason-specific cooldown window for future metadata-wait health-state entries. |
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_TRACKER_DEAD_SECONDS` | max(base, 21600) | Cooldown for stalled torrents with no connected seeds, reported seeds, or availability. |
-| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_IMPORT_FAILED_SECONDS` | max(base, 86400) | Cooldown honored for manually/future-applied import-failed tags. |
-| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_MANUAL_HOLD_SECONDS` | max(base, 604800) | Cooldown honored for manually-applied hold tags. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_IMPORT_FAILED_SECONDS` | max(base, 86400) | Reason-specific cooldown window for future import-failed health-state entries. |
+| `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_MANUAL_HOLD_SECONDS` | max(base, 604800) | Reason-specific cooldown window for future manual-hold health-state entries. |
 | `QBT_TRACKER_HEALTH_SCORING_ENABLED` | `true` | Read qBittorrent tracker responses for eligible candidates and include tracker health in selection scores. |
 | `QBT_TRACKER_HEALTH_MAX_CANDIDATES_PER_PASS` | `50` | Maximum `/torrents/trackers` reads per controller pass. |
 | `QBT_TRACKER_HEALTH_MIN_REFRESH_SECONDS` | `300` | Minimum age before refreshing a torrent's tracker health again. |
@@ -148,13 +148,12 @@ Optional single-download selection tuning:
 | `QBT_STATUS_HTTP_HOST` | `0.0.0.0` | Bind address for the status endpoint. |
 | `QBT_STATUS_HTTP_PORT` | `8081` | Bind port for `/healthz`, `/status`, and `/metrics`. |
 
-Cooldown tags are reasoned as
-`<prefix>-<reason>-<timestamp>`, for example
-`quota-stalled-tracker-dead-20260601T123456Z`. Legacy
-`<prefix>-<timestamp>` tags are still honored with the base cooldown. The
-normal selector writes `no-progress` and `tracker-dead` tags today; `metadata`,
-`import-failed`, and `manual-hold` are parsed and cleaned so they can be applied
-manually or by future integrations without being treated as generic stalls.
+Cooldown state is canonical in `QBT_TORRENT_HEALTH_STATE_PATH`, including the
+reason, scope, current cooldown failure count, first-seen time, last-tried time,
+and next retry time. qBittorrent tags remain visibility output only, using
+`<prefix>-<reason>-<timestamp>` names such as
+`quota-stalled-tracker-dead-20260601T123456Z`; tag-only cooldowns are cleaned up
+but do not block selection.
 
 Optional storage and thermal guards:
 

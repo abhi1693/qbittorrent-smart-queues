@@ -175,6 +175,66 @@ class CooldownParsingTests(unittest.TestCase):
             self.assertEqual(1, store.no_progress_backoff_level(torrent))
             self.assertEqual(3600, store.cooldown_seconds_for_torrent(torrent, 3600, "no-progress"))
 
+    def test_record_failure_writes_canonical_cooldown_state(self):
+        now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        torrent = {
+            "hash": "abc123",
+            "name": "Canonical.Cooldown.S01E01",
+            "category": "tv",
+            "state": "stalledDL",
+            "amount_left": 1000,
+            "downloaded": 0,
+            "progress": 0.5,
+            "tags": "",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {
+                "QBT_TORRENT_HEALTH_STATE_PATH": os.path.join(tmpdir, "health.json"),
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS": "120",
+            },
+            clear=False,
+        ):
+            store = self.guard.TorrentHealthStore()
+            store.record_failure(torrent, now, "did not make progress", cooldown_reason="no-progress")
+
+            state = store.active_cooldown_state(torrent, now, scope="normal")
+            self.assertEqual("no-progress", state["reason"])
+            self.assertEqual("normal", state["scope"])
+            self.assertEqual(1, state["failure_count"])
+            self.assertEqual(self.guard.format_utc(now), state["first_seen_at"])
+            self.assertEqual(self.guard.format_utc(now), state["last_tried_at"])
+            self.assertEqual(self.guard.format_utc(now + timedelta(seconds=120)), state["next_retry_at"])
+            self.assertEqual(120, state["cooldown_seconds"])
+
+            after = dict(torrent, amount_left=0, downloaded=1000, progress=1.0)
+            store.record_productive(torrent, after, now + timedelta(seconds=30), sample_seconds=30)
+            self.assertEqual({}, store.active_cooldown_state(torrent, now + timedelta(seconds=30), scope="normal"))
+
+    def test_storage_cooldown_is_not_normal_cooldown_state(self):
+        now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        torrent = {"hash": "abc123", "name": "Storage.Cooldown", "amount_left": 1000}
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {
+                "QBT_TORRENT_HEALTH_STATE_PATH": os.path.join(tmpdir, "health.json"),
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+            },
+            clear=False,
+        ):
+            store = self.guard.TorrentHealthStore()
+            store.record_failure(
+                torrent,
+                now,
+                "did not make progress",
+                cooldown_reason="no-progress",
+                cooldown_scope="storage",
+            )
+
+            self.assertEqual({}, store.active_cooldown_state(torrent, now, scope="normal"))
+            self.assertEqual("storage", store.active_cooldown_state(torrent, now, scope="storage")["scope"])
+
     def test_no_progress_backoff_is_capped(self):
         now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         torrent = {"hash": "abc123", "name": "Backoff.Show.S01E02", "amount_left": 1000}
