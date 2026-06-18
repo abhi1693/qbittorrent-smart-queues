@@ -494,7 +494,9 @@ class QueueStatusStore:
             "qbt_guard_torrent_progress_ratio": [],
             "qbt_guard_torrent_amount_left_bytes": [],
             "qbt_guard_torrent_download_speed_bytes_per_sec": [],
+            "qbt_guard_torrent_eta_seconds": [],
             "qbt_guard_torrent_availability": [],
+            "qbt_guard_torrent_seeds": [],
         }
         for role, torrent_items in (
             ("selected", selected_torrents),
@@ -517,7 +519,7 @@ class QueueStatusStore:
                     "state": torrent.get("state") or "",
                 }
                 torrent_info_samples.append((labels, 1))
-                numeric_labels = {"role": role, "index": str(index)}
+                numeric_labels = dict(labels)
                 torrent_numeric_samples["qbt_guard_torrent_progress_ratio"].append(
                     (numeric_labels, torrent.get("progress"))
                 )
@@ -527,33 +529,53 @@ class QueueStatusStore:
                 torrent_numeric_samples["qbt_guard_torrent_download_speed_bytes_per_sec"].append(
                     (numeric_labels, torrent.get("download_speed_bytes_per_sec"))
                 )
+                if torrent.get("eta_seconds") is not None:
+                    torrent_numeric_samples["qbt_guard_torrent_eta_seconds"].append(
+                        (numeric_labels, torrent.get("eta_seconds"))
+                    )
                 torrent_numeric_samples["qbt_guard_torrent_availability"].append(
                     (numeric_labels, torrent.get("availability"))
                 )
+                torrent_numeric_samples["qbt_guard_torrent_seeds"].extend([
+                    ({**numeric_labels, "type": "connected"}, torrent.get("connected_seeds")),
+                    ({**numeric_labels, "type": "reported"}, torrent.get("reported_seeds")),
+                ])
         append_gauge_family(lines, "qbt_guard_torrent_info", "Recent decision torrent labels by role.", torrent_info_samples)
         append_gauge_family(
             lines,
             "qbt_guard_torrent_progress_ratio",
-            "Recent decision torrent progress ratio by role and index.",
+            "Recent decision torrent progress ratio by role, torrent labels, and index.",
             torrent_numeric_samples["qbt_guard_torrent_progress_ratio"],
         )
         append_gauge_family(
             lines,
             "qbt_guard_torrent_amount_left_bytes",
-            "Recent decision torrent bytes left by role and index.",
+            "Recent decision torrent bytes left by role, torrent labels, and index.",
             torrent_numeric_samples["qbt_guard_torrent_amount_left_bytes"],
         )
         append_gauge_family(
             lines,
             "qbt_guard_torrent_download_speed_bytes_per_sec",
-            "Recent decision torrent download speed by role and index.",
+            "Recent decision torrent download speed by role, torrent labels, and index.",
             torrent_numeric_samples["qbt_guard_torrent_download_speed_bytes_per_sec"],
         )
         append_gauge_family(
             lines,
+            "qbt_guard_torrent_eta_seconds",
+            "Recent decision torrent ETA seconds by role, torrent labels, and index.",
+            torrent_numeric_samples["qbt_guard_torrent_eta_seconds"],
+        )
+        append_gauge_family(
+            lines,
             "qbt_guard_torrent_availability",
-            "Recent decision torrent availability by role and index.",
+            "Recent decision torrent availability by role, torrent labels, and index.",
             torrent_numeric_samples["qbt_guard_torrent_availability"],
+        )
+        append_gauge_family(
+            lines,
+            "qbt_guard_torrent_seeds",
+            "Recent decision torrent seed counts by role, torrent labels, and index.",
+            torrent_numeric_samples["qbt_guard_torrent_seeds"],
         )
         append_gauge_family(
             lines,
@@ -6830,6 +6852,46 @@ def storage_recovery_batch(
     return selected, selected_remaining_bytes, deferred_count
 
 
+def category_worker_batch(candidates, preferred_candidates, max_active_per_category):
+    max_active_per_category = max(1, int(max_active_per_category))
+    selected = []
+    selected_hashes = set()
+    selected_by_category = Counter()
+    deferred_count = 0
+
+    def add_if_slot_available(torrent):
+        item_hash = torrent_hash(torrent)
+        if item_hash and item_hash in selected_hashes:
+            return False
+        category = torrent_category(torrent)
+        if selected_by_category[category] >= max_active_per_category:
+            return False
+        selected.append(torrent)
+        if item_hash:
+            selected_hashes.add(item_hash)
+        selected_by_category[category] += 1
+        return True
+
+    for torrent in preferred_candidates:
+        add_if_slot_available(torrent)
+
+    for torrent in candidates:
+        add_if_slot_available(torrent)
+
+    selected_hashes = {
+        torrent_hash(torrent)
+        for torrent in selected
+        if torrent_hash(torrent)
+    }
+    for torrent in candidates:
+        item_hash = torrent_hash(torrent)
+        if item_hash and item_hash in selected_hashes:
+            continue
+        deferred_count += 1
+
+    return selected, dict(selected_by_category), deferred_count
+
+
 def storage_torrent_block_reason(client, torrent, storage_guard, storage_state):
     if not storage_guard or not storage_guard.require_torrent_fit:
         return ""
@@ -7881,6 +7943,10 @@ def apply_single_download(
         if uncapped_window_active
         else normal_max_active_downloads
     )
+    max_active_downloads_per_category = max(
+        0,
+        env_int("QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY", 0),
+    )
 
     park_stalled_downloads_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED", True)
     park_stalled_samples = max(
@@ -8121,6 +8187,7 @@ def apply_single_download(
             productive_candidates = scoring.productive_candidates
             slot_plan = policy_result.allocation.slot_plan
             candidate_counts = policy_result.candidate_counts
+            candidate_counts["max_active_downloads_per_category"] = max_active_downloads_per_category
 
             def score_for(torrent, storage_scoring=False, active_cooldown_tags=None):
                 return candidate_score(
@@ -8492,6 +8559,281 @@ def apply_single_download(
                     selected=", ".join(torrent_name(torrent) for torrent in selection_candidates[:5]),
                 )
                 break
+
+            if (
+                not storage_constrained_mode
+                and max_active_downloads_per_category > 0
+                and selection_candidates
+            ):
+                leased_worker_candidates = []
+                for torrent in selection_candidates:
+                    lease_reason = health_store.active_selection_lease_reason(torrent, now)
+                    if lease_reason:
+                        leased_worker_candidates.append(torrent)
+                leased_worker_hashes = {
+                    torrent_hash(torrent)
+                    for torrent in leased_worker_candidates
+                    if torrent_hash(torrent)
+                }
+                if leased_worker_candidates:
+                    candidate_counts["selection_lease_active"] = len(leased_worker_candidates)
+
+                selected_batch, selected_by_category, deferred_by_category_limit = category_worker_batch(
+                    selection_candidates,
+                    productive_candidates + leased_worker_candidates,
+                    max_active_downloads_per_category,
+                )
+                selected_hashes = [
+                    torrent_hash(torrent) for torrent in selected_batch
+                    if torrent_hash(torrent)
+                ]
+                selected_hash_set = set(selected_hashes)
+                if selected_hashes:
+                    category_slot_plan = smart_queue_slot_plan(
+                        len(selected_hashes),
+                        len(normal_parked_stalled_hashes),
+                    )
+                    active_queue_limit = set_active_queue_limit_for_slots(
+                        client,
+                        active_queue_limit,
+                        category_slot_plan,
+                    )
+                    protected_hashes = selected_hash_set | normal_parked_stalled_hashes
+                    new_worker_torrents = [
+                        torrent for torrent in selected_batch
+                        if (
+                            not is_productive_download(torrent)
+                            and torrent_hash(torrent) not in leased_worker_hashes
+                        )
+                    ]
+                    for selected in new_worker_torrents:
+                        health_store.record_attempt(selected, now)
+                    if new_worker_torrents:
+                        attempt += 1
+
+                    stop_hashes = [
+                        torrent_hash(torrent) for torrent in torrents
+                        if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
+                    ]
+                    client.stop_hashes(stop_hashes)
+                    for selected in selected_batch:
+                        selected_hash = torrent_hash(selected)
+                        apply_tv_episode_file_priorities(
+                            client,
+                            selected,
+                            tv_order_categories,
+                            tv_file_priority_enabled,
+                            tv_file_priority_lookahead,
+                            tv_order_state.get("watch_priorities", {}).get(selected_hash),
+                        )
+                    client.top_priority(selected_hashes)
+                    try:
+                        client.reannounce_hashes(selected_hashes)
+                    except ApiError as exc:
+                        log_warning(
+                            f"Failed to reannounce selected category batch: {exc}",
+                        )
+                    client.start_hashes(selected_hashes)
+
+                    batch_action = "try_category_batch" if new_worker_torrents else "keep_category_batch"
+                    batch_reason = (
+                        f"running up to {max_active_downloads_per_category} active "
+                        "download worker(s) per category; parked stalled torrents "
+                        "do not count toward category workers"
+                    )
+                    batch_candidate_counts = {
+                        **candidate_counts,
+                        "normal_category_workers": len(selected_hashes),
+                        "normal_category_deferred": deferred_by_category_limit,
+                        **category_slot_plan.as_counts(),
+                    }
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        **decision_competition_context(
+                            winner=selected_batch[0],
+                            candidate_pool=selection_candidates,
+                        ),
+                        action=batch_action,
+                        reason=batch_reason,
+                        selected_torrent=scored_torrent_summary(selected_batch[0]),
+                        selected_torrents=[
+                            scored_torrent_summary(torrent)
+                            for torrent in selected_batch
+                        ],
+                        parked_torrents=[
+                            scored_torrent_summary(torrent)
+                            for torrent in normal_parked_stalled_torrents
+                        ],
+                        rejected_counts=dict(rejected_counts),
+                        candidate_counts=batch_candidate_counts,
+                        selected_category_counts=selected_by_category,
+                        attempt=attempt,
+                        attempt_limit=max_attempts,
+                    )
+                    log_decision_info(
+                        batch_action,
+                        f"Running {len(selected_hashes)} torrent(s) across "
+                        f"{len(selected_by_category)} category/categories; "
+                        f"up to {max_active_downloads_per_category} worker(s) per category; "
+                        f"{len(normal_parked_stalled_torrents)} stalled torrent(s) parked; "
+                        f"qB active download limit {category_slot_plan.qbt_active_download_limit}",
+                        selected=", ".join(torrent_name(torrent) for torrent in selected_batch[:5]),
+                        attempt=attempt,
+                        attempt_limit=max_attempts,
+                    )
+
+                    if stall_check_seconds <= 0:
+                        break
+
+                    time.sleep(stall_check_seconds)
+                    refreshed = {
+                        torrent_hash(torrent): torrent
+                        for torrent in single_download_torrents(client)
+                    }
+                    if storage_guard:
+                        storage_state = storage_guard.snapshot()
+                        if storage_state.get("stop") and storage_hard_stop_required(storage_guard, storage_state):
+                            client.stop_hashes(selected_hashes)
+                            emit_decision_log(
+                                "qbt_guard_decision",
+                                **decision_base_context(run_decision_context, client, storage_state),
+                                **decision_competition_context(
+                                    winner=selected_batch[0],
+                                    candidate_pool=selection_candidates,
+                                ),
+                                action="stop_category_batch_for_storage",
+                                reason=storage_state["reason"],
+                                selected_torrents=[
+                                    scored_torrent_summary(refreshed.get(torrent_hash(torrent)) or torrent)
+                                    for torrent in selected_batch
+                                ],
+                                rejected_counts={"storage_stop": 1},
+                                candidate_counts=batch_candidate_counts,
+                                selected_category_counts=selected_by_category,
+                            )
+                            log_decision_info(
+                                "stop_category_batch_for_storage",
+                                f"Stopped category batch after storage check: "
+                                f"{storage_state['reason']}",
+                                reason=storage_state["reason"],
+                            )
+                            break
+
+                    progress_events = []
+                    parked_after_sample = []
+                    stopped_after_sample = []
+                    no_progress_count = 0
+                    progress_class_counts = Counter()
+                    for selected in selected_batch:
+                        selected_hash = torrent_hash(selected)
+                        selected_refreshed = refreshed.get(selected_hash)
+                        progress_classification = torrent_progress_classification(
+                            selected,
+                            selected_refreshed or selected,
+                            normal_progress_min_bytes(selected),
+                            stall_check_seconds,
+                        )
+                        progress_class_counts[progress_class_count_key(progress_classification.state)] += 1
+                        if progress_classification.state == PROGRESS_CLASS_ACTIVELY_PROGRESSING:
+                            progress_events.append(
+                                {
+                                    "torrent": scored_torrent_summary(selected_refreshed or selected),
+                                    "reason": progress_classification.reason,
+                                }
+                            )
+                            health_store.record_productive(
+                                selected,
+                                selected_refreshed,
+                                datetime.now(timezone.utc),
+                                stall_check_seconds,
+                            )
+                            continue
+
+                        no_progress_count += 1
+                        no_progress_torrent = selected_refreshed or selected
+                        if park_stalled_downloads_enabled and progress_classification.park_as_listener:
+                            health_store.record_storage_recovery_no_progress(
+                                no_progress_torrent,
+                                datetime.now(timezone.utc),
+                                classification=progress_classification,
+                            )
+                            parked_after_sample.append(no_progress_torrent)
+                            continue
+
+                        if selected_hash:
+                            client.stop_hashes([selected_hash])
+                            attempted_hashes.add(selected_hash)
+                        cooldown_reason = progress_classification.cooldown_reason
+                        health_store.record_failure(
+                            no_progress_torrent,
+                            datetime.now(timezone.utc),
+                            progress_classification.reason,
+                            cooldown_reason=cooldown_reason,
+                            cooldown_scope="normal",
+                        )
+                        add_stall_cooldown_tag(
+                            client,
+                            no_progress_torrent,
+                            stall_tag_prefix,
+                            now,
+                            stall_cooldown_seconds,
+                            cooldown_reason,
+                            health_store=health_store,
+                        )
+                        stopped_after_sample.append(no_progress_torrent)
+
+                    post_sample_counts = {
+                        **batch_candidate_counts,
+                        **dict(progress_class_counts),
+                        "normal_category_progress": len(progress_events),
+                        "normal_category_no_progress": no_progress_count,
+                        "normal_category_newly_parked": len(parked_after_sample),
+                        "normal_category_stopped_no_progress": len(stopped_after_sample),
+                    }
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        **decision_competition_context(
+                            winner=refreshed.get(torrent_hash(selected_batch[0])) or selected_batch[0],
+                            candidate_pool=selection_candidates,
+                        ),
+                        action="keep_category_batch",
+                        reason=(
+                            "category batch remains selected; no-progress torrents "
+                            "are parked outside category worker counts when parking is enabled"
+                        ),
+                        selected_torrent=scored_torrent_summary(
+                            refreshed.get(torrent_hash(selected_batch[0])) or selected_batch[0]
+                        ),
+                        selected_torrents=[
+                            scored_torrent_summary(refreshed.get(torrent_hash(torrent)) or torrent)
+                            for torrent in selected_batch
+                        ],
+                        parked_torrents=[
+                            scored_torrent_summary(torrent)
+                            for torrent in normal_parked_stalled_torrents + parked_after_sample
+                        ],
+                        progress_torrents=progress_events[:5],
+                        rejected_counts={
+                            **dict(rejected_counts),
+                            "no_progress_after_wait": no_progress_count,
+                        },
+                        candidate_counts=post_sample_counts,
+                        selected_category_counts=selected_by_category,
+                    )
+                    log_decision_info(
+                        "keep_category_batch",
+                        f"Keeping category batch selected after {stall_check_seconds}s; "
+                        f"{len(progress_events)} progressed, "
+                        f"{no_progress_count} without measured progress, "
+                        f"{len(parked_after_sample)} parked, "
+                        f"{len(stopped_after_sample)} stopped",
+                        selected=", ".join(torrent_name(torrent) for torrent in selected_batch[:5]),
+                    )
+                    if stopped_after_sample and not progress_events and not park_stalled_downloads_enabled:
+                        continue
+                    break
 
             if productive_candidates and storage_constrained_mode and selection_candidates:
                 selected_hash = torrent_hash(selection_candidates[0])

@@ -135,6 +135,7 @@ Optional single-download selection tuning:
 | `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MIN_AVAILABILITY` | `0.95` | Lower availability bound for `missing-final-piece` classification. |
 | `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MAX_AVAILABILITY` | `1.0` | Upper availability bound for `missing-final-piece` classification. |
 | `QBT_NO_PROGRESS_CLASS_SCORE_MAX_AGE_SECONDS` | `86400` | How long the last no-progress class influences candidate scoring. |
+| `QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY` | `0` | Optional normal-mode category worker limit. When set above `0`, the selector keeps or starts up to this many active download workers for each qBittorrent category, while parked stalled torrents remain active outside the per-category worker count. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES` | storage recovery stall samples | No-progress samples required before a non-productive running torrent is parked. qBittorrent `stalledDL`/`metaDL` torrents park immediately. |
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
@@ -219,10 +220,11 @@ default; set `QBT_DECISION_LOG_LEVEL=info` while tuning, or
 When `QBT_STATUS_HTTP_ENABLED=true`, the controller exposes:
 
 - `/healthz`: plain `ok` health response.
-- `/status`: JSON snapshot of the latest queue decision, loop result, selected torrent, rejection counts, and candidate counts.
+- `/status`: JSON snapshot of the latest queue decision, loop result, selected torrents, rejection counts, and candidate counts.
 - `/metrics`: Prometheus text metrics for the latest decision. The endpoint
-  includes controller freshness, latest action labels, selected torrent
-  progress/speed/ETA, selected and parked torrent info rows, queue funnel
+  includes controller freshness, latest action labels, legacy single selected
+  torrent gauges, per-torrent selected/parked/progress gauges for progress,
+  remaining bytes, speed, ETA, availability, and seed counts, queue funnel
   counts, rejection reasons, effective transfer caps, budget bytes, and
   storage headroom.
 
@@ -241,11 +243,13 @@ By default, normal single-download mode now parks stalled/no-progress torrents
 instead of pausing and cooldown-tagging them. Parked torrents stay active in
 qBittorrent so they can resume immediately if a needed peer appears, while the
 controller excludes them from replacement selection and raises qBittorrent's
-active download limit enough to start another candidate beside them. The
-controller tracks qBittorrent active slots separately from Smart Queue worker
-slots: `qB active download limit = useful worker slots + parked listener
-slots`. Parked listeners stay active for peer discovery but do not consume the
-limited useful download worker slots.
+active download limit enough to start replacement candidates beside them. Set
+`QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY` above `0` to run a
+normal-mode batch with that many active download workers per qBittorrent
+category. The controller tracks qBittorrent active slots separately from Smart
+Queue worker slots: `qB active download limit = useful worker slots + parked
+listener slots`. Parked listeners stay active for peer discovery but do not
+consume the limited useful download worker slots or category worker counts.
 Internally the selector classifies every torrent into a lifecycle state:
 `candidate`, `selected-worker`, `productive`, `parked-listener`, `cooldown`,
 `retryable`, or `stale`. Worker states consume a useful download slot;

@@ -596,6 +596,240 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertIn((2, None), client.queue_limits)
         self.assertEqual([], client.added_tags)
 
+    def test_category_worker_limit_starts_three_per_category_excluding_stalled(self):
+        torrents = []
+        for category, prefix in (("tv", "TV.Show.S01E"), ("movies", "Movie")):
+            for index in range(4):
+                torrents.append(
+                    {
+                        "hash": f"{category}-{index}",
+                        "name": f"{prefix}{index + 1:02d}",
+                        "category": category,
+                        "state": "stoppedDL",
+                        "dlspeed": 0,
+                        "amount_left": (index + 1) * 1000,
+                        "downloaded": 0,
+                        "progress": 0.0,
+                        "availability": 2.0,
+                        "num_seeds": 5,
+                        "num_complete": 5,
+                        "tags": "",
+                    }
+                )
+        torrents.append(
+            {
+                "hash": "tv-stalled",
+                "name": "TV.Show.S01E99",
+                "category": "tv",
+                "state": "stalledDL",
+                "dlspeed": 0,
+                "amount_left": 999,
+                "downloaded": 0,
+                "progress": 0.0,
+                "availability": 2.0,
+                "num_seeds": 0,
+                "num_complete": 5,
+                "tags": "",
+            }
+        )
+        client = FakeQbtClient(torrents)
+        env = {
+            "QBT_SINGLE_DOWNLOAD_CATEGORIES": "tv,movies",
+            "QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY": "3",
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_SINGLE_DOWNLOAD_TV_ORDER_CATEGORIES": "",
+            "QBT_SINGLE_DOWNLOAD_MOVIE_ORDER_CATEGORIES": "",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                    decision_context={},
+                )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        try_event = next(item for item in decision_events if item.get("action") == "try_category_batch")
+        started_hashes = set(client.started[-1])
+        stopped_hashes = {
+            item_hash
+            for stop_call in client.stopped
+            for item_hash in stop_call
+        }
+
+        self.assertEqual(
+            {"tv-0", "tv-1", "tv-2", "movies-0", "movies-1", "movies-2"},
+            started_hashes,
+        )
+        self.assertIn("tv-3", stopped_hashes)
+        self.assertIn("movies-3", stopped_hashes)
+        self.assertNotIn("tv-stalled", stopped_hashes)
+        self.assertIn((7, None), client.queue_limits)
+        self.assertEqual(3, try_event["candidate_counts"]["max_active_downloads_per_category"])
+        self.assertEqual(6, try_event["candidate_counts"]["normal_category_workers"])
+        self.assertEqual(2, try_event["candidate_counts"]["normal_category_deferred"])
+        self.assertEqual(1, try_event["candidate_counts"]["parked_stalled"])
+        self.assertEqual(6, try_event["candidate_counts"]["smart_queue_worker_slots"])
+        self.assertEqual(1, try_event["candidate_counts"]["smart_queue_parked_listener_slots"])
+        self.assertEqual(7, try_event["candidate_counts"]["qbt_active_download_limit"])
+        self.assertEqual({"tv": 3, "movies": 3}, try_event["selected_category_counts"])
+
+    def test_category_worker_limit_keeps_productive_and_fills_open_category_slots(self):
+        torrents = [
+            {
+                "hash": "tv-active-1",
+                "name": "TV.Active.S01E01",
+                "category": "tv",
+                "state": "downloading",
+                "dlspeed": 65_536,
+                "amount_left": 1000,
+                "downloaded": 1000,
+                "progress": 0.5,
+                "availability": 2.0,
+                "num_seeds": 5,
+                "num_complete": 5,
+                "tags": "",
+            },
+            {
+                "hash": "tv-active-2",
+                "name": "TV.Active.S01E02",
+                "category": "tv",
+                "state": "downloading",
+                "dlspeed": 65_536,
+                "amount_left": 1000,
+                "downloaded": 1000,
+                "progress": 0.5,
+                "availability": 2.0,
+                "num_seeds": 5,
+                "num_complete": 5,
+                "tags": "",
+            },
+            {
+                "hash": "tv-new-1",
+                "name": "TV.New.S01E03",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 1000,
+                "downloaded": 0,
+                "progress": 0.0,
+                "availability": 2.0,
+                "num_seeds": 5,
+                "num_complete": 5,
+                "tags": "",
+            },
+            {
+                "hash": "tv-new-2",
+                "name": "TV.New.S01E04",
+                "category": "tv",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 1000,
+                "downloaded": 0,
+                "progress": 0.0,
+                "availability": 2.0,
+                "num_seeds": 5,
+                "num_complete": 5,
+                "tags": "",
+            },
+        ]
+        for index in range(3):
+            torrents.append(
+                {
+                    "hash": f"movies-active-{index}",
+                    "name": f"Movie.Active.{index}",
+                    "category": "movies",
+                    "state": "downloading",
+                    "dlspeed": 65_536,
+                    "amount_left": 1000,
+                    "downloaded": 1000,
+                    "progress": 0.5,
+                    "availability": 2.0,
+                    "num_seeds": 5,
+                    "num_complete": 5,
+                    "tags": "",
+                }
+            )
+        torrents.append(
+            {
+                "hash": "movies-new",
+                "name": "Movie.New",
+                "category": "movies",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 1000,
+                "downloaded": 0,
+                "progress": 0.0,
+                "availability": 2.0,
+                "num_seeds": 5,
+                "num_complete": 5,
+                "tags": "",
+            }
+        )
+        client = FakeQbtClient(torrents)
+        env = {
+            "QBT_SINGLE_DOWNLOAD_CATEGORIES": "tv,movies",
+            "QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY": "3",
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_SINGLE_DOWNLOAD_TV_ORDER_CATEGORIES": "",
+            "QBT_SINGLE_DOWNLOAD_MOVIE_ORDER_CATEGORIES": "",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            self.guard.apply_single_download(
+                [client],
+                usage_bytes=0,
+                monthly_limit_bytes=1000,
+                download_limit=1024,
+                limit_reason="unit test",
+                storage_guard=FakeStorageGuard(),
+                decision_context={},
+            )
+
+        started_hashes = set(client.started[-1])
+        stopped_hashes = {
+            item_hash
+            for stop_call in client.stopped
+            for item_hash in stop_call
+        }
+
+        self.assertEqual(
+            {
+                "tv-active-1",
+                "tv-active-2",
+                "tv-new-1",
+                "movies-active-0",
+                "movies-active-1",
+                "movies-active-2",
+            },
+            started_hashes,
+        )
+        self.assertIn("tv-new-2", stopped_hashes)
+        self.assertIn("movies-new", stopped_hashes)
+        self.assertIn((6, None), client.queue_limits)
+
     def test_uncapped_window_raises_normal_active_download_limit(self):
         client = FakeQbtClient([
             {

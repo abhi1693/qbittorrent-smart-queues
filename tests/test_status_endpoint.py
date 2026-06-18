@@ -35,6 +35,34 @@ class StatusEndpointTests(unittest.TestCase):
                     "connected_seeds": 0,
                     "reported_seeds": 1,
                 },
+                selected_torrents=[
+                    {
+                        "hash": "abc123",
+                        "name": "Example.S01E01",
+                        "category": "tv",
+                        "state": "downloading",
+                        "progress": 0.5,
+                        "amount_left_bytes": 1048576,
+                        "download_speed_bytes_per_sec": 1024,
+                        "eta_seconds": 3600,
+                        "availability": 0.5,
+                        "connected_seeds": 0,
+                        "reported_seeds": 1,
+                    },
+                    {
+                        "hash": "def456",
+                        "name": "Example.S01E02",
+                        "category": "tv",
+                        "state": "downloading",
+                        "progress": 0.25,
+                        "amount_left_bytes": 2097152,
+                        "download_speed_bytes_per_sec": 2048,
+                        "eta_seconds": 7200,
+                        "availability": 1.2,
+                        "connected_seeds": 2,
+                        "reported_seeds": 5,
+                    },
+                ],
                 winner_torrent={
                     "hash": "abc123",
                     "name": "Example.S01E01",
@@ -111,6 +139,19 @@ class StatusEndpointTests(unittest.TestCase):
         self.assertIn('qbt_guard_selected_torrent_amount_left_bytes 1048576.0', metrics)
         self.assertIn('qbt_guard_selected_torrent_eta_seconds 3600.0', metrics)
         self.assertIn('qbt_guard_selected_torrent_seeds{type="connected"} 0.0', metrics)
+        self.assertIn('qbt_guard_decision_torrent_count{role="selected"} 2.0', metrics)
+        self.assertIn(
+            'qbt_guard_torrent_download_speed_bytes_per_sec{category="tv",hash="def456",index="2",name="Example.S01E02",role="selected",state="downloading"} 2048.0',
+            metrics,
+        )
+        self.assertIn(
+            'qbt_guard_torrent_eta_seconds{category="tv",hash="def456",index="2",name="Example.S01E02",role="selected",state="downloading"} 7200.0',
+            metrics,
+        )
+        self.assertIn(
+            'qbt_guard_torrent_seeds{category="tv",hash="def456",index="2",name="Example.S01E02",role="selected",state="downloading",type="reported"} 5.0',
+            metrics,
+        )
         self.assertIn('qbt_guard_effective_cap_bytes_per_sec{type="download"} 0.0', metrics)
         self.assertIn('qbt_guard_storage_bytes{type="headroom"} 40000.0', metrics)
         self.assertIn('qbt_guard_decision_torrent_count{role="parked"} 1.0', metrics)
