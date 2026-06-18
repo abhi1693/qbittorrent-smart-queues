@@ -127,6 +127,31 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             self.assertFalse(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 1024}))
             self.assertTrue(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 65_536}))
 
+    def test_cap_aware_floors_scale_with_worker_share(self):
+        env = {
+            "QBT_SINGLE_DOWNLOAD_PRODUCTIVE_CAP_FRACTION": "0.80",
+            "QBT_SINGLE_DOWNLOAD_PROGRESS_CAP_FRACTION": "0.80",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            self.assertEqual(
+                16_666,
+                self.guard.cap_aware_productive_rate_floor(
+                    configured_floor=65_536,
+                    download_limit=125_000,
+                    worker_slots=6,
+                ),
+            )
+            self.assertEqual(
+                5_000_000,
+                self.guard.cap_aware_progress_min_bytes(
+                    configured_floor=19_660_800,
+                    download_limit=125_000,
+                    worker_slots=6,
+                    sample_seconds=300,
+                ),
+            )
+
     def test_progress_reason_requires_left_delta_speed_or_downloaded_delta(self):
         before = {"amount_left": 1000, "downloaded": 100, "dlspeed": 0}
 
@@ -655,7 +680,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                     [client],
                     usage_bytes=0,
                     monthly_limit_bytes=1000,
-                    download_limit=1024,
+                    download_limit=1_000_000,
                     limit_reason="unit test",
                     storage_guard=FakeStorageGuard(),
                     decision_context={},
@@ -802,7 +827,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 [client],
                 usage_bytes=0,
                 monthly_limit_bytes=1000,
-                download_limit=1024,
+                download_limit=1_000_000,
                 limit_reason="unit test",
                 storage_guard=FakeStorageGuard(),
                 decision_context={},
@@ -829,6 +854,70 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertIn("tv-new-2", stopped_hashes)
         self.assertIn("movies-new", stopped_hashes)
         self.assertIn((6, None), client.queue_limits)
+
+    def test_category_worker_limit_is_capped_by_effective_download_limit(self):
+        torrents = []
+        for category, prefix in (("tv", "TV.Show.S01E"), ("movies", "Movie")):
+            for index in range(3):
+                torrents.append(
+                    {
+                        "hash": f"{category}-{index}",
+                        "name": f"{prefix}{index + 1:02d}",
+                        "category": category,
+                        "state": "stoppedDL",
+                        "dlspeed": 0,
+                        "amount_left": (index + 1) * 1000,
+                        "downloaded": 0,
+                        "progress": 0.0,
+                        "availability": 2.0,
+                        "num_seeds": 5,
+                        "num_complete": 5,
+                        "tags": "",
+                    }
+                )
+        client = FakeQbtClient(torrents)
+        env = {
+            "QBT_SINGLE_DOWNLOAD_CATEGORIES": "tv,movies",
+            "QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY": "3",
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_SINGLE_DOWNLOAD_TV_ORDER_CATEGORIES": "",
+            "QBT_SINGLE_DOWNLOAD_MOVIE_ORDER_CATEGORIES": "",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=125_000,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                    decision_context={},
+                )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        try_event = next(item for item in decision_events if item.get("action") == "try_category_batch")
+
+        self.assertEqual(1, len(client.started[-1]))
+        self.assertIn((1, None), client.queue_limits)
+        self.assertEqual(1, try_event["candidate_counts"]["normal_category_total_worker_limit"])
+        self.assertEqual(1, try_event["candidate_counts"]["normal_category_workers"])
+        self.assertEqual(5, try_event["candidate_counts"]["normal_category_deferred"])
+        self.assertEqual(1, try_event["candidate_counts"]["smart_queue_worker_slots"])
+        self.assertEqual(1, try_event["candidate_counts"]["qbt_active_download_limit"])
 
     def test_uncapped_window_raises_normal_active_download_limit(self):
         client = FakeQbtClient([

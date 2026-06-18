@@ -77,14 +77,14 @@ after router/VPN/protocol overhead.
 | `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
 | `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
 | `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
-| `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `10485760` | Hard ISP usable download cap in bytes/s. This caps smoothed quota rates, burst mode, and single-download mode. Example: `10485760` = `10 MiB/s`. Replaces `QBT_MAX_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC` and `QBT_SINGLE_DOWNLOAD_DOWNLOAD_LIMIT_BYTES_PER_SEC`, which remain accepted as fallback aliases. |
+| `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `10485760` | Hard ISP usable download cap in bytes/s. This caps smoothed quota rates, burst mode, and single-download mode. Example: `10485760` = `10 MiB/s`. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_ENABLED` | `false` | Set qBittorrent's download limit to `0` during the configured local-time window, which qBittorrent treats as unlimited. Monthly/daily quota stop guardrails, thermal checks, storage checks, and queue selection still apply. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_TIMEZONE` | `Asia/Kolkata` | IANA timezone used for the uncapped window. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_START_LOCAL` | `22:00` | Local start time for uncapped downloads, inclusive. Example: `22:00` = 10 PM. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_END_LOCAL` | `05:00` | Local end time for uncapped downloads, exclusive. Windows that cross midnight are supported. Example: `05:00` = 5 AM. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_MAX_ACTIVE_DOWNLOADS` | `QBT_SINGLE_DOWNLOAD_NORMAL_MAX_ACTIVE_DOWNLOADS` | Active download worker limit used during the uncapped window. Parked stalled torrents add listening slots above this worker limit so they can resume immediately when seeders return. |
 | `QBT_QUOTA_BURST_ENABLED` | `false` | Allow faster downloads above the smoothed quota-safe rate while daily and monthly reserves remain. |
-| `QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | Burst-mode ISP usable cap in bytes/s. Example: `10485760` = `10 MiB/s`. Replaces `QBT_QUOTA_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC`, which remains accepted as a fallback alias. |
+| `QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | Burst-mode ISP usable cap in bytes/s. Example: `10485760` = `10 MiB/s`. |
 | `QBT_QUOTA_BURST_MIN_MONTHLY_REMAINING_FRACTION` | `0.10` | Minimum monthly guardrail reserve required before burst mode is allowed. |
 | `QBT_QUOTA_BURST_MIN_DAILY_REMAINING_FRACTION` | `0.20` | Minimum daily guardrail reserve required before burst mode is allowed. |
 
@@ -131,6 +131,8 @@ Optional single-download selection tuning:
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum unified-score advantage required before preempting a productive torrent. |
 | `QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_SECONDS` | `900` | Minimum dwell lease granted when a torrent is selected. While the lease is active, a torrent that is productive or has current/recent connected peers is not preempted or replaced by a briefly higher-scoring candidate. Set to `0` to disable. |
 | `QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_PEER_GRACE_SECONDS` | lease seconds | How long recent connected peer contact keeps an active lease eligible after peers temporarily disappear. |
+| `QBT_SINGLE_DOWNLOAD_PRODUCTIVE_CAP_FRACTION` | `0.80` | Fraction of each worker's effective cap share used as the productive-speed floor. |
+| `QBT_SINGLE_DOWNLOAD_PROGRESS_CAP_FRACTION` | `0.80` | Fraction of each worker's effective cap share used as the progress byte floor. |
 | `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MIN_PROGRESS` | `0.999` | Progress threshold for classifying a no-progress torrent as `missing-final-piece`. |
 | `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MIN_AVAILABILITY` | `0.95` | Lower availability bound for `missing-final-piece` classification. |
 | `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MAX_AVAILABILITY` | `1.0` | Upper availability bound for `missing-final-piece` classification. |
@@ -166,6 +168,8 @@ Optional storage and thermal guards:
 | --- | --- | --- |
 | `QBT_DOWNLOAD_STORAGE_PATH` | `/downloads` | Filesystem path checked for free download headroom. |
 | `QBT_DOWNLOAD_STORAGE_MIN_FREE_BYTES` | `32212254720` | Minimum free-space reserve. |
+| `QBT_DOWNLOAD_STORAGE_PRESSURE_MIN_BLOCKED` | `10` | Minimum number of storage-blocked candidates required before storage pressure mode can activate. |
+| `QBT_DOWNLOAD_STORAGE_PRESSURE_BLOCKED_FRACTION` | `0.50` | Minimum fraction of all candidates blocked by storage headroom before storage pressure mode can activate. |
 | `QBT_TORRENT_HEALTH_STATE_PATH` | `/state/torrent-health.json` | Persistent torrent health state file. |
 | `PROMETHEUS_URL` | unset | Prometheus base URL for thermal checks. |
 | `QBT_NVME_THERMAL_STOP_ENABLED` | enabled only when `PROMETHEUS_URL` is set | Enable NVMe thermal stop checks. |
@@ -231,13 +235,17 @@ When `QBT_STATUS_HTTP_ENABLED=true`, the controller exposes:
 Single-download mode keeps an active torrent only when selected bytes or
 downloaded bytes move by at least `QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES`
 during the `QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS` sample window. Instantaneous
-download speed is telemetry only for normal queue decisions; a low speed does
-not stop a torrent if it is making real progress. When
+download speed is used to decide whether active workers are productive, but a
+low speed does not stop a torrent if it is making enough progress. When
 `QBT_SINGLE_DOWNLOAD_ADAPTIVE_PROGRESS_ENABLED=true`, defaulting to true, that
 floor scales up for larger torrents using `QBT_SINGLE_DOWNLOAD_PROGRESS_SIZE_FRACTION`,
 is capped by `QBT_SINGLE_DOWNLOAD_PROGRESS_MAX_BYTES`, and is relaxed for older
 torrents using `QBT_SINGLE_DOWNLOAD_PROGRESS_AGE_RELIEF_DAYS` and
 `QBT_SINGLE_DOWNLOAD_PROGRESS_AGE_RELIEF_FRACTION`.
+The controller also clamps worker count, productive speed, and progress bytes to
+what the current effective download cap can support. This keeps fallback, quota,
+thermal, or burst caps from making every worker look stalled just because the
+configured static thresholds assume a higher link speed.
 
 By default, normal single-download mode now parks stalled/no-progress torrents
 instead of pausing and cooldown-tagging them. Parked torrents stay active in
@@ -266,19 +274,25 @@ Selection decisions use the same scoring model in normal mode, uncapped windows,
 preemption checks, and storage recovery. Decision logs include the chosen
 torrent's `score` object with visible components for priority, queue order,
 health, progress, near-complete progress, remaining bytes, ETA, sources,
-availability, cooldown, storage fit, and storage remaining. In `tiered` mode the
-queue key still sorts before the score; in `balanced` mode the score is the
-primary ordering signal after explicit priority.
+availability, stopped state, cooldown, storage fit, and storage remaining.
+Stopped torrents carry a score penalty so a high-progress but parked item does
+not jump ahead of an active candidate that is currently able to download. In
+`tiered` mode the queue key still sorts before the score; in `balanced` mode the
+score is the primary ordering signal after explicit priority.
 Selected torrents also receive a dwell lease. During that lease, the controller
 keeps the torrent if it is still making productive progress or has current or
 recent connected peer contact, even when another candidate briefly scores
 higher. This prevents stop/requeue churn from dropping useful peer connections.
 
-When download storage is at or below the configured reserve and torrent-fit
-checks are enabled, the controller enters a constrained recovery mode instead of
-pausing every torrent. It only considers torrents whose selected remaining bytes
-can fit in the currently free space, selects the smallest verified remaining
-downloads first, temporarily raises qBittorrent's active queue limit up to
+Before storage reaches reserve, storage pressure mode can use the storage-fit
+score in normal selection when enough candidates are blocked by headroom. This
+starts smaller fitting downloads earlier, frees completed data sooner, and
+reduces the chance of falling into constrained recovery. When download storage
+is at or below the configured reserve and torrent-fit checks are enabled, the
+controller enters a constrained recovery mode instead of pausing every torrent.
+It only considers torrents whose selected remaining bytes can fit in the
+currently free space, selects the smallest verified remaining downloads first,
+temporarily raises qBittorrent's active queue limit up to
 `QBT_DOWNLOAD_STORAGE_RECOVERY_MAX_ACTIVE` downloads, defaulting to `5`, and
 tracks no-progress samples for each recovery member. After
 `QBT_DOWNLOAD_STORAGE_RECOVERY_STALL_SAMPLES` samples, defaulting to `2`, a

@@ -241,6 +241,48 @@ class CandidateSortingTests(unittest.TestCase):
 
         self.assertEqual(["almost-done", "early"], [item["hash"] for item in ordered])
 
+    def test_balanced_strategy_penalizes_stopped_candidates(self):
+        active = self.torrent(
+            "active",
+            state="downloading",
+            progress=0.36,
+            amount_left=4 * 1024 * 1024 * 1024,
+            eta=3 * 3600,
+            availability=2.0,
+            num_seeds=5,
+            num_complete=5,
+        )
+        stopped = self.torrent(
+            "stopped",
+            state="stoppedDL",
+            progress=0.95,
+            amount_left=3 * 1024 * 1024 * 1024,
+            eta=0,
+            availability=1.0,
+            num_seeds=1,
+            num_complete=1,
+        )
+        store = FakeHealthStore({})
+
+        ordered = self.sort_balanced([stopped, active], store)
+
+        self.assertEqual(["active", "stopped"], [item["hash"] for item in ordered])
+        stopped_score = self.guard.candidate_score(
+            stopped,
+            set(),
+            set(),
+            set(),
+            {},
+            set(),
+            {},
+            3,
+            1.05,
+            store,
+            self.now,
+            strategy="balanced",
+        )
+        self.assertLess(stopped_score.components["stopped"], 0)
+
     def test_balanced_strategy_still_keeps_priority_tier_first(self):
         priority = self.torrent("priority", tags="priority", progress=0.05, amount_left=90 * 1024 * 1024 * 1024)
         almost_done = self.torrent("almost-done", progress=0.99, amount_left=1024 * 1024 * 1024)
@@ -339,6 +381,7 @@ class CandidateSortingTests(unittest.TestCase):
             "sources",
             "storage_fit",
             "storage_remaining",
+            "stopped",
         ):
             self.assertIn(name, components)
         self.assertEqual(1000.0, components["priority"])
@@ -371,10 +414,14 @@ class CandidateSortingTests(unittest.TestCase):
         challenger = self.torrent(
             "challenger",
             state="stoppedDL",
-            progress=0.95,
-            amount_left=4 * 1024 * 1024 * 1024,
+            progress=0.99,
+            amount_left=512 * 1024 * 1024,
+            eta=1800,
+            availability=4.0,
+            num_seeds=20,
+            num_complete=20,
         )
-        store = FakeHealthStore({"current": 20.0, "challenger": 0.0})
+        store = FakeHealthStore({"current": 20.0, "challenger": 100.0})
 
         should_preempt = self.guard.should_preempt_productive_torrent(
             current,

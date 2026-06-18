@@ -1,6 +1,7 @@
 import importlib
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 
 class FakeHealthStore:
@@ -42,11 +43,12 @@ class FakeHealthStore:
 
 
 class FakeClient:
-    def __init__(self):
+    def __init__(self, files=None):
+        self.files = files or {}
         self.removed_tags = []
 
     def torrent_files(self, item_hash):
-        return []
+        return [dict(item) for item in self.files.get(item_hash, [])]
 
     def remove_tags(self, hashes, tags):
         self.removed_tags.append((list(hashes), list(tags)))
@@ -75,14 +77,22 @@ class PolicyEngineTests(unittest.TestCase):
         torrent.update(overrides)
         return torrent
 
-    def engine(self, torrents, health_store=None, attempted_hashes=None):
+    def engine(
+        self,
+        torrents,
+        health_store=None,
+        attempted_hashes=None,
+        client=None,
+        storage_guard=None,
+        storage_state=None,
+    ):
         return self.guard.SmartQueuePolicyEngine(
-            client=FakeClient(),
+            client=client or FakeClient(),
             torrents=torrents,
             health_store=health_store or FakeHealthStore(),
             now=self.now,
-            storage_guard=None,
-            storage_state=None,
+            storage_guard=storage_guard,
+            storage_state=storage_state,
             storage_constrained_mode=False,
             min_progress=0.0,
             max_remaining_bytes=0,
@@ -110,6 +120,7 @@ class PolicyEngineTests(unittest.TestCase):
             park_stalled_samples=2,
             max_parked_stalled_downloads=0,
             normal_worker_limit=1,
+            productive_rate_floor_bytes=65_536,
             normal_progress_min_bytes=lambda torrent: 1,
         )
 
@@ -172,6 +183,70 @@ class PolicyEngineTests(unittest.TestCase):
         self.assertEqual(1, filters.cooldown_count)
         self.assertEqual(1, classification.rejected_counts["cooldown"])
         self.assertEqual(1, classification.rejected_counts["cooldown_no_progress"])
+
+    def test_storage_pressure_sorts_fitting_candidates_by_storage_score(self):
+        class StorageGuard:
+            require_torrent_fit = True
+
+        storage_state = {
+            "enabled": True,
+            "stop": False,
+            "reason": "pressure",
+            "free_bytes": 20_000,
+            "reserve_bytes": 1_000,
+            "headroom_bytes": 10_000,
+        }
+        small = self.torrent(
+            "small",
+            name="Small.Movie.1080p",
+            amount_left=2_000,
+            progress=0.95,
+            availability=3.0,
+            num_seeds=10,
+            num_complete=10,
+        )
+        large = self.torrent(
+            "large",
+            name="Large.Movie.1080p",
+            amount_left=8_000,
+            progress=0.10,
+            availability=2.0,
+            num_seeds=5,
+            num_complete=5,
+        )
+        blocked = self.torrent("blocked", name="Blocked.Movie.1080p", amount_left=40_000)
+        client = FakeClient(
+            files={
+                "small": [{"name": "small.mkv", "size": 10_000, "progress": 0.8, "priority": 1}],
+                "large": [{"name": "large.mkv", "size": 10_000, "progress": 0.2, "priority": 1}],
+                "blocked": [{"name": "blocked.mkv", "size": 50_000, "progress": 0.0, "priority": 1}],
+            }
+        )
+        engine = self.engine(
+            [blocked, large, small],
+            client=client,
+            storage_guard=StorageGuard(),
+            storage_state=storage_state,
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "QBT_DOWNLOAD_STORAGE_PRESSURE_MIN_BLOCKED": "1",
+                "QBT_DOWNLOAD_STORAGE_PRESSURE_BLOCKED_FRACTION": "0.25",
+            },
+            clear=False,
+        ):
+            observation = engine.observe()
+            classification = engine.classify(observation)
+            filters = engine.filter(observation, classification)
+
+        self.assertTrue(filters.storage_pressure_mode)
+        self.assertEqual(["small", "large"], [
+            torrent["hash"] for torrent in filters.candidates
+        ])
+        self.assertEqual(1, filters.storage_blocked_count)
+        self.assertEqual(1, classification.rejected_counts["storage_headroom"])
 
 
 if __name__ == "__main__":
