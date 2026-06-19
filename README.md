@@ -115,7 +115,9 @@ Optional stale torrent maintenance:
 | `QBT_STALE_TORRENT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls. |
 
 The qBittorrent tag `blacklist` is a built-in manual operator action. On each
-pass, the controller consumes torrents with this tag before normal queue
+successful qBittorrent connection, the controller ensures the global
+`blacklist` tag exists so it is available from the qBittorrent UI tag list. On
+each pass, the controller consumes torrents with this tag before normal queue
 selection, finds the matching Sonarr or Radarr queue record, and calls the Arr
 queue API with `removeFromClient=true`, `blocklist=true`, and
 `skipRedownload=false`. That removes the current torrent, blocklists the release

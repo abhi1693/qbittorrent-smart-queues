@@ -2947,6 +2947,15 @@ class QbtClient:
             {"hashes": "|".join(hashes), "tags": ",".join(tags)},
         )
 
+    def create_tags(self, tags):
+        if not tags:
+            return
+        self.request(
+            "POST",
+            "/api/v2/torrents/createTags",
+            {"tags": ",".join(tags)},
+        )
+
     def all_tags(self):
         payload = self.request("GET", "/api/v2/torrents/tags")
         return json.loads(payload.decode("utf-8"))
@@ -2973,11 +2982,19 @@ def reachable_qbt_clients():
         try:
             client.login()
             client.request("GET", "/api/v2/app/version")
+            ensure_qbt_global_tags(client)
             clients.append(client)
             log_debug("Connected to qBittorrent service")
         except ApiError as exc:
             log_warning(f"Skipping unavailable qBittorrent service: {exc}")
     return clients
+
+
+def ensure_qbt_global_tags(client):
+    try:
+        client.create_tags([MANUAL_BLACKLIST_TAG])
+    except (AttributeError, ApiError) as exc:
+        log_warning(f"Failed to ensure qBittorrent global tag {MANUAL_BLACKLIST_TAG!r}: {exc}")
 
 
 def apply_fail_closed():

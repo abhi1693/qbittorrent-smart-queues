@@ -77,6 +77,44 @@ class LoopModeTests(unittest.TestCase):
             service_logs[0]["qbt_urls"],
         )
 
+    def test_reachable_qbt_clients_ensures_blacklist_tag(self):
+        instances = []
+
+        class FakeQbtClient:
+            def __init__(self, url):
+                self.url = url
+                self.created_tags = []
+                instances.append(self)
+
+            def login(self):
+                pass
+
+            def request(self, method, path, form=None):
+                self.requested_version = (method, path, form)
+                return b"v5.2.1"
+
+            def create_tags(self, tags):
+                self.created_tags.append(list(tags))
+
+        with mock.patch.dict("os.environ", {"QBT_URLS": "http://qbittorrent.test:8080"}, clear=True), \
+                mock.patch.object(self.guard, "QbtClient", FakeQbtClient):
+            clients = self.guard.reachable_qbt_clients()
+
+        self.assertEqual(instances, clients)
+        self.assertEqual(("GET", "/api/v2/app/version", None), instances[0].requested_version)
+        self.assertEqual([["blacklist"]], instances[0].created_tags)
+
+    def test_qbt_client_create_tags_uses_global_tags_endpoint(self):
+        client = self.guard.QbtClient("http://qbittorrent.test:8080")
+        with mock.patch.object(client, "request", return_value=b"") as request:
+            client.create_tags(["blacklist"])
+
+        request.assert_called_once_with(
+            "POST",
+            "/api/v2/torrents/createTags",
+            {"tags": "blacklist"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
