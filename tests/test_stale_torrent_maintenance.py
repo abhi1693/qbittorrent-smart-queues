@@ -314,7 +314,7 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertIn("http://radarr.test/api/v3/queue/88?", delete_url)
         self.assertIn("blocklist=true", delete_url)
 
-    def test_manual_blacklist_tag_marks_torrent_when_no_arr_queue_record_matches(self):
+    def test_manual_blacklist_tag_deletes_torrent_when_no_arr_queue_record_matches(self):
         client = FakeQbtClient()
         torrent = {
             "hash": "nomatch",
@@ -336,10 +336,41 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 radarr,
             )
 
-        self.assertEqual({"attempted": 1, "succeeded": 0, "failed": 0, "no_arr_match": 1}, result)
+        self.assertEqual({"attempted": 1, "succeeded": 1, "failed": 0, "no_arr_match": 1}, result)
         request_json.assert_not_called()
-        self.assertEqual([(["nomatch"], ["Blacklist"])], client.removed_tags)
-        self.assertEqual([(["nomatch"], ["blacklist-no-arr-match"])], client.added_tags)
+        self.assertEqual([(["nomatch"], True)], client.deleted)
+        self.assertEqual([], client.removed_tags)
+        self.assertEqual([], client.added_tags)
+
+    def test_manual_blacklist_tag_marks_failure_when_direct_delete_fails(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "deletefail",
+            "name": "Manual Delete Failure",
+            "state": "stoppedDL",
+            "progress": 0,
+            "amount_left": 1024,
+            "category": "anime",
+            "tags": "Blacklist",
+        }
+        sonarr = StaticQueue(None, configs=[])
+        radarr = StaticQueue(None, configs=[])
+
+        with (
+            mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json,
+            mock.patch.object(client, "delete_hashes", side_effect=self.guard.ApiError("qB delete failed")),
+        ):
+            result = self.guard.process_manual_blacklist_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual({"attempted": 1, "succeeded": 0, "failed": 1, "no_arr_match": 1}, result)
+        request_json.assert_not_called()
+        self.assertEqual([(["deletefail"], ["Blacklist"])], client.removed_tags)
+        self.assertEqual([(["deletefail"], ["blacklist-failed"])], client.added_tags)
 
     def test_long_stalled_torrent_is_tagged_reannounced_and_parked(self):
         now = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)

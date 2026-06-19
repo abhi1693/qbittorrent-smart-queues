@@ -122,9 +122,9 @@ selection, finds the matching Sonarr or Radarr queue record, and calls the Arr
 queue API with `removeFromClient=true`, `blocklist=true`, and
 `skipRedownload=false`. That removes the current torrent, blocklists the release
 in Arr, and leaves Sonarr/Radarr free to grab a different source. If no matching
-Arr queue record is found, the controller replaces the action tag with
-`blacklist-no-arr-match`; if the Arr delete call fails, it replaces it with
-`blacklist-failed`.
+Arr queue record is found, the controller deletes the torrent directly from
+qBittorrent with `deleteFiles=true`. If the Arr delete call or direct qBittorrent
+delete fails, it replaces the action tag with `blacklist-failed`.
 
 Stale maintenance is intentionally conservative. It does not delete incomplete
 14-day stalled torrents just because they are old; it tags, reannounces, and

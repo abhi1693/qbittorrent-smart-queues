@@ -120,7 +120,6 @@ TORRENT_LIFECYCLE_STALE = "stale"
 STOPPED_TORRENT_SCORE_PENALTY = -35.0
 MANUAL_BLACKLIST_TAG = "blacklist"
 MANUAL_BLACKLIST_FAILED_TAG = "blacklist-failed"
-MANUAL_BLACKLIST_NO_ARR_MATCH_TAG = "blacklist-no-arr-match"
 
 
 @dataclass(frozen=True)
@@ -5338,13 +5337,26 @@ def process_manual_blacklist_torrents(client, torrents=None, sonarr_queue=None, 
             )
         else:
             result["no_arr_match"] += 1
-            mark_manual_blacklist_failure(client, torrent, MANUAL_BLACKLIST_NO_ARR_MATCH_TAG)
-            log_warning(
-                f"Could not find a Sonarr/Radarr queue record for manually tagged torrent: "
-                f"{torrent_name(torrent)}",
-                hash=item_hash,
-                tag=MANUAL_BLACKLIST_TAG,
-            )
+            try:
+                client.delete_hashes([item_hash], True)
+                result["succeeded"] += 1
+                log_info(
+                    f"Deleted manually blacklisted torrent directly because no "
+                    f"Sonarr/Radarr queue record matched: {torrent_name(torrent)}",
+                    hash=item_hash,
+                    tag=MANUAL_BLACKLIST_TAG,
+                    delete_files=True,
+                )
+            except ApiError as exc:
+                result["failed"] += 1
+                mark_manual_blacklist_failure(client, torrent, MANUAL_BLACKLIST_FAILED_TAG)
+                log_warning(
+                    f"Failed to delete manually blacklisted torrent directly after "
+                    f"no Sonarr/Radarr queue record matched: {torrent_name(torrent)}: {exc}",
+                    hash=item_hash,
+                    tag=MANUAL_BLACKLIST_TAG,
+                    delete_files=True,
+                )
 
     return result
 
