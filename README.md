@@ -114,6 +114,16 @@ Optional stale torrent maintenance:
 | `QBT_STALE_TORRENT_FAIL_PERMANENT_IMPORT_FAILURES` | `true` | Remove and blocklist completed Radarr downloads with permanent corrupt/sample-detection import failures. |
 | `QBT_STALE_TORRENT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls. |
 
+The qBittorrent tag `blacklist` is a built-in manual operator action. On each
+pass, the controller consumes torrents with this tag before normal queue
+selection, finds the matching Sonarr or Radarr queue record, and calls the Arr
+queue API with `removeFromClient=true`, `blocklist=true`, and
+`skipRedownload=false`. That removes the current torrent, blocklists the release
+in Arr, and leaves Sonarr/Radarr free to grab a different source. If no matching
+Arr queue record is found, the controller replaces the action tag with
+`blacklist-no-arr-match`; if the Arr delete call fails, it replaces it with
+`blacklist-failed`.
+
 Stale maintenance is intentionally conservative. It does not delete incomplete
 14-day stalled torrents just because they are old; it tags, reannounces, and
 parks them so they can resume later while the selector moves on to torrents that

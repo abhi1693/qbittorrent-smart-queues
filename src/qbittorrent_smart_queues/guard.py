@@ -118,6 +118,9 @@ TORRENT_LIFECYCLE_COOLDOWN = "cooldown"
 TORRENT_LIFECYCLE_RETRYABLE = "retryable"
 TORRENT_LIFECYCLE_STALE = "stale"
 STOPPED_TORRENT_SCORE_PENALTY = -35.0
+MANUAL_BLACKLIST_TAG = "blacklist"
+MANUAL_BLACKLIST_FAILED_TAG = "blacklist-failed"
+MANUAL_BLACKLIST_NO_ARR_MATCH_TAG = "blacklist-no-arr-match"
 
 
 @dataclass(frozen=True)
@@ -3551,6 +3554,13 @@ def torrent_tags(torrent):
     }
 
 
+def torrent_matching_tags(torrent, normalized_tag):
+    normalized_tag = str(normalized_tag or "").strip().lower()
+    if not normalized_tag:
+        return []
+    return sorted(tag for tag in torrent_tags(torrent) if tag.lower() == normalized_tag)
+
+
 def torrent_category(torrent):
     return str(torrent.get("category") or "").strip()
 
@@ -5132,13 +5142,22 @@ def arr_import_verified_from_configs(configs, metadata, media_type, timeout):
     return False
 
 
-def arr_delete_queue_record(base_url, api_key, queue_id, remove_from_client=True, blocklist=False, timeout=10):
+def arr_delete_queue_record(
+    base_url,
+    api_key,
+    queue_id,
+    remove_from_client=True,
+    blocklist=False,
+    skip_redownload=False,
+    timeout=10,
+):
     if not base_url or not api_key or queue_id is None:
         return False
     opener = urllib.request.build_opener()
     params = urllib.parse.urlencode({
         "removeFromClient": str(bool(remove_from_client)).lower(),
         "blocklist": str(bool(blocklist)).lower(),
+        "skipRedownload": str(bool(skip_redownload)).lower(),
     })
     url = join_url(base_url, f"/api/v3/queue/{queue_id}") + "?" + params
     request_json(
@@ -5162,6 +5181,7 @@ def arr_delete_queue_record_from_configs(configs, source, queue_id, blocklist, t
                 queue_id,
                 remove_from_client=True,
                 blocklist=blocklist,
+                skip_redownload=False,
                 timeout=timeout,
             )
             return True
@@ -5172,6 +5192,144 @@ def arr_delete_queue_record_from_configs(configs, source, queue_id, blocklist, t
                 source=label,
             )
     return False
+
+
+def arr_queue_candidates_for_torrent(torrent, sonarr_queue, radarr_queue):
+    candidates = []
+    sonarr_metadata = sonarr_queue.torrent_metadata(torrent) if sonarr_queue else None
+    if sonarr_metadata:
+        candidates.append(("sonarr", sonarr_queue, sonarr_metadata))
+    radarr_metadata = radarr_queue.torrent_metadata(torrent) if radarr_queue else None
+    if radarr_metadata:
+        candidates.append(("radarr", radarr_queue, radarr_metadata))
+
+    category = torrent_category(torrent).lower()
+    if category.endswith("movies") or category == "movies":
+        preferred = "radarr"
+    elif category.endswith("tv") or category == "tv":
+        preferred = "sonarr"
+    else:
+        preferred = ""
+    if preferred:
+        candidates.sort(key=lambda item: 0 if item[0] == preferred else 1)
+    return candidates
+
+
+def clear_manual_blacklist_action_tags(client, torrent):
+    item_hash = torrent_hash(torrent)
+    if not item_hash:
+        return False
+    action_tags = torrent_matching_tags(torrent, MANUAL_BLACKLIST_TAG)
+    if not action_tags:
+        return True
+    try:
+        client.remove_tags([item_hash], action_tags)
+        return True
+    except ApiError as exc:
+        log_warning(
+            f"Failed to clear manual blacklist action tag(s) from "
+            f"{torrent_name(torrent)}: {exc}",
+            hash=item_hash,
+        )
+        return False
+
+
+def mark_manual_blacklist_failure(client, torrent, failure_tag):
+    item_hash = torrent_hash(torrent)
+    if not item_hash:
+        return
+    clear_manual_blacklist_action_tags(client, torrent)
+    try:
+        client.add_tags([item_hash], [failure_tag])
+    except ApiError as exc:
+        log_warning(
+            f"Failed to mark manual blacklist failure for {torrent_name(torrent)}: {exc}",
+            hash=item_hash,
+            failure_tag=failure_tag,
+        )
+
+
+def process_manual_blacklist_torrents(client, torrents=None, sonarr_queue=None, radarr_queue=None):
+    if torrents is None:
+        torrents = single_download_torrents(client)
+    tagged_torrents = [
+        torrent for torrent in torrents
+        if torrent_hash(torrent) and torrent_matching_tags(torrent, MANUAL_BLACKLIST_TAG)
+    ]
+    if not tagged_torrents:
+        return {
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "no_arr_match": 0,
+        }
+
+    if sonarr_queue is None:
+        sonarr_queue = SonarrQueueMetadata()
+    if radarr_queue is None:
+        radarr_queue = RadarrQueueMetadata()
+
+    timeout = env_int("QBT_MANUAL_BLACKLIST_ARR_TIMEOUT", env_int("QBT_ARR_QUEUE_TIMEOUT", 10))
+    result = {
+        "attempted": len(tagged_torrents),
+        "succeeded": 0,
+        "failed": 0,
+        "no_arr_match": 0,
+    }
+    for torrent in tagged_torrents:
+        item_hash = torrent_hash(torrent)
+        candidates = arr_queue_candidates_for_torrent(torrent, sonarr_queue, radarr_queue)
+        deleted = False
+        matched = False
+        if candidates:
+            clear_manual_blacklist_action_tags(client, torrent)
+        for source, queue, metadata in candidates:
+            queue_id = metadata.get("queue_id") if metadata else None
+            configs = queue.configs() if queue else []
+            if queue_id is None or not configs:
+                continue
+            matched = True
+            deleted = arr_delete_queue_record_from_configs(
+                configs,
+                metadata.get("source"),
+                queue_id,
+                blocklist=True,
+                timeout=timeout,
+            )
+            if deleted:
+                result["succeeded"] += 1
+                log_info(
+                    f"Blocklisted manually tagged torrent through {source}: "
+                    f"{torrent_name(torrent)}",
+                    hash=item_hash,
+                    queue_id=queue_id,
+                    tag=MANUAL_BLACKLIST_TAG,
+                )
+                break
+
+        if deleted:
+            continue
+
+        if matched:
+            result["failed"] += 1
+            mark_manual_blacklist_failure(client, torrent, MANUAL_BLACKLIST_FAILED_TAG)
+            log_warning(
+                f"Failed to blocklist manually tagged torrent through Arr: "
+                f"{torrent_name(torrent)}",
+                hash=item_hash,
+                tag=MANUAL_BLACKLIST_TAG,
+            )
+        else:
+            result["no_arr_match"] += 1
+            mark_manual_blacklist_failure(client, torrent, MANUAL_BLACKLIST_NO_ARR_MATCH_TAG)
+            log_warning(
+                f"Could not find a Sonarr/Radarr queue record for manually tagged torrent: "
+                f"{torrent_name(torrent)}",
+                hash=item_hash,
+                tag=MANUAL_BLACKLIST_TAG,
+            )
+
+    return result
 
 
 def is_completed_torrent(torrent):
@@ -5358,6 +5516,9 @@ def cleanup_qbt_clients(clients):
             log_warning(f"Failed to list qBittorrent torrents for stale maintenance: {exc}")
             torrents = []
         if torrents:
+            manual_blacklist_result = process_manual_blacklist_torrents(client, torrents)
+            if manual_blacklist_result["attempted"]:
+                continue
             delete_files = env_bool("QBT_DELETE_FILES", True)
             completed_torrents = [
                 torrent for torrent in torrents
@@ -8251,6 +8412,37 @@ def apply_single_download(
                         break
             else:
                 storage_state = None
+            manual_blacklist_result = process_manual_blacklist_torrents(
+                client,
+                torrents,
+                sonarr_queue,
+                radarr_queue,
+            )
+            if manual_blacklist_result["attempted"]:
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="manual_blacklist",
+                    reason="processed qBittorrent blacklist tag before queue selection",
+                    rejected_counts={
+                        "manual_blacklist_succeeded": manual_blacklist_result["succeeded"],
+                        "manual_blacklist_failed": manual_blacklist_result["failed"],
+                        "manual_blacklist_no_arr_match": manual_blacklist_result["no_arr_match"],
+                    },
+                    candidate_counts={
+                        "manual_blacklist_attempted": manual_blacklist_result["attempted"],
+                    },
+                    selected_torrent=None,
+                )
+                log_decision_info(
+                    "manual_blacklist",
+                    "Processed manually blacklisted torrent tag(s) before queue selection",
+                    attempted=manual_blacklist_result["attempted"],
+                    succeeded=manual_blacklist_result["succeeded"],
+                    failed=manual_blacklist_result["failed"],
+                    no_arr_match=manual_blacklist_result["no_arr_match"],
+                )
+                break
             storage_constrained_mode = storage_state_is_reserve_constrained(storage_guard, storage_state)
             if storage_constrained_mode:
                 initial_slot_plan = None

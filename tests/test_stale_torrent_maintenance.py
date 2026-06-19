@@ -10,6 +10,7 @@ class FakeQbtClient:
     def __init__(self):
         self.deleted = []
         self.added_tags = []
+        self.removed_tags = []
         self.reannounced = []
         self.stopped = []
 
@@ -18,6 +19,9 @@ class FakeQbtClient:
 
     def add_tags(self, hashes, tags):
         self.added_tags.append((list(hashes), list(tags)))
+
+    def remove_tags(self, hashes, tags):
+        self.removed_tags.append((list(hashes), list(tags)))
 
     def reannounce_hashes(self, hashes):
         self.reannounced.append(list(hashes))
@@ -97,6 +101,7 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertIn("/api/v3/queue/42?", delete_url)
         self.assertIn("removeFromClient=true", delete_url)
         self.assertIn("blocklist=false", delete_url)
+        self.assertIn("skipRedownload=false", delete_url)
         self.assertEqual([], client.deleted)
 
     def test_completed_sonarr_already_imported_torrent_is_kept_without_verified_episode_file(self):
@@ -198,6 +203,7 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertIn("/api/v3/queue/88?", delete_url)
         self.assertIn("removeFromClient=true", delete_url)
         self.assertIn("blocklist=false", delete_url)
+        self.assertIn("skipRedownload=false", delete_url)
         self.assertEqual([], client.deleted)
 
     def test_completed_radarr_corrupt_download_is_blocklisted(self):
@@ -234,7 +240,106 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertIn("/api/v3/queue/77?", request_json.call_args.args[2])
         self.assertIn("removeFromClient=true", request_json.call_args.args[2])
         self.assertIn("blocklist=true", request_json.call_args.args[2])
+        self.assertIn("skipRedownload=false", request_json.call_args.args[2])
         self.assertEqual([], client.deleted)
+
+    def test_manual_blacklist_tag_blocklists_sonarr_queue_record(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "abc123",
+            "name": "Tagged Show S01E01",
+            "state": "stoppedDL",
+            "progress": 0.2,
+            "amount_left": 1024,
+            "category": "tv",
+            "tags": "blacklist,priority",
+        }
+        sonarr = StaticQueue({
+            "queue_id": 42,
+            "source": "sonarr",
+            "series": "tagged show",
+            "season": 1,
+            "episode": 1,
+        })
+        radarr = StaticQueue(None, configs=[])
+
+        with mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
+            result = self.guard.process_manual_blacklist_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual({"attempted": 1, "succeeded": 1, "failed": 0, "no_arr_match": 0}, result)
+        request_json.assert_called_once()
+        delete_url = request_json.call_args.args[2]
+        self.assertIn("/api/v3/queue/42?", delete_url)
+        self.assertIn("removeFromClient=true", delete_url)
+        self.assertIn("blocklist=true", delete_url)
+        self.assertIn("skipRedownload=false", delete_url)
+        self.assertEqual([(["abc123"], ["blacklist"])], client.removed_tags)
+        self.assertEqual([], client.added_tags)
+
+    def test_manual_blacklist_tag_prefers_radarr_for_movie_category(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "feed123",
+            "name": "Tagged Movie 2026",
+            "state": "stoppedDL",
+            "progress": 0.2,
+            "amount_left": 1024,
+            "category": "movies",
+            "tags": "blacklist",
+        }
+        sonarr = StaticQueue(
+            {"queue_id": 11, "source": "sonarr"},
+            configs=[("sonarr", "http://sonarr.test", "sonarr-key")],
+        )
+        radarr = StaticQueue(
+            {"queue_id": 88, "source": "radarr"},
+            configs=[("radarr", "http://radarr.test", "radarr-key")],
+        )
+
+        with mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
+            result = self.guard.process_manual_blacklist_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual({"attempted": 1, "succeeded": 1, "failed": 0, "no_arr_match": 0}, result)
+        delete_url = request_json.call_args.args[2]
+        self.assertIn("http://radarr.test/api/v3/queue/88?", delete_url)
+        self.assertIn("blocklist=true", delete_url)
+
+    def test_manual_blacklist_tag_marks_torrent_when_no_arr_queue_record_matches(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "nomatch",
+            "name": "Manual Only Torrent",
+            "state": "stoppedDL",
+            "progress": 0,
+            "amount_left": 1024,
+            "category": "anime",
+            "tags": "Blacklist",
+        }
+        sonarr = StaticQueue(None, configs=[])
+        radarr = StaticQueue(None, configs=[])
+
+        with mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
+            result = self.guard.process_manual_blacklist_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual({"attempted": 1, "succeeded": 0, "failed": 0, "no_arr_match": 1}, result)
+        request_json.assert_not_called()
+        self.assertEqual([(["nomatch"], ["Blacklist"])], client.removed_tags)
+        self.assertEqual([(["nomatch"], ["blacklist-no-arr-match"])], client.added_tags)
 
     def test_long_stalled_torrent_is_tagged_reannounced_and_parked(self):
         now = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
