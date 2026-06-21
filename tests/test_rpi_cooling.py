@@ -1,4 +1,6 @@
+import contextlib
 import importlib
+import io
 import json
 import os
 import tempfile
@@ -469,13 +471,15 @@ class RpiCoolingTests(unittest.TestCase):
             ]
         )
         env = {
+            "QBT_LOG_FORMAT": "json",
             "QBT_RPI_COOLING_THROTTLE_DOWNLOAD_LIMIT_BYTES_PER_SEC": "2097152",
             "QBT_RPI_COOLING_THROTTLE_UPLOAD_LIMIT_BYTES_PER_SEC": "131072",
         }
+        stdout = io.StringIO()
 
         with mock.patch.dict("os.environ", env, clear=True), \
                 mock.patch.object(self.guard, "cleanup_qbt_clients"), \
-                mock.patch.object(self.guard, "log_debug") as log_debug:
+                contextlib.redirect_stdout(stdout):
             result = self.guard.apply_rpi_cooling_stop(
                 [client],
                 {
@@ -490,7 +494,12 @@ class RpiCoolingTests(unittest.TestCase):
         self.assertEqual([], client.download_limits)
         self.assertEqual([], client.upload_limits)
         self.assertEqual(0, client.stop_all_calls)
-        log_debug.assert_called_once()
+        record = json.loads(stdout.getvalue())
+        self.assertEqual("qbt_guard_decision", record["event"])
+        self.assertEqual("throttle", record["action"])
+        self.assertTrue(record["skipped_no_active_downloads"])
+        self.assertEqual(0, record["active_download_count"])
+        self.assertEqual(2, record["torrent_count"])
 
     def test_unrelated_hot_node_does_not_throttle_qbittorrent_when_topology_enabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:

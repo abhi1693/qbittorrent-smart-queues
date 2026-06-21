@@ -377,10 +377,13 @@ def status_metric_torrent(summary):
 
 
 class QueueStatusStore:
+    decision_events = {"qbt_guard_decision", "qbt_guard_stop"}
+
     def __init__(self):
         self.lock = threading.Lock()
         self.started_at = datetime.now(timezone.utc)
         self.last_event = None
+        self.last_decision_event = None
         self.last_decision_at = None
         self.last_loop_at = None
         self.loop_result = 0
@@ -391,21 +394,22 @@ class QueueStatusStore:
         safe_fields = json_safe(fields)
         action = str(safe_fields.get("action") or "")
         with self.lock:
+            next_event = {
+                "event": event,
+                "source": source,
+                "timestamp": format_utc(now),
+                **safe_fields,
+            }
             if event == "qbt_guard_loop":
                 self.last_loop_at = now
                 self.loop_result = int(safe_fields.get("result") or 0)
-            if event == "qbt_guard_decision" or event == "qbt_guard_loop":
-                previous_event = dict(self.last_event or {})
-                next_event = {
-                    "event": event,
-                    "source": source,
-                    "timestamp": format_utc(now),
-                    **safe_fields,
-                }
+                self.last_event = next_event
+            if event in self.decision_events:
+                previous_event = dict(self.last_decision_event or {})
                 if (
                     event == "qbt_guard_decision"
                     and source == "summary"
-                    and previous_event.get("event") == "qbt_guard_decision"
+                    and previous_event.get("event") in self.decision_events
                     and previous_event.get("action") == action
                 ):
                     for key in (
@@ -425,16 +429,17 @@ class QueueStatusStore:
                     ):
                         if key not in next_event and key in previous_event:
                             next_event[key] = previous_event[key]
+                self.last_decision_event = next_event
                 self.last_event = next_event
-                if event == "qbt_guard_decision":
-                    self.last_decision_at = now
-                    self.status_update_counts[(action, source)] += 1
+                self.last_decision_at = now
+                self.status_update_counts[(action, source)] += 1
 
     def snapshot(self):
         with self.lock:
             return {
                 "started_at": format_utc(self.started_at),
                 "last_event": dict(self.last_event or {}),
+                "last_decision_event": dict(self.last_decision_event or {}),
                 "last_decision_at": format_utc(self.last_decision_at) if self.last_decision_at else "",
                 "last_loop_at": format_utc(self.last_loop_at) if self.last_loop_at else "",
                 "loop_result": self.loop_result,
@@ -446,7 +451,7 @@ class QueueStatusStore:
 
     def prometheus_metrics(self):
         snapshot = self.snapshot()
-        last_event = snapshot.get("last_event") or {}
+        last_event = snapshot.get("last_decision_event") or snapshot.get("last_event") or {}
         lines = [
             "# HELP qbt_guard_status_up qBittorrent smart queues status endpoint health.",
             "# TYPE qbt_guard_status_up gauge",
@@ -3039,18 +3044,25 @@ def qbt_limit_decision_summary_key(action, pause_torrents, download_limit, uploa
     context = decision_context or {}
     rpi_cooling_state = context.get("rpi_cooling") or {}
     rpi_action = rpi_cooling_qbt_action(rpi_cooling_state)
-    if not rpi_action:
-        return None
-    candidate = rpi_cooling_state.get("candidate") or {}
-    active = rpi_cooling_state.get("active") or {}
-    node_name = candidate.get("node") or active.get("node") or ""
-    phase = active.get("phase") or rpi_cooling_state.get("action") or ""
+    if rpi_action:
+        candidate = rpi_cooling_state.get("candidate") or {}
+        active = rpi_cooling_state.get("active") or {}
+        node_name = candidate.get("node") or active.get("node") or ""
+        phase = active.get("phase") or rpi_cooling_state.get("action") or ""
+        return (
+            "rpi_cooling_qbt_limits",
+            action,
+            rpi_action,
+            phase,
+            node_name,
+            bool(pause_torrents),
+            int_or_none(download_limit),
+            int_or_none(upload_limit),
+        )
     return (
-        "rpi_cooling_qbt_limits",
+        "qbt_limits",
         action,
-        rpi_action,
-        phase,
-        node_name,
+        str(context.get("limit_reason") or context.get("reason") or ""),
         bool(pause_torrents),
         int_or_none(download_limit),
         int_or_none(upload_limit),
@@ -3110,14 +3122,50 @@ def thermal_qbt_limit_message(pause_torrents, download_limit, upload_limit, deci
     return message, fields
 
 
+def idle_qbt_limit_message(action, pause_torrents, download_limit, upload_limit, decision_context, reason):
+    fields = rpi_cooling_decision_fields(decision_context)
+    if fields:
+        node = fields.get("thermal_node", "unknown-node")
+        sensor = fields.get("thermal_sensor", "temperature")
+        try:
+            temperature = f"{float(fields['temperature_celsius']):.1f}C"
+        except (KeyError, TypeError, ValueError):
+            temperature = "unknown"
+        try:
+            threshold = f"{float(fields['threshold_celsius']):.1f}C"
+        except (KeyError, TypeError, ValueError):
+            threshold = "configured threshold"
+        if pause_torrents:
+            return (
+                f"Thermal pause already idle for {node}; "
+                f"{sensor} {temperature} >= {threshold}",
+                fields,
+            )
+        return (
+            f"Thermal throttle skipped because qBittorrent is idle for {node}; "
+            f"{sensor} {temperature} >= {threshold}",
+            fields,
+        )
+
+    if pause_torrents:
+        return f"No active qBittorrent downloads to pause; {reason}", {}
+    return (
+        f"No active qBittorrent downloads to throttle to "
+        f"{human_rate(download_limit)} down and {human_rate(upload_limit)} up; {reason}"
+    ), {}
+
+
 def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_limit, decision_context=None):
     action = "pause_all" if pause_torrents else "throttle"
+    context = dict(decision_context or {})
+    summary_context = dict(context)
+    summary_context["limit_reason"] = reason
     summary_key = qbt_limit_decision_summary_key(
         action,
         pause_torrents,
         download_limit,
         upload_limit,
-        decision_context,
+        summary_context,
     )
     for client in clients:
         try:
@@ -3130,20 +3178,45 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
             )
             active_summary = {"active": True, "active_count": None, "total_count": None}
         if not active_summary["active"]:
-            log_debug(
-                "Skipped qBittorrent thermal limit update because no active downloads are running",
+            emit_decision_log(
+                "qbt_guard_stop",
+                **decision_base_context(context, client),
+                action=action,
+                reason=reason,
+                effective_cap={
+                    "download_limit_bytes_per_sec": download_limit,
+                    "upload_limit_bytes_per_sec": upload_limit,
+                },
+                active_download_count=active_summary["active_count"],
+                torrent_count=active_summary["total_count"],
+                skipped_no_active_downloads=True,
+            )
+            message, idle_fields = idle_qbt_limit_message(
+                action,
+                pause_torrents,
+                download_limit,
+                upload_limit,
+                context,
+                reason,
+            )
+            log_decision_info(
+                action,
+                message,
+                summary_key=summary_key,
+                text_omit_fields={"action", "reason", *idle_fields.keys()},
+                reason=reason,
                 qbt_url=getattr(client, "base_url", ""),
                 active_download_count=active_summary["active_count"],
                 torrent_count=active_summary["total_count"],
-                action=action,
-                reason=reason,
+                skipped_no_active_downloads=True,
+                **idle_fields,
             )
             continue
         client.set_download_limit(download_limit)
         client.set_upload_limit(upload_limit)
         emit_decision_log(
             "qbt_guard_stop",
-            **decision_base_context(decision_context, client),
+            **decision_base_context(context, client),
             action=action,
             reason=reason,
             effective_cap={
@@ -3157,7 +3230,7 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
                 True,
                 download_limit,
                 upload_limit,
-                decision_context,
+                context,
                 reason,
             )
             log_decision_info(
@@ -3173,7 +3246,7 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
                 False,
                 download_limit,
                 upload_limit,
-                decision_context,
+                context,
                 reason,
             )
             log_decision_info(

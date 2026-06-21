@@ -225,6 +225,45 @@ class LoggingTests(unittest.TestCase):
         self.assertNotIn("reason=", line)
         self.assertNotIn("action=throttle", line)
 
+    def test_guard_limit_decision_is_logged_when_qbittorrent_is_idle(self):
+        stdout = io.StringIO()
+        client = mock.Mock()
+        client.base_url = "http://qbittorrent.example"
+        client.torrents_info.return_value = [
+            {
+                "hash": "abc",
+                "name": "stopped torrent",
+                "state": "stoppedDL",
+                "progress": 0.0,
+                "amount_left": 100,
+            }
+        ]
+        env = {"QBT_LOG_FORMAT": "json"}
+
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            self.guard.apply_qbt_limits(
+                [client],
+                "daily UDM quota guardrail reached",
+                True,
+                1,
+                1,
+                {"budget": {"daily_remaining_bytes": 0}},
+            )
+
+        client.set_download_limit.assert_not_called()
+        client.set_upload_limit.assert_not_called()
+        client.stop_all.assert_not_called()
+
+        record = json.loads(stdout.getvalue())
+        self.assertEqual("INFO", record["level"])
+        self.assertEqual("qbt_guard_decision", record["event"])
+        self.assertEqual("pause_all", record["action"])
+        self.assertEqual("daily UDM quota guardrail reached", record["reason"])
+        self.assertTrue(record["skipped_no_active_downloads"])
+        self.assertEqual(0, record["active_download_count"])
+        self.assertEqual(1, record["torrent_count"])
+        self.assertIn("No active qBittorrent downloads to pause", record["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

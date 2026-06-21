@@ -216,6 +216,54 @@ class StatusEndpointTests(unittest.TestCase):
         self.assertIn('qbt_guard_candidate_count{type="available"} 4.0', metrics)
         self.assertIn('qbt_guard_rejected_count{reason="cooldown"} 2.0', metrics)
 
+    def test_loop_sleep_does_not_hide_last_guard_stop_decision_metrics(self):
+        self.guard.QUEUE_STATUS.record(
+            "qbt_guard_stop",
+            source="structured",
+            action="pause_all",
+            reason="daily UDM quota guardrail reached",
+            budget={
+                "monthly_usage_bytes": 1781085064844,
+                "monthly_guardrail_bytes": 2500000000000,
+                "monthly_remaining_bytes": 718914935156,
+                "daily_cap_bytes": 83333333333,
+                "daily_usage_bytes": 85751606654,
+                "daily_remaining_bytes": 0,
+            },
+            effective_cap={
+                "download_limit_bytes_per_sec": 1,
+                "upload_limit_bytes_per_sec": 1,
+            },
+            active_download_count=0,
+            torrent_count=422,
+            skipped_no_active_downloads=True,
+        )
+        self.guard.QUEUE_STATUS.record(
+            "qbt_guard_decision",
+            source="summary",
+            action="pause_all",
+            message="No active qBittorrent downloads to pause; daily UDM quota guardrail reached",
+            reason="daily UDM quota guardrail reached",
+        )
+        self.guard.QUEUE_STATUS.record(
+            "qbt_guard_loop",
+            source="structured",
+            action="sleep",
+            result=0,
+            elapsed_seconds=1.0,
+            sleep_seconds=29.0,
+        )
+
+        snapshot = self.guard.QUEUE_STATUS.snapshot()
+        self.assertEqual("sleep", snapshot["last_event"]["action"])
+        self.assertEqual("pause_all", snapshot["last_decision_event"]["action"])
+
+        metrics = self.guard.QUEUE_STATUS.prometheus_metrics()
+        self.assertIn('qbt_guard_last_decision_info{action="pause_all"', metrics)
+        self.assertNotIn('qbt_guard_last_decision_info{action="sleep"', metrics)
+        self.assertIn('qbt_guard_budget_bytes{type="daily_remaining"} 0.0', metrics)
+        self.assertIn('qbt_guard_effective_cap_bytes_per_sec{type="download"} 1.0', metrics)
+
 
 if __name__ == "__main__":
     unittest.main()
