@@ -4,10 +4,11 @@ from datetime import datetime, timezone
 
 
 class FakeHealthStore:
-    def __init__(self, samples=0, entries=None, stale_age_seconds=0):
+    def __init__(self, samples=0, entries=None, stale_age_seconds=0, lease_reason=""):
         self.samples = samples
         self.entries = entries or {}
         self.stale_age_seconds = stale_age_seconds
+        self.lease_reason = lease_reason
 
     def storage_recovery_no_progress_samples(self, torrent):
         return self.samples
@@ -17,6 +18,9 @@ class FakeHealthStore:
 
     def entry(self, item_hash):
         return self.entries.get(item_hash)
+
+    def active_selection_lease_reason(self, torrent, now):
+        return self.lease_reason
 
 
 class TorrentLifecycleTests(unittest.TestCase):
@@ -71,6 +75,27 @@ class TorrentLifecycleTests(unittest.TestCase):
             FakeHealthStore(samples=2),
             self.now,
             required_park_samples=2,
+        )
+
+        self.assertEqual(self.guard.TORRENT_LIFECYCLE_PARKED_LISTENER, lifecycle.state)
+        self.assertTrue(lifecycle.listener_slot)
+
+    def test_no_progress_parking_takes_precedence_over_selection_lease(self):
+        lifecycle = self.guard.torrent_lifecycle(
+            self.torrent(state="downloading", dlspeed=0),
+            FakeHealthStore(samples=2, lease_reason="selection lease active and peers are currently connected"),
+            self.now,
+            required_park_samples=2,
+        )
+
+        self.assertEqual(self.guard.TORRENT_LIFECYCLE_PARKED_LISTENER, lifecycle.state)
+        self.assertTrue(lifecycle.listener_slot)
+
+    def test_stalled_torrent_parks_even_with_selection_lease(self):
+        lifecycle = self.guard.torrent_lifecycle(
+            self.torrent(state="stalledDL", dlspeed=0),
+            FakeHealthStore(lease_reason="selection lease active and peers are currently connected"),
+            self.now,
         )
 
         self.assertEqual(self.guard.TORRENT_LIFECYCLE_PARKED_LISTENER, lifecycle.state)

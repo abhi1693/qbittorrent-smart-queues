@@ -5716,13 +5716,6 @@ def parked_listener_reason(
 ):
     if not is_running_torrent(torrent) or is_productive_download(torrent, min_rate_bytes):
         return ""
-    if (
-        health_store
-        and now is not None
-        and hasattr(health_store, "active_selection_lease_reason")
-        and health_store.active_selection_lease_reason(torrent, now)
-    ):
-        return ""
     classification = torrent_progress_classification(None, torrent, 1)
     if is_stalled_torrent(torrent):
         return classification.reason if classification.park_as_listener else ""
@@ -5732,6 +5725,13 @@ def parked_listener_reason(
         >= max(1, int(required_no_progress_samples))
     ):
         return classification.reason if classification.park_as_listener else ""
+    if (
+        health_store
+        and now is not None
+        and hasattr(health_store, "active_selection_lease_reason")
+        and health_store.active_selection_lease_reason(torrent, now)
+    ):
+        return ""
     return ""
 
 
@@ -7660,6 +7660,7 @@ class SmartQueuePolicyEngine:
         storage_recovery_deferred_count = 0
         normal_parked_stalled_torrents = []
         normal_parked_stalled_hashes = set()
+        normal_deferred_parked_stalled_hashes = set()
         normal_parked_stalled_deferred_count = 0
 
         if observation.storage_constrained_mode:
@@ -7752,6 +7753,7 @@ class SmartQueuePolicyEngine:
                         and len(normal_parked_stalled_torrents) >= self.max_parked_stalled_downloads
                     ):
                         normal_parked_stalled_deferred_count += 1
+                        normal_deferred_parked_stalled_hashes.add(item_hash)
                         continue
                     progress_classification = torrent_progress_classification(
                         None,
@@ -7776,6 +7778,7 @@ class SmartQueuePolicyEngine:
             selection_candidates = [
                 torrent for torrent in base_selection_candidates
                 if torrent_hash(torrent) not in normal_parked_stalled_hashes
+                and torrent_hash(torrent) not in normal_deferred_parked_stalled_hashes
             ]
 
         if not observation.storage_constrained_mode and watch_priority_candidates:

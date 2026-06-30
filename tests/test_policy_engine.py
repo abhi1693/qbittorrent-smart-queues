@@ -5,9 +5,10 @@ from unittest import mock
 
 
 class FakeHealthStore:
-    def __init__(self, scores=None, cooldown_hashes=None):
+    def __init__(self, scores=None, cooldown_hashes=None, no_progress_hashes=None):
         self.scores = scores or {}
         self.cooldown_hashes = set(cooldown_hashes or [])
+        self.no_progress_hashes = set(no_progress_hashes or [])
         self.observed_torrents = []
         self.progress_classifications = []
 
@@ -36,7 +37,7 @@ class FakeHealthStore:
         }
 
     def storage_recovery_no_progress_samples(self, torrent):
-        return 0
+        return 2 if torrent.get("hash") in self.no_progress_hashes else 0
 
     def record_progress_classification(self, torrent, now, classification):
         self.progress_classifications.append((torrent, now, classification))
@@ -183,6 +184,30 @@ class PolicyEngineTests(unittest.TestCase):
         self.assertEqual(1, filters.cooldown_count)
         self.assertEqual(1, classification.rejected_counts["cooldown"])
         self.assertEqual(1, classification.rejected_counts["cooldown_no_progress"])
+
+    def test_over_cap_parked_listeners_are_not_selected_as_workers(self):
+        parked = self.torrent("parked", state="stalledDL")
+        deferred = self.torrent("deferred", state="stalledDL")
+        ready = self.torrent("ready")
+        health_store = FakeHealthStore(no_progress_hashes={"parked", "deferred"})
+        engine = self.engine([parked, deferred, ready], health_store=health_store)
+        engine.max_parked_stalled_downloads = 1
+
+        observation = engine.observe()
+        classification = engine.classify(observation)
+        filters = engine.filter(observation, classification)
+        scoring = engine.score(observation, classification, filters)
+
+        parked_hashes = [
+            torrent["hash"] for torrent in scoring.normal_parked_stalled_torrents
+        ]
+        self.assertEqual(1, len(parked_hashes))
+        self.assertIn(parked_hashes[0], {"parked", "deferred"})
+        self.assertEqual(1, scoring.normal_parked_stalled_deferred_count)
+        self.assertEqual(["ready"], [
+            torrent["hash"] for torrent in scoring.selection_candidates
+        ])
+        self.assertEqual(1, classification.rejected_counts["deferred_parked_stalled"])
 
     def test_storage_pressure_sorts_fitting_candidates_by_storage_score(self):
         class StorageGuard:
