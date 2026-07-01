@@ -3,11 +3,13 @@ name: Container
 
 on:
   push:
-    branches:
-      - master
     tags:
       - "v*"
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver image version without a leading v
+        required: true
 
 permissions:
   contents: read
@@ -22,19 +24,17 @@ jobs:
     uses: abhi1693/actions/.github/workflows/docker-build-push.yml@master
     with:
       runs-on: ubuntu-24.04-arm
-      image: ghcr.io/${{ github.repository }}
+      image: ghcr.io/abhi1693/qbittorrent-smart-queues
       context: .
       file: Dockerfile
       platforms: linux/arm64
       cache-scope: qbittorrent-smart-queues
       push: ${{ github.event_name != 'pull_request' }}
       tags: |
-        type=ref,event=branch
-        type=ref,event=tag
         type=semver,pattern={{version}}
-        type=sha,prefix=sha-
+        type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
       labels: |
-        org.opencontainers.image.source=https://github.com/${{ github.repository }}
+        org.opencontainers.image.source=https://github.com/abhi1693/qbittorrent-smart-queues
         org.opencontainers.image.title=qbittorrent-smart-queues
     secrets:
       github-token: ${{ secrets.GITHUB_TOKEN }}
