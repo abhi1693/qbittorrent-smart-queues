@@ -153,6 +153,12 @@ Optional single-download selection tuning:
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES` | storage recovery stall samples | No-progress samples required before a non-productive running torrent is parked. qBittorrent `stalledDL`/`metaDL` torrents park immediately. |
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
+| `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_ENABLED` | `true` | When storage-fit checks are enabled, briefly start one stopped magnet whose size is unknown so qBittorrent can fetch its metadata before the controller evaluates storage headroom. Productive downloads retain priority. |
+| `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_TIMEOUT_SECONDS` | `60` | Maximum time to wait for one magnet's metadata before stopping it and applying metadata cooldown. |
+| `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_POLL_SECONDS` | `2` | Poll interval while waiting for qBittorrent to report metadata. |
+| `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_MAX_ATTEMPTS_PER_RUN` | `1` | Maximum unknown-metadata magnets attempted during one controller run. |
+| `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `65536` | Temporary per-torrent download cap during metadata discovery. Set to `0` to leave the torrent's existing limit unchanged. |
+| `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_UPLOAD_LIMIT_BYTES_PER_SEC` | `16384` | Temporary per-torrent upload cap during metadata discovery. Set to `0` to leave the torrent's existing limit unchanged. |
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS` | `3600` | Base cooldown for torrents that fail a single-download attempt. |
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_NO_PROGRESS_SECONDS` | base cooldown | Cooldown for torrents that run but do not move enough bytes during the sample. |
 | `QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_METADATA_SECONDS` | min(base, 1800) | Reason-specific cooldown window for future metadata-wait health-state entries. |
@@ -173,6 +179,27 @@ and next retry time. qBittorrent tags remain visibility output only, using
 `<prefix>-<reason>-<timestamp>` names such as
 `quota-stalled-tracker-dead-20260601T123456Z`; tag-only cooldowns are cleaned up
 but do not block selection.
+
+Storage-fit checks need the torrent's selected file sizes, which qBittorrent
+does not know for a newly added magnet until its metadata arrives. Without a
+metadata bootstrap, an "add stopped" workflow can deadlock: the controller
+cannot prove the torrent fits, so it never starts the torrent that must run to
+learn its size. The bootstrap path breaks that cycle without bypassing the
+storage reserve. It temporarily opens one queue slot, applies the per-torrent
+traffic caps above, starts the stopped magnet, polls `has_metadata`, and always
+attempts to stop it before restoring its previous limits. If both targeted and
+global stop calls fail, the low traffic caps remain in place. A timeout enters
+the existing metadata cooldown so unreachable magnets do not monopolize every
+pass. The path is disabled automatically when torrent-fit enforcement is not
+active, when storage is already at/below reserve, or when qBittorrent file
+preallocation is enabled. Disabling bootstrap with preallocation avoids
+allocating an unknown-size payload before its storage fit can be verified.
+
+For new magnets, configure qBittorrent to add torrents in the started state with
+the stop condition set to `MetadataReceived`. qBittorrent then performs this
+metadata-only transition immediately after add and leaves the torrent stopped
+for Smart Queues. The controller bootstrap remains necessary for older magnets
+that were added stopped before that setting was enabled.
 
 Optional storage and thermal guards:
 

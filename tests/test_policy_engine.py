@@ -86,6 +86,8 @@ class PolicyEngineTests(unittest.TestCase):
         client=None,
         storage_guard=None,
         storage_state=None,
+        storage_constrained_mode=False,
+        metadata_bootstrap_enabled=True,
     ):
         return self.guard.SmartQueuePolicyEngine(
             client=client or FakeClient(),
@@ -94,7 +96,7 @@ class PolicyEngineTests(unittest.TestCase):
             now=self.now,
             storage_guard=storage_guard,
             storage_state=storage_state,
-            storage_constrained_mode=False,
+            storage_constrained_mode=storage_constrained_mode,
             min_progress=0.0,
             max_remaining_bytes=0,
             categories=set(),
@@ -123,6 +125,7 @@ class PolicyEngineTests(unittest.TestCase):
             normal_worker_limit=1,
             productive_rate_floor_bytes=65_536,
             normal_progress_min_bytes=lambda torrent: 1,
+            metadata_bootstrap_enabled=metadata_bootstrap_enabled,
         )
 
     def test_policy_stages_are_independently_testable(self):
@@ -272,6 +275,219 @@ class PolicyEngineTests(unittest.TestCase):
         ])
         self.assertEqual(1, filters.storage_blocked_count)
         self.assertEqual(1, classification.rejected_counts["storage_headroom"])
+
+    def test_unknown_metadata_is_bootstrapped_before_storage_fit(self):
+        class StorageGuard:
+            require_torrent_fit = True
+
+        unknown = self.torrent(
+            "unknown",
+            progress=0.0,
+            amount_left=0,
+            size=-1,
+            total_size=-1,
+            has_metadata=False,
+            added_on=1_700_000_000,
+        )
+        engine = self.engine(
+            [unknown],
+            storage_guard=StorageGuard(),
+            storage_state={
+                "enabled": True,
+                "stop": False,
+                "free_bytes": 20_000,
+                "reserve_bytes": 1_000,
+                "headroom_bytes": 10_000,
+            },
+        )
+
+        result = engine.run()
+
+        self.assertEqual([], result.classification.eligible_torrents)
+        self.assertEqual(["unknown"], [
+            torrent["hash"]
+            for torrent in result.classification.metadata_bootstrap_torrents
+        ])
+        self.assertEqual(0, result.classification.tracker_health_observed)
+        self.assertEqual(["unknown"], [
+            torrent["hash"]
+            for torrent in result.filters.metadata_bootstrap_candidates
+        ])
+        self.assertEqual("bootstrap_metadata", result.action_plan.action)
+        self.assertEqual(1, result.candidate_counts["metadata_unknown"])
+        self.assertEqual(1, result.candidate_counts["metadata_bootstrap_available"])
+        self.assertEqual(0, result.rejected_counts["storage_headroom"])
+
+    def test_metadata_bootstrap_precedes_nonproductive_known_candidate(self):
+        class StorageGuard:
+            require_torrent_fit = True
+
+        known = self.torrent("known", amount_left=1_000, has_metadata=True)
+        unknown = self.torrent(
+            "unknown",
+            progress=0.0,
+            amount_left=0,
+            size=-1,
+            total_size=-1,
+            has_metadata=False,
+        )
+        client = FakeClient(
+            files={
+                "known": [
+                    {"name": "known.mkv", "size": 1_000, "progress": 0.0, "priority": 1},
+                ],
+            }
+        )
+        engine = self.engine(
+            [unknown, known],
+            client=client,
+            storage_guard=StorageGuard(),
+            storage_state={
+                "enabled": True,
+                "stop": False,
+                "free_bytes": 20_000,
+                "reserve_bytes": 1_000,
+                "headroom_bytes": 10_000,
+            },
+        )
+
+        result = engine.run()
+
+        self.assertEqual("bootstrap_metadata", result.action_plan.action)
+        self.assertEqual(["known"], [
+            torrent["hash"] for torrent in result.scoring.selection_candidates
+        ])
+        self.assertEqual(["unknown"], [
+            torrent["hash"] for torrent in result.filters.metadata_bootstrap_candidates
+        ])
+
+    def test_productive_candidate_precedes_metadata_bootstrap(self):
+        class StorageGuard:
+            require_torrent_fit = True
+
+        productive = self.torrent(
+            "productive",
+            state="downloading",
+            dlspeed=65_536,
+            amount_left=1_000,
+            has_metadata=True,
+        )
+        unknown = self.torrent(
+            "unknown",
+            progress=0.0,
+            amount_left=0,
+            size=-1,
+            total_size=-1,
+            has_metadata=False,
+        )
+        client = FakeClient(
+            files={
+                "productive": [
+                    {
+                        "name": "productive.mkv",
+                        "size": 2_000,
+                        "progress": 0.5,
+                        "priority": 1,
+                    },
+                ],
+            }
+        )
+        result = self.engine(
+            [unknown, productive],
+            client=client,
+            storage_guard=StorageGuard(),
+            storage_state={
+                "enabled": True,
+                "stop": False,
+                "free_bytes": 20_000,
+                "reserve_bytes": 1_000,
+                "headroom_bytes": 10_000,
+            },
+        ).run()
+
+        self.assertEqual("keep_productive", result.action_plan.action)
+        self.assertEqual(["productive"], [
+            torrent["hash"] for torrent in result.scoring.productive_candidates
+        ])
+        self.assertEqual(["unknown"], [
+            torrent["hash"] for torrent in result.filters.metadata_bootstrap_candidates
+        ])
+
+    def test_metadata_bootstrap_respects_cooldown_and_constrained_storage(self):
+        class StorageGuard:
+            require_torrent_fit = True
+
+        unknown = self.torrent(
+            "unknown",
+            progress=0.0,
+            amount_left=0,
+            size=-1,
+            total_size=-1,
+            has_metadata=False,
+        )
+        storage_state = {
+            "enabled": True,
+            "stop": False,
+            "free_bytes": 20_000,
+            "reserve_bytes": 1_000,
+            "headroom_bytes": 10_000,
+        }
+        cooling_result = self.engine(
+            [unknown],
+            health_store=FakeHealthStore(cooldown_hashes={"unknown"}),
+            storage_guard=StorageGuard(),
+            storage_state=storage_state,
+        ).run()
+        constrained_result = self.engine(
+            [unknown],
+            storage_guard=StorageGuard(),
+            storage_state=storage_state,
+            storage_constrained_mode=True,
+        ).run()
+
+        self.assertEqual([], cooling_result.filters.metadata_bootstrap_candidates)
+        self.assertEqual(1, cooling_result.filters.metadata_bootstrap_cooldown_count)
+        self.assertEqual(
+            1,
+            cooling_result.rejected_counts["metadata_bootstrap_cooldown_no_progress"],
+        )
+        self.assertEqual([], constrained_result.filters.metadata_bootstrap_candidates)
+        self.assertEqual(
+            1,
+            constrained_result.rejected_counts["metadata_bootstrap_storage_constrained"],
+        )
+
+    def test_disabled_metadata_bootstrap_preserves_storage_fit_filter(self):
+        class StorageGuard:
+            require_torrent_fit = True
+
+        unknown = self.torrent(
+            "unknown",
+            progress=0.0,
+            amount_left=0,
+            size=-1,
+            total_size=-1,
+            has_metadata=False,
+        )
+        result = self.engine(
+            [unknown],
+            storage_guard=StorageGuard(),
+            storage_state={
+                "enabled": True,
+                "stop": False,
+                "free_bytes": 20_000,
+                "reserve_bytes": 1_000,
+                "headroom_bytes": 10_000,
+            },
+            metadata_bootstrap_enabled=False,
+        ).run()
+
+        self.assertEqual(["unknown"], [
+            torrent["hash"] for torrent in result.classification.eligible_torrents
+        ])
+        self.assertEqual([], result.classification.metadata_bootstrap_torrents)
+        self.assertEqual(1, result.rejected_counts["storage_headroom"])
+        self.assertEqual("stop_no_available_candidates", result.action_plan.action)
 
 
 if __name__ == "__main__":

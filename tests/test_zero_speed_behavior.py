@@ -33,6 +33,9 @@ class FakeQbtClient:
     def set_active_queue_limits(self, max_active_downloads, max_active_torrents=None):
         self.queue_limits.append((max_active_downloads, max_active_torrents))
 
+    def app_preferences(self):
+        return {"preallocate_all": False}
+
     def stop_all(self):
         self.stop_all_calls += 1
 
@@ -340,6 +343,153 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 now=now,
             ),
         )
+
+    def test_apply_single_download_bootstraps_metadata_then_selects_torrent(self):
+        class FitStorageGuard(FakeStorageGuard):
+            require_torrent_fit = True
+
+        class MetadataQbtClient(FakeQbtClient):
+            def __init__(self, torrents, files=None):
+                super().__init__(torrents, files=files)
+                self.torrent_download_limits = []
+                self.torrent_upload_limits = []
+
+            def set_torrent_download_limit(self, hashes, limit):
+                self.torrent_download_limits.append((list(hashes), limit))
+
+            def set_torrent_upload_limit(self, hashes, limit):
+                self.torrent_upload_limits.append((list(hashes), limit))
+
+            def torrent_info(self, item_hash):
+                for torrent in self.torrents:
+                    if torrent["hash"] == item_hash:
+                        return dict(torrent)
+                return None
+
+            def start_hashes(self, hashes):
+                super().start_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] not in hashes:
+                        continue
+                    if not torrent.get("has_metadata"):
+                        torrent.update({
+                            "has_metadata": True,
+                            "state": "metaDL",
+                            "amount_left": 1_000,
+                            "size": 2_000,
+                            "total_size": 2_000,
+                        })
+                    else:
+                        torrent["state"] = "downloading"
+                        torrent["dlspeed"] = 65_536
+
+            def stop_hashes(self, hashes):
+                super().stop_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] in hashes:
+                        torrent["state"] = "stoppedDL"
+                        torrent["dlspeed"] = 0
+
+        client = MetadataQbtClient(
+            [
+                {
+                    "hash": "magnet",
+                    "name": "Metadata.First.Movie.1080p",
+                    "category": "movies",
+                    "state": "stoppedDL",
+                    "dlspeed": 0,
+                    "amount_left": 0,
+                    "downloaded": 0,
+                    "size": -1,
+                    "total_size": -1,
+                    "progress": 0.0,
+                    "has_metadata": False,
+                    "dl_limit": -1,
+                    "up_limit": -1,
+                    "tags": "priority",
+                },
+                {
+                    "hash": "known",
+                    "name": "Known.But.Not.Productive.Movie.1080p",
+                    "category": "movies",
+                    "state": "stoppedDL",
+                    "dlspeed": 0,
+                    "amount_left": 1_000,
+                    "downloaded": 0,
+                    "size": 2_000,
+                    "total_size": 2_000,
+                    "progress": 0.5,
+                    "has_metadata": True,
+                    "dl_limit": -1,
+                    "up_limit": -1,
+                    "tags": "",
+                },
+            ],
+            files={
+                "magnet": [
+                    {"name": "movie.mkv", "size": 2_000, "progress": 0.5, "priority": 1},
+                ],
+                "known": [
+                    {"name": "known.mkv", "size": 2_000, "progress": 0.5, "priority": 1},
+                ],
+            },
+        )
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "60",
+            "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_ENABLED": "true",
+            "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_TIMEOUT_SECONDS": "2",
+            "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_POLL_SECONDS": "0.1",
+            "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env["QBT_TORRENT_HEALTH_STATE_PATH"] = f"{tmpdir}/torrent-health.json"
+            with mock.patch.dict("os.environ", env, clear=False):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.guard.apply_single_download(
+                        [client],
+                        usage_bytes=0,
+                        monthly_limit_bytes=1_000,
+                        download_limit=1_024,
+                        limit_reason="unit test",
+                        storage_guard=FitStorageGuard(),
+                    )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        actions = [event.get("action") for event in decision_events]
+
+        self.assertIn("bootstrap_metadata_ready", actions)
+        self.assertIn("try_candidate", actions)
+        self.assertLess(
+            actions.index("bootstrap_metadata_ready"),
+            actions.index("try_candidate"),
+        )
+        self.assertEqual([["magnet"], ["magnet"]], client.started)
+        self.assertIn(["magnet"], client.stopped)
+        self.assertEqual(
+            [(["magnet"], 65_536), (["magnet"], 0)],
+            client.torrent_download_limits,
+        )
+        self.assertEqual(
+            [(["magnet"], 16_384), (["magnet"], 0)],
+            client.torrent_upload_limits,
+        )
+        self.assertEqual("downloading", client.torrents[0]["state"])
+        self.assertTrue(client.queue_limits)
+        self.assertTrue(all(limit == 1 for limit, _ in client.queue_limits))
 
     def test_apply_single_download_parks_zero_speed_torrent_after_wait_without_bytes(self):
         client = FakeQbtClient([

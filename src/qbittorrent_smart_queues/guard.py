@@ -151,6 +151,14 @@ class TorrentProgressClassification:
 
 
 @dataclass(frozen=True)
+class TorrentMetadataBootstrapResult:
+    status: str
+    torrent: dict | None = None
+    reason: str = ""
+    elapsed_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
 class SmartQueueSlotPlan:
     worker_slots: int
     parked_listener_slots: int = 0
@@ -517,7 +525,11 @@ class QueueStatusStore:
             ])
 
         action_class = "other"
-        if action.startswith("try_") or action in {"storage_recovery_batch", "preempt_productive"}:
+        if (
+            action.startswith("try_")
+            or action.startswith("bootstrap_")
+            or action in {"storage_recovery_batch", "preempt_productive"}
+        ):
             action_class = "selecting"
         elif action.startswith("keep_") or action.startswith("confirm_"):
             action_class = "keeping"
@@ -2834,6 +2846,16 @@ class QbtClient:
             {"json": json.dumps(preferences)},
         )
 
+    def app_preferences(self):
+        payload = self.request("GET", "/api/v2/app/preferences")
+        preferences = json.loads(payload.decode("utf-8"))
+        if not isinstance(preferences, dict):
+            raise ApiError(
+                "qBittorrent preferences response has unexpected shape: "
+                f"{type(preferences).__name__}"
+            )
+        return preferences
+
     def set_active_queue_limits(self, max_active_downloads, max_active_torrents=None):
         max_active_downloads = max(1, int(max_active_downloads))
         if max_active_torrents is None:
@@ -2858,6 +2880,22 @@ class QbtClient:
             path += "?" + urllib.parse.urlencode({"filter": filter_name})
         payload = self.request("GET", path)
         return json.loads(payload.decode("utf-8"))
+
+    def torrent_info(self, item_hash):
+        if not item_hash:
+            return None
+        path = "/api/v2/torrents/info?" + urllib.parse.urlencode({"hashes": item_hash})
+        payload = self.request("GET", path)
+        torrents = json.loads(payload.decode("utf-8"))
+        if not isinstance(torrents, list):
+            raise ApiError(
+                "qBittorrent torrent info response has unexpected shape: "
+                f"{type(torrents).__name__}"
+            )
+        for torrent in torrents:
+            if torrent_hash(torrent) == item_hash:
+                return torrent
+        return None
 
     def transfer_info(self):
         payload = self.request("GET", "/api/v2/transfer/info")
@@ -2910,6 +2948,30 @@ class QbtClient:
             self.request("POST", "/api/v2/torrents/stop", form)
         except ApiError:
             self.request("POST", "/api/v2/torrents/pause", form)
+
+    def set_torrent_download_limit(self, hashes, limit_bytes_per_second):
+        if not hashes:
+            return
+        self.request(
+            "POST",
+            "/api/v2/torrents/setDownloadLimit",
+            {
+                "hashes": "|".join(hashes),
+                "limit": str(max(0, int(limit_bytes_per_second))),
+            },
+        )
+
+    def set_torrent_upload_limit(self, hashes, limit_bytes_per_second):
+        if not hashes:
+            return
+        self.request(
+            "POST",
+            "/api/v2/torrents/setUploadLimit",
+            {
+                "hashes": "|".join(hashes),
+                "limit": str(max(0, int(limit_bytes_per_second))),
+            },
+        )
 
     def top_priority(self, hashes):
         if not hashes:
@@ -3546,6 +3608,28 @@ def torrent_total_size(torrent):
     if 0 < progress < 1 and amount_left > 0:
         return max(amount_left, math.ceil(amount_left / (1.0 - progress)))
     return amount_left
+
+
+def torrent_has_metadata(torrent):
+    raw = torrent.get("has_metadata")
+    if isinstance(raw, bool):
+        return raw
+    if raw is not None:
+        normalized = str(raw).strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+
+    return (
+        torrent_progress(torrent) >= 1.0
+        or torrent_total_size(torrent) > 0
+        or torrent_amount_left(torrent) > 0
+    )
+
+
+def torrent_metadata_missing(torrent):
+    return torrent_progress(torrent) < 1.0 and not torrent_has_metadata(torrent)
 
 
 def torrent_age_seconds(torrent, now):
@@ -6648,11 +6732,12 @@ class TorrentHealthStore:
         entry["last_failure_at"] = format_utc(now)
         entry["last_failure_reason"] = str(reason or "not productive")
         entry["last_cooldown_reason"] = cooldown_reason
-        entry["last_progress_class"] = (
-            PROGRESS_CLASS_TRACKER_DEAD
-            if cooldown_reason == STALL_COOLDOWN_REASON_TRACKER_DEAD
-            else PROGRESS_CLASS_NO_CONNECTED_PEERS
-        )
+        if cooldown_reason == STALL_COOLDOWN_REASON_TRACKER_DEAD:
+            entry["last_progress_class"] = PROGRESS_CLASS_TRACKER_DEAD
+        elif cooldown_reason == STALL_COOLDOWN_REASON_METADATA:
+            entry["last_progress_class"] = PROGRESS_CLASS_METADATA_WAIT
+        else:
+            entry["last_progress_class"] = PROGRESS_CLASS_NO_CONNECTED_PEERS
         entry["last_progress_class_reason"] = str(reason or "not productive")
         entry["last_progress_class_at"] = format_utc(now)
         entry["failed_attempts"] = int(entry.get("failed_attempts") or 0) + 1
@@ -6696,6 +6781,28 @@ class TorrentHealthStore:
         entry["last_reported_seeds"] = torrent_reported_seeds(torrent)
         entry["last_availability"] = torrent_availability(torrent)
         entry["predicted_completion_seconds"] = self.predicted_completion_seconds(torrent, entry)
+        self.dirty = True
+        self.save()
+
+    def record_metadata_received(self, torrent, now):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return
+        entry["name"] = torrent_name(torrent)
+        entry["category"] = torrent_category(torrent)
+        entry["metadata_received_at"] = format_utc(now)
+        entry["metadata_bootstrap_successes"] = int(entry.get("metadata_bootstrap_successes") or 0) + 1
+        entry["last_progress_class"] = ""
+        entry["last_progress_class_reason"] = "torrent metadata received"
+        entry["last_progress_class_at"] = format_utc(now)
+        if entry.get("cooldown_reason") == STALL_COOLDOWN_REASON_METADATA:
+            entry["cooldown_reason"] = ""
+            entry["cooldown_scope"] = ""
+            entry["cooldown_next_retry_at"] = ""
+            entry["cooldown_seconds"] = 0
+            entry["cooldown_failure_count"] = 0
+            entry["cooldown_cleared_at"] = format_utc(now)
+            entry["last_failure_reason"] = ""
         self.dirty = True
         self.save()
 
@@ -7294,6 +7401,160 @@ def storage_torrent_block_reason(client, torrent, storage_guard, storage_state):
     )
 
 
+def metadata_bootstrap_safety_block_reason(client):
+    try:
+        preferences = client.app_preferences()
+    except (AttributeError, ApiError, json.JSONDecodeError) as exc:
+        return f"cannot verify qBittorrent preallocation setting: {exc}"
+    if "preallocate_all" not in preferences:
+        return "qBittorrent preferences do not report preallocate_all"
+    if preferences.get("preallocate_all") is True:
+        return (
+            "qBittorrent file preallocation is enabled; metadata bootstrap could "
+            "allocate an unknown-size torrent before storage fit is verified"
+        )
+    return ""
+
+
+def bootstrap_torrent_metadata(
+    client,
+    torrent,
+    timeout_seconds,
+    poll_seconds,
+    download_limit_bytes_per_second=65_536,
+    upload_limit_bytes_per_second=16_384,
+    sleep_fn=None,
+    monotonic_fn=None,
+):
+    sleep_fn = sleep_fn or time.sleep
+    monotonic_fn = monotonic_fn or time.monotonic
+    item_hash = torrent_hash(torrent)
+    if not item_hash:
+        return TorrentMetadataBootstrapResult(
+            status="error",
+            torrent=torrent,
+            reason="torrent hash is missing",
+        )
+    if torrent_has_metadata(torrent):
+        return TorrentMetadataBootstrapResult(
+            status="ready",
+            torrent=torrent,
+            reason="torrent metadata is already available",
+        )
+
+    timeout_seconds = max(0.0, float(timeout_seconds or 0.0))
+    poll_seconds = max(0.1, float(poll_seconds or 0.1))
+    started_at = monotonic_fn()
+    deadline = started_at + timeout_seconds
+    latest = torrent
+    status = "timeout"
+    reason = f"torrent metadata did not arrive within {human_duration(timeout_seconds)}"
+    cleanup_errors = []
+    original_download_limit = int_or_none(torrent.get("dl_limit"))
+    original_upload_limit = int_or_none(torrent.get("up_limit"))
+    download_limit_changed = False
+    upload_limit_changed = False
+    stopped_confirmed = False
+
+    try:
+        client.top_priority([item_hash])
+        if download_limit_bytes_per_second > 0:
+            temporary_download_limit = max(1, int(download_limit_bytes_per_second))
+            if original_download_limit is not None and original_download_limit > 0:
+                temporary_download_limit = min(
+                    temporary_download_limit,
+                    original_download_limit,
+                )
+            client.set_torrent_download_limit([item_hash], temporary_download_limit)
+            download_limit_changed = True
+        if upload_limit_bytes_per_second > 0:
+            temporary_upload_limit = max(1, int(upload_limit_bytes_per_second))
+            if original_upload_limit is not None and original_upload_limit > 0:
+                temporary_upload_limit = min(
+                    temporary_upload_limit,
+                    original_upload_limit,
+                )
+            client.set_torrent_upload_limit([item_hash], temporary_upload_limit)
+            upload_limit_changed = True
+        client.start_hashes([item_hash])
+        while True:
+            refreshed = client.torrent_info(item_hash)
+            if refreshed is None:
+                status = "error"
+                reason = "torrent disappeared while waiting for metadata"
+                break
+            latest = refreshed
+            if torrent_has_metadata(refreshed):
+                status = "ready"
+                reason = "torrent metadata received"
+                break
+
+            current = monotonic_fn()
+            if current >= deadline:
+                break
+            sleep_fn(min(poll_seconds, max(0.0, deadline - current)))
+    except (ApiError, json.JSONDecodeError) as exc:
+        status = "error"
+        reason = f"metadata bootstrap failed: {exc}"
+    finally:
+        try:
+            client.stop_hashes([item_hash])
+            stopped_confirmed = True
+        except ApiError as exc:
+            cleanup_errors.append(f"failed to stop metadata bootstrap torrent: {exc}")
+            try:
+                client.stop_all()
+                stopped_confirmed = True
+            except ApiError as stop_all_exc:
+                cleanup_errors.append(f"failed to stop all torrents: {stop_all_exc}")
+        if download_limit_changed and stopped_confirmed:
+            try:
+                client.set_torrent_download_limit(
+                    [item_hash],
+                    max(0, original_download_limit or 0),
+                )
+            except ApiError as exc:
+                cleanup_errors.append(f"failed to restore torrent download limit: {exc}")
+        if upload_limit_changed and stopped_confirmed:
+            try:
+                client.set_torrent_upload_limit(
+                    [item_hash],
+                    max(0, original_upload_limit or 0),
+                )
+            except ApiError as exc:
+                cleanup_errors.append(f"failed to restore torrent upload limit: {exc}")
+        if not stopped_confirmed and (download_limit_changed or upload_limit_changed):
+            cleanup_errors.append(
+                "retained metadata bootstrap traffic limits because stopping the torrent failed"
+            )
+
+    try:
+        final = client.torrent_info(item_hash)
+    except (ApiError, json.JSONDecodeError) as exc:
+        final = None
+        if status == "ready":
+            status = "error"
+            reason = f"failed to verify received metadata after stopping torrent: {exc}"
+    if final is not None:
+        latest = final
+        if torrent_has_metadata(final):
+            status = "ready"
+            reason = "torrent metadata received"
+
+    if cleanup_errors:
+        cleanup_error = "; ".join(cleanup_errors)
+        log_warning(cleanup_error, torrent=torrent_name(latest))
+        status = "error"
+        reason = f"{reason}; {cleanup_error}"
+
+    return TorrentMetadataBootstrapResult(
+        status=status,
+        torrent=latest,
+        reason=reason,
+        elapsed_seconds=max(0.0, monotonic_fn() - started_at),
+    )
+
+
 SMART_QUEUE_POLICY_STAGES = (
     "observe",
     "classify",
@@ -7317,6 +7578,7 @@ class SmartQueuePolicyObservation:
 @dataclass(frozen=True)
 class SmartQueuePolicyClassification:
     eligible_torrents: list
+    metadata_bootstrap_torrents: list
     rejected_counts: Counter
     tracker_health_observed: int
 
@@ -7326,7 +7588,9 @@ class SmartQueuePolicyFilterResult:
     all_candidates: list
     candidates: list
     available_candidates: list
+    metadata_bootstrap_candidates: list
     cooldown_count: int
+    metadata_bootstrap_cooldown_count: int
     storage_blocked_count: int
     storage_pressure_mode: bool
     storage_pressure_blocked_fraction: float
@@ -7417,6 +7681,7 @@ class SmartQueuePolicyEngine:
         normal_worker_limit,
         productive_rate_floor_bytes,
         normal_progress_min_bytes,
+        metadata_bootstrap_enabled=True,
     ):
         self.client = client
         self.torrents = list(torrents or [])
@@ -7453,6 +7718,7 @@ class SmartQueuePolicyEngine:
         self.normal_worker_limit = normal_worker_limit
         self.productive_rate_floor_bytes = max(1, int(productive_rate_floor_bytes or 1))
         self.normal_progress_min_bytes = normal_progress_min_bytes
+        self.metadata_bootstrap_enabled = bool(metadata_bootstrap_enabled)
 
     def observe(self):
         self.health_store.observe_torrents(self.torrents, self.now)
@@ -7490,6 +7756,7 @@ class SmartQueuePolicyEngine:
     def classify(self, observation):
         rejected_counts = Counter()
         eligible_torrents = []
+        metadata_bootstrap_torrents = []
         for torrent in observation.torrents:
             reject_reason = single_download_reject_reason(
                 torrent,
@@ -7499,6 +7766,9 @@ class SmartQueuePolicyEngine:
             )
             if reject_reason:
                 rejected_counts[reject_reason] += 1
+            elif self.metadata_bootstrap_enabled and torrent_metadata_missing(torrent):
+                rejected_counts["metadata_unknown"] += 1
+                metadata_bootstrap_torrents.append(torrent)
             else:
                 eligible_torrents.append(torrent)
 
@@ -7511,6 +7781,7 @@ class SmartQueuePolicyEngine:
         )
         return SmartQueuePolicyClassification(
             eligible_torrents=eligible_torrents,
+            metadata_bootstrap_torrents=metadata_bootstrap_torrents,
             rejected_counts=rejected_counts,
             tracker_health_observed=tracker_health_observed,
         )
@@ -7628,11 +7899,57 @@ class SmartQueuePolicyEngine:
                 continue
             available_candidates.append(torrent)
 
+        metadata_bootstrap_candidates = []
+        metadata_bootstrap_cooldown_count = 0
+        metadata_candidates = sorted(
+            classification.metadata_bootstrap_torrents,
+            key=lambda torrent: self.score_for(observation, torrent).sort_key,
+        )
+        if self.storage_constrained_mode:
+            rejected_counts["metadata_bootstrap_storage_constrained"] += len(metadata_candidates)
+        elif self.metadata_bootstrap_enabled:
+            for torrent in metadata_candidates:
+                candidate_hash = torrent_hash(torrent)
+                if candidate_hash in self.attempted_hashes:
+                    rejected_counts["metadata_bootstrap_attempted_this_run"] += 1
+                    continue
+                if not is_stopped_torrent(torrent):
+                    rejected_counts["metadata_bootstrap_not_stopped"] += 1
+                    continue
+                cooldown_state = {}
+                if hasattr(self.health_store, "active_cooldown_state"):
+                    cooldown_state = self.health_store.active_cooldown_state(
+                        torrent,
+                        self.now,
+                        scope="normal",
+                    )
+                if self.stall_tag_prefix:
+                    clear_expired_stall_tags(
+                        self.client,
+                        torrent,
+                        self.stall_tag_prefix,
+                        self.now,
+                        self.stall_cooldown_seconds,
+                        health_store=self.health_store,
+                        canonical_cooldown_state=cooldown_state,
+                    )
+                if cooldown_state:
+                    cooldown_reason = cooldown_state.get("reason") or "unknown"
+                    rejected_counts["metadata_bootstrap_cooldown"] += 1
+                    rejected_counts[
+                        f"metadata_bootstrap_cooldown_{cooldown_reason.replace('-', '_')}"
+                    ] += 1
+                    metadata_bootstrap_cooldown_count += 1
+                    continue
+                metadata_bootstrap_candidates.append(torrent)
+
         return SmartQueuePolicyFilterResult(
             all_candidates=all_candidates,
             candidates=candidates,
             available_candidates=available_candidates,
+            metadata_bootstrap_candidates=metadata_bootstrap_candidates,
             cooldown_count=cooldown_count,
+            metadata_bootstrap_cooldown_count=metadata_bootstrap_cooldown_count,
             storage_blocked_count=storage_blocked_count,
             storage_pressure_mode=storage_pressure_mode,
             storage_pressure_blocked_fraction=storage_pressure_blocked_fraction,
@@ -7842,6 +8159,8 @@ class SmartQueuePolicyEngine:
             return SmartQueuePolicyActionPlan("keep_storage_recovery_parked")
         if scoring.productive_candidates:
             return SmartQueuePolicyActionPlan("keep_productive")
+        if filters.metadata_bootstrap_candidates:
+            return SmartQueuePolicyActionPlan("bootstrap_metadata")
         if scoring.normal_parked_stalled_torrents and not scoring.selection_candidates:
             return SmartQueuePolicyActionPlan("keep_parked_stalled")
         if filters.available_candidates and scoring.selection_candidates:
@@ -7852,8 +8171,11 @@ class SmartQueuePolicyEngine:
         rejected_counts = classification.rejected_counts
         candidate_counts = {
             "total": len(observation.torrents),
-            "eligible": len(filters.all_candidates),
+            "eligible": len(filters.all_candidates) + len(classification.metadata_bootstrap_torrents),
             "after_storage": len(filters.candidates),
+            "metadata_unknown": len(classification.metadata_bootstrap_torrents),
+            "metadata_bootstrap_available": len(filters.metadata_bootstrap_candidates),
+            "metadata_bootstrap_cooldown": filters.metadata_bootstrap_cooldown_count,
             "tv_queue_order_blocked": filters.tv_order_blocked_count,
             "available": len(filters.available_candidates),
             "selection_pool": len(scoring.selection_candidates),
@@ -8362,6 +8684,34 @@ def apply_single_download(
     healthy_min_availability = env_float("QBT_SINGLE_DOWNLOAD_HEALTHY_MIN_AVAILABILITY", 1.05)
     tracker_health_max_candidates = max(0, env_int("QBT_TRACKER_HEALTH_MAX_CANDIDATES_PER_PASS", 50))
     tracker_health_min_refresh_seconds = max(0, env_int("QBT_TRACKER_HEALTH_MIN_REFRESH_SECONDS", 300))
+    metadata_bootstrap_enabled = env_bool("QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_ENABLED", True)
+    metadata_bootstrap_timeout_seconds = max(
+        1,
+        env_int("QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_TIMEOUT_SECONDS", 60),
+    )
+    metadata_bootstrap_poll_seconds = max(
+        0.1,
+        env_float("QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_POLL_SECONDS", 2.0),
+    )
+    metadata_bootstrap_max_attempts = max(
+        0,
+        env_int("QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_MAX_ATTEMPTS_PER_RUN", 1),
+    )
+    metadata_bootstrap_download_limit = max(
+        0,
+        env_int(
+            "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_DOWNLOAD_LIMIT_BYTES_PER_SEC",
+            65_536,
+        ),
+    )
+    metadata_bootstrap_upload_limit = max(
+        0,
+        env_int(
+            "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_UPLOAD_LIMIT_BYTES_PER_SEC",
+            16_384,
+        ),
+    )
+    metadata_bootstrap_enabled = metadata_bootstrap_enabled and metadata_bootstrap_max_attempts > 0
     selection_strategy_name = selection_strategy()
     preempt_productive_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED", False)
     preempt_productive_score_margin = env_float("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN", 25.0)
@@ -8452,10 +8802,26 @@ def apply_single_download(
                     "will be considered",
                     reason=storage_state["reason"],
                 )
+        client_metadata_bootstrap_enabled = (
+            metadata_bootstrap_enabled
+            and storage_guard is not None
+            and getattr(storage_guard, "require_torrent_fit", False)
+            and bool(storage_state and storage_state.get("enabled"))
+            and not storage_state_is_reserve_constrained(storage_guard, storage_state)
+        )
+        if client_metadata_bootstrap_enabled:
+            bootstrap_safety_reason = metadata_bootstrap_safety_block_reason(client)
+            if bootstrap_safety_reason:
+                client_metadata_bootstrap_enabled = False
+                log_warning(
+                    f"Metadata bootstrap disabled for {client.base_url}: "
+                    f"{bootstrap_safety_reason}",
+                )
         attempted_hashes = set()
         attempt = 0
         deadline = time.monotonic() + max_run_seconds
         active_queue_limit = None
+        metadata_bootstrap_attempts = 0
 
         while True:
             if max_attempts > 0 and attempt >= max_attempts:
@@ -8596,6 +8962,10 @@ def apply_single_download(
                 normal_worker_limit=normal_worker_limit,
                 productive_rate_floor_bytes=base_productive_rate_floor_bytes,
                 normal_progress_min_bytes=normal_progress_min_bytes,
+                metadata_bootstrap_enabled=(
+                    client_metadata_bootstrap_enabled
+                    and bool(storage_state and storage_state.get("enabled"))
+                ),
             ).run()
 
             observation = policy_result.observation
@@ -8605,6 +8975,7 @@ def apply_single_download(
             all_candidates = filters.all_candidates
             candidates = filters.candidates
             available_candidates = filters.available_candidates
+            metadata_bootstrap_candidates = filters.metadata_bootstrap_candidates
             cooldown_count = filters.cooldown_count
             storage_blocked_count = filters.storage_blocked_count
             storage_blocked_examples = filters.storage_blocked_examples
@@ -8686,6 +9057,125 @@ def apply_single_download(
                     }
                     for torrent in list(torrents_to_reject or [])[:limit]
                 ]
+
+            if (
+                policy_result.action_plan.action == "bootstrap_metadata"
+                and metadata_bootstrap_attempts < metadata_bootstrap_max_attempts
+                and metadata_bootstrap_candidates
+            ):
+                metadata_candidate = metadata_bootstrap_candidates[0]
+                metadata_hash = torrent_hash(metadata_candidate)
+                metadata_bootstrap_attempts += 1
+                attempted_hashes.add(metadata_hash)
+                remaining_run_seconds = max(0.1, deadline - time.monotonic())
+                bootstrap_timeout = min(metadata_bootstrap_timeout_seconds, remaining_run_seconds)
+                bootstrap_slot_plan = smart_queue_slot_plan(
+                    1,
+                    slot_plan.parked_listener_slots,
+                )
+                active_queue_limit = set_active_queue_limit_for_slots(
+                    client,
+                    active_queue_limit,
+                    bootstrap_slot_plan,
+                )
+                log_decision_info(
+                    "bootstrap_metadata",
+                    f"Fetching metadata for stopped torrent "
+                    f"{metadata_bootstrap_attempts}/{metadata_bootstrap_max_attempts}: "
+                    f"{torrent_name(metadata_candidate)}",
+                    selected=torrent_name(metadata_candidate),
+                    attempt=metadata_bootstrap_attempts,
+                    attempt_limit=metadata_bootstrap_max_attempts,
+                )
+                try:
+                    bootstrap_result = bootstrap_torrent_metadata(
+                        client,
+                        metadata_candidate,
+                        bootstrap_timeout,
+                        metadata_bootstrap_poll_seconds,
+                        metadata_bootstrap_download_limit,
+                        metadata_bootstrap_upload_limit,
+                    )
+                finally:
+                    active_queue_limit = set_active_queue_limit_for_slots(
+                        client,
+                        active_queue_limit,
+                        slot_plan,
+                    )
+
+                bootstrap_torrent = bootstrap_result.torrent or metadata_candidate
+                bootstrap_now = datetime.now(timezone.utc)
+                bootstrap_rejected_counts = dict(rejected_counts)
+                if bootstrap_result.status == "ready":
+                    health_store.record_metadata_received(bootstrap_torrent, bootstrap_now)
+                    bootstrap_action = "bootstrap_metadata_ready"
+                elif bootstrap_result.status == "timeout":
+                    health_store.record_failure(
+                        bootstrap_torrent,
+                        bootstrap_now,
+                        bootstrap_result.reason,
+                        cooldown_reason=STALL_COOLDOWN_REASON_METADATA,
+                        cooldown_scope="normal",
+                    )
+                    add_stall_cooldown_tag(
+                        client,
+                        bootstrap_torrent,
+                        stall_tag_prefix,
+                        bootstrap_now,
+                        stall_cooldown_seconds,
+                        STALL_COOLDOWN_REASON_METADATA,
+                        health_store=health_store,
+                    )
+                    bootstrap_rejected_counts["metadata_bootstrap_timeout"] = 1
+                    bootstrap_action = "bootstrap_metadata_timeout"
+                else:
+                    bootstrap_rejected_counts["metadata_bootstrap_error"] = 1
+                    bootstrap_action = "bootstrap_metadata_error"
+
+                bootstrap_candidate_counts = {
+                    **candidate_counts,
+                    "metadata_bootstrap_attempted": metadata_bootstrap_attempts,
+                    "metadata_bootstrap_max_attempts": metadata_bootstrap_max_attempts,
+                    "metadata_bootstrap_received": int(bootstrap_result.status == "ready"),
+                    "metadata_bootstrap_timed_out": int(bootstrap_result.status == "timeout"),
+                    **bootstrap_slot_plan.as_counts(),
+                }
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    **decision_competition_context(
+                        winner=bootstrap_torrent,
+                        candidate_pool=metadata_bootstrap_candidates,
+                    ),
+                    action=bootstrap_action,
+                    reason=bootstrap_result.reason,
+                    selected_torrent=torrent_decision_summary(bootstrap_torrent),
+                    rejected_counts=bootstrap_rejected_counts,
+                    candidate_counts=bootstrap_candidate_counts,
+                    attempt=metadata_bootstrap_attempts,
+                    attempt_limit=metadata_bootstrap_max_attempts,
+                    metadata_bootstrap_elapsed_seconds=round(
+                        bootstrap_result.elapsed_seconds,
+                        3,
+                    ),
+                )
+                log_decision_info(
+                    bootstrap_action,
+                    f"Metadata bootstrap {bootstrap_result.status} after "
+                    f"{human_duration(bootstrap_result.elapsed_seconds)}: "
+                    f"{torrent_name(bootstrap_torrent)}; {bootstrap_result.reason}",
+                    selected=torrent_name(bootstrap_torrent),
+                    reason=bootstrap_result.reason,
+                )
+                if metadata_bootstrap_attempts >= metadata_bootstrap_max_attempts:
+                    attempted_hashes.update(
+                        torrent_hash(torrent)
+                        for torrent in metadata_bootstrap_candidates
+                        if torrent_hash(torrent)
+                    )
+                if bootstrap_result.status == "ready":
+                    attempted_hashes.discard(metadata_hash)
+                continue
 
             if (
                 not storage_constrained_mode
