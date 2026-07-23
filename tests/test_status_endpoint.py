@@ -276,8 +276,8 @@ class StatusEndpointTests(unittest.TestCase):
                 "monthly_usage_bytes": 1781085064844,
                 "monthly_guardrail_bytes": 2500000000000,
                 "monthly_remaining_bytes": 718914935156,
-                "daily_cap_bytes": 83333333333,
-                "daily_usage_bytes": 85751606654,
+                "daily_guardrail_bytes": 83333333333,
+                "day_usage_bytes": 85751606654,
                 "daily_remaining_bytes": 0,
             },
             effective_cap={
@@ -312,6 +312,14 @@ class StatusEndpointTests(unittest.TestCase):
         self.assertIn('qbt_guard_last_decision_info{action="pause_all"', metrics)
         self.assertNotIn('qbt_guard_last_decision_info{action="sleep"', metrics)
         self.assertIn('qbt_guard_budget_bytes{type="daily_remaining"} 0.0', metrics)
+        self.assertIn(
+            'qbt_guard_budget_bytes{type="daily_cap"} 83333333333.0',
+            metrics,
+        )
+        self.assertIn(
+            'qbt_guard_budget_bytes{type="daily_usage"} 85751606654.0',
+            metrics,
+        )
         self.assertIn('qbt_guard_effective_cap_bytes_per_sec{type="download"} 1.0', metrics)
 
 

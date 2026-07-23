@@ -703,6 +703,12 @@ class QueueStatusStore:
 
         budget = last_event.get("budget")
         if isinstance(budget, dict):
+            daily_cap_bytes = budget.get("daily_guardrail_bytes")
+            if daily_cap_bytes is None:
+                daily_cap_bytes = budget.get("daily_cap_bytes")
+            daily_usage_bytes = budget.get("day_usage_bytes")
+            if daily_usage_bytes is None:
+                daily_usage_bytes = budget.get("daily_usage_bytes")
             append_gauge_family(
                 lines,
                 "qbt_guard_budget_bytes",
@@ -711,8 +717,8 @@ class QueueStatusStore:
                     ({"type": "monthly_usage"}, budget.get("monthly_usage_bytes")),
                     ({"type": "monthly_guardrail"}, budget.get("monthly_guardrail_bytes")),
                     ({"type": "monthly_remaining"}, budget.get("monthly_remaining_bytes")),
-                    ({"type": "daily_cap"}, budget.get("daily_cap_bytes")),
-                    ({"type": "daily_usage"}, budget.get("daily_usage_bytes")),
+                    ({"type": "daily_cap"}, daily_cap_bytes),
+                    ({"type": "daily_usage"}, daily_usage_bytes),
                     ({"type": "daily_remaining"}, budget.get("daily_remaining_bytes")),
                 ],
             )
