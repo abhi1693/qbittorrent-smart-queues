@@ -433,6 +433,7 @@ class QueueStatusStore:
                         "selected_torrent",
                         "selected_torrents",
                         "storage",
+                        "udm",
                         "winner_torrent",
                     ):
                         if key not in next_event and key in previous_event:
@@ -715,6 +716,37 @@ class QueueStatusStore:
                     ({"type": "daily_remaining"}, budget.get("daily_remaining_bytes")),
                 ],
             )
+
+        udm = last_event.get("udm")
+        backup_internet = udm.get("backup_internet") if isinstance(udm, dict) else None
+        if isinstance(backup_internet, dict) and backup_internet.get("enabled"):
+            append_gauge_family(
+                lines,
+                "qbt_guard_backup_internet_active",
+                "Whether UniFi reports a configured backup internet uplink as active.",
+                [({}, bool_metric_value(backup_internet.get("backup_active")))],
+            )
+            append_gauge_family(
+                lines,
+                "qbt_guard_backup_internet_state_available",
+                "Whether the UniFi backup internet state was read successfully.",
+                [({}, bool_metric_value(backup_internet.get("available")))],
+            )
+            lines.extend([
+                "# HELP qbt_guard_active_wan_info Latest resolved UniFi WAN uplink labels.",
+                "# TYPE qbt_guard_active_wan_info gauge",
+                prometheus_metric_line(
+                    "qbt_guard_active_wan_info",
+                    {
+                        "interface": backup_internet.get("active_interface") or "",
+                        "network": backup_internet.get("active_network") or "",
+                        "network_group": backup_internet.get("active_network_group") or "",
+                        "role": backup_internet.get("active_role") or "unknown",
+                        "uplink": backup_internet.get("active_uplink") or "",
+                    },
+                    1,
+                ),
+            ])
 
         storage = last_event.get("storage")
         if isinstance(storage, dict):
@@ -2633,6 +2665,128 @@ class DownloadStorageGuard:
         return state
 
 
+def normalize_udm_wan_identifier(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def udm_wan_interface_aliases(interface_name, interface):
+    aliases = {
+        normalize_udm_wan_identifier(interface_name),
+    }
+    if normalize_udm_wan_identifier(interface_name) == "wan1":
+        aliases.add("wan")
+    if isinstance(interface, dict):
+        for key in ("name", "ifname", "uplink_ifname"):
+            alias = normalize_udm_wan_identifier(interface.get(key))
+            if alias:
+                aliases.add(alias)
+    return {alias for alias in aliases if alias}
+
+
+def classify_udm_backup_internet_state(network_rows, device_rows):
+    wan_networks = {}
+    backup_network_groups = set()
+    for row in network_rows:
+        if not isinstance(row, dict) or str(row.get("purpose") or "").strip().lower() != "wan":
+            continue
+        network_group = normalize_udm_wan_identifier(row.get("wan_networkgroup"))
+        if network_group:
+            wan_networks[network_group] = row
+        load_balance_type = str(row.get("wan_load_balance_type") or "").strip().lower()
+        if load_balance_type in {"failover", "failover-only"}:
+            identifier = normalize_udm_wan_identifier(row.get("wan_networkgroup"))
+            if identifier:
+                backup_network_groups.add(identifier)
+
+    if not backup_network_groups:
+        raise ApiError("UniFi has no WAN configured with failover-only role")
+
+    gateways = []
+    for row in device_rows:
+        if not isinstance(row, dict) or not isinstance(row.get("uplink"), dict):
+            continue
+        interface_names = [
+            key
+            for key, value in row.items()
+            if re.fullmatch(r"wan\d*", str(key).strip().lower()) and isinstance(value, dict)
+        ]
+        if interface_names:
+            gateways.append((row, interface_names))
+    if len(gateways) != 1:
+        raise ApiError(f"Expected one UniFi gateway with WAN interfaces, found {len(gateways)}")
+
+    gateway, interface_names = gateways[0]
+    uplink = gateway.get("uplink") or {}
+    active_uplink = normalize_udm_wan_identifier(uplink.get("name") or uplink.get("ifname"))
+    if uplink.get("up") is False:
+        raise ApiError("UniFi gateway reports that its active uplink is down")
+
+    interfaces = []
+    for interface_name in interface_names:
+        interface = gateway.get(interface_name) or {}
+        aliases = udm_wan_interface_aliases(interface_name, interface)
+        matching_network = None
+        for network_group, network in wan_networks.items():
+            if network_group in aliases:
+                matching_network = network
+                aliases.add(network_group)
+                break
+        interfaces.append({
+            "name": interface_name,
+            "details": interface,
+            "aliases": {alias for alias in aliases if alias},
+            "network": matching_network or {},
+        })
+
+    known_interface_identifiers = set().union(
+        *(interface["aliases"] for interface in interfaces)
+    )
+    unmatched_backup_groups = backup_network_groups - known_interface_identifiers
+    if unmatched_backup_groups:
+        raise ApiError(
+            "UniFi failover-only WAN group does not match a gateway logical "
+            "interface or uplink interface: "
+            + ", ".join(sorted(unmatched_backup_groups))
+        )
+
+    active_interfaces = []
+    if active_uplink:
+        active_interfaces = [
+            interface
+            for interface in interfaces
+            if active_uplink in interface["aliases"]
+        ]
+    if not active_interfaces:
+        active_interfaces = [
+            interface
+            for interface in interfaces
+            if interface["details"].get("is_uplink") is True
+        ]
+    if len(active_interfaces) != 1:
+        rendered_uplink = uplink.get("name") or uplink.get("ifname") or "unknown"
+        raise ApiError(
+            f"Could not uniquely map active UniFi uplink {rendered_uplink!r} "
+            f"to a WAN interface; matched {len(active_interfaces)}"
+        )
+
+    active_interface = active_interfaces[0]
+    network = active_interface["network"]
+    backup_active = bool(active_interface["aliases"] & backup_network_groups)
+    return {
+        "enabled": True,
+        "available": True,
+        "backup_active": backup_active,
+        "active_role": "backup" if backup_active else "primary",
+        "active_network": str(network.get("name") or active_interface["name"]),
+        "active_network_group": str(
+            network.get("wan_networkgroup") or active_interface["name"]
+        ),
+        "active_interface": str(active_interface["name"]),
+        "active_uplink": str(uplink.get("name") or uplink.get("ifname") or ""),
+        "role_source": "wan_load_balance_type",
+    }
+
+
 class UdmClient:
     def __init__(self):
         self.base_url = os.environ.get("UDM_URL", "").strip().rstrip("/")
@@ -2782,6 +2936,32 @@ class UdmClient:
     def month_to_date_download_bytes(self, now):
         month_total, _ = self.download_usage_snapshot(now)
         return month_total
+
+    def api_rows(self, endpoint, label):
+        self.login()
+        url = join_url(self.base_url, endpoint)
+        data, _ = request_json(
+            self.opener,
+            "GET",
+            url,
+            headers=self.headers(),
+            timeout=self.timeout,
+        )
+        return response_rows(data, label)
+
+    def backup_internet_state(self):
+        network_endpoint = (
+            f"{self.api_base_path}/api/s/{self.site}/rest/networkconf"
+        )
+        device_endpoint = (
+            f"{self.api_base_path}/api/s/{self.site}/stat/device"
+        )
+        network_rows = self.api_rows(network_endpoint, "UDM network configuration")
+        device_rows = self.api_rows(device_endpoint, "UDM device status")
+        return classify_udm_backup_internet_state(
+            network_rows,
+            device_rows,
+        )
 
 
 class QbtClient:
@@ -3063,22 +3243,60 @@ def ensure_qbt_global_tags(client):
         log_warning(f"Failed to ensure qBittorrent global tag {MANUAL_BLACKLIST_TAG!r}: {exc}")
 
 
-def apply_fail_closed():
+def apply_safety_stop(clients, reason, decision_context=None):
+    context = dict(decision_context or {})
+    stop_limit = env_int("QBT_STOP_DOWNLOAD_LIMIT_BYTES_PER_SEC", 1)
+    stop_upload_limit = env_int("QBT_STOP_UPLOAD_LIMIT_BYTES_PER_SEC", 1)
+    stopped_clients = 0
+    for client in clients:
+        try:
+            client.set_download_limit(stop_limit)
+            client.set_upload_limit(stop_upload_limit)
+            client.stop_all()
+            stopped_clients += 1
+            emit_decision_log(
+                "qbt_guard_stop",
+                **decision_base_context(context, client),
+                action="pause_all",
+                reason=reason,
+                effective_cap={
+                    "download_limit_bytes_per_sec": stop_limit,
+                    "upload_limit_bytes_per_sec": stop_upload_limit,
+                },
+            )
+            log_decision_info(
+                "pause_all",
+                f"Paused all torrents; {reason}",
+                summary_key=("safety_stop", reason, getattr(client, "base_url", "")),
+                text_omit_fields={"action", "reason"},
+                reason=reason,
+                qbt_url=getattr(client, "base_url", ""),
+            )
+        except (ApiError, AttributeError) as exc:
+            log_error(
+                "Failed to apply qBittorrent safety stop",
+                qbt_url=getattr(client, "base_url", ""),
+                reason=reason,
+                error=str(exc),
+            )
+    return stopped_clients > 0
+
+
+def apply_fail_closed(reason="UDM quota data is unavailable", decision_context=None):
     clients = reachable_qbt_clients()
     if not clients:
         log_error("No qBittorrent clients reachable while failing closed")
         return False
-    stop_limit = env_int("QBT_STOP_DOWNLOAD_LIMIT_BYTES_PER_SEC", 1)
-    stop_upload_limit = env_int("QBT_STOP_UPLOAD_LIMIT_BYTES_PER_SEC", 1)
-    for client in clients:
-        client.set_download_limit(stop_limit)
-        client.set_upload_limit(stop_upload_limit)
-        client.stop_all()
-        log_decision_info(
-            "pause_all",
-            "Paused all torrents because UDM quota data is unavailable",
-            reason="UDM quota data is unavailable",
-        )
+    return apply_safety_stop(clients, reason, decision_context)
+
+
+def apply_backup_internet_stop(clients, backup_state, decision_context=None):
+    if not backup_state or not backup_state.get("backup_active"):
+        return False
+    active_network = backup_state.get("active_network") or "backup WAN"
+    active_uplink = backup_state.get("active_uplink") or "unknown uplink"
+    reason = f"UniFi backup internet is active on {active_network} via {active_uplink}"
+    apply_safety_stop(clients, reason, decision_context)
     return True
 
 
@@ -3942,17 +4160,29 @@ def thermal_decision_summary(thermal_state):
     }
 
 
-def udm_decision_summary(udm_client, now, error=None):
+def udm_decision_summary(
+    udm_client,
+    now,
+    error=None,
+    backup_state=None,
+    backup_error=None,
+):
     latest_stats_at = getattr(udm_client, "latest_stats_at", None) if udm_client else None
     age_seconds = None
     if latest_stats_at:
         age_seconds = max(0, int((now - latest_stats_at).total_seconds()))
-    return {
+    summary = {
         "available": error is None,
         "error": str(error) if error else "",
         "latest_stats_at": format_utc(latest_stats_at) if latest_stats_at else None,
         "stats_age_seconds": age_seconds,
     }
+    if backup_state is not None:
+        summary["backup_internet"] = dict(backup_state)
+        if backup_error:
+            summary["backup_internet"]["available"] = False
+            summary["backup_internet"]["error"] = str(backup_error)
+    return summary
 
 
 def decision_base_context(decision_context, client, storage_state=None):
@@ -10620,6 +10850,25 @@ def apply_single_download(
 
 def run_once():
     now = datetime.now(timezone.utc)
+    backup_internet_stop_enabled = env_bool(
+        "UDM_BACKUP_INTERNET_STOP_ENABLED",
+        False,
+    )
+    backup_internet_fail_closed = env_bool(
+        "UDM_BACKUP_INTERNET_FAIL_CLOSED",
+        True,
+    )
+    backup_internet_state = (
+        {
+            "enabled": True,
+            "available": False,
+            "backup_active": False,
+            "active_role": "unknown",
+        }
+        if backup_internet_stop_enabled
+        else None
+    )
+    backup_internet_error = None
     monthly_quota = env_int("UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES", 2_500_000_000_000)
     cap_fraction = env_float("UDM_MONTHLY_CAP_FRACTION", 1.0)
     cap_bytes = env_int(
@@ -10651,13 +10900,82 @@ def run_once():
 
     rpi_cooling_state = apply_rpi_thermal_cooling()
     storage_guard = DownloadStorageGuard()
+    udm_client = UdmClient()
+    if backup_internet_stop_enabled:
+        try:
+            backup_internet_state = udm_client.backup_internet_state()
+            log_debug(
+                "Resolved UniFi active WAN",
+                active_network=backup_internet_state.get("active_network"),
+                active_network_group=backup_internet_state.get("active_network_group"),
+                active_interface=backup_internet_state.get("active_interface"),
+                active_uplink=backup_internet_state.get("active_uplink"),
+                active_role=backup_internet_state.get("active_role"),
+                backup_active=backup_internet_state.get("backup_active"),
+            )
+        except ApiError as exc:
+            backup_internet_error = exc
+            log_warning(f"Failed to read UniFi backup internet state: {exc}")
+
+        backup_decision_context = {
+            "udm": udm_decision_summary(
+                udm_client,
+                now,
+                backup_state=backup_internet_state,
+                backup_error=backup_internet_error,
+            ),
+            "rpi_cooling": rpi_cooling_state,
+        }
+        if backup_internet_error and backup_internet_fail_closed:
+            clients = reachable_qbt_clients()
+            if not clients:
+                log_error(
+                    "No qBittorrent clients reachable while UniFi backup internet "
+                    "state is unavailable"
+                )
+                return 0
+            apply_safety_stop(
+                clients,
+                "UniFi backup internet state is unavailable",
+                backup_decision_context,
+            )
+            cleanup_qbt_clients(clients)
+            return 1
+
+        if backup_internet_state.get("backup_active"):
+            clients = reachable_qbt_clients()
+            if not clients:
+                log_error(
+                    "No qBittorrent clients reachable while UniFi backup internet is active"
+                )
+                return 0
+            apply_backup_internet_stop(
+                clients,
+                backup_internet_state,
+                backup_decision_context,
+            )
+            cleanup_qbt_clients(clients)
+            return 0
+
     try:
-        udm_client = UdmClient()
         usage_bytes, day_usage_bytes = udm_client.download_usage_snapshot(now)
     except ApiError as exc:
         log_warning(f"Failed to read UDM month-to-date WAN usage: {exc}")
+        fail_closed_reason = ""
         if env_bool("UDM_FAIL_CLOSED", False):
-            if not apply_fail_closed():
+            fail_closed_reason = "UDM quota data is unavailable"
+        if fail_closed_reason:
+            fail_closed_context = {
+                "udm": udm_decision_summary(
+                    udm_client,
+                    now,
+                    error=exc,
+                    backup_state=backup_internet_state,
+                    backup_error=backup_internet_error,
+                ),
+                "rpi_cooling": rpi_cooling_state,
+            }
+            if not apply_fail_closed(fail_closed_reason, fail_closed_context):
                 return 0
             return 1
         clients = reachable_qbt_clients()
@@ -10671,7 +10989,13 @@ def run_once():
                 "uncapped_download_window": uncapped_window,
                 "uncapped_download_window_active": uncapped_window["active"],
             },
-            "udm": udm_decision_summary(None, now, error=exc),
+            "udm": udm_decision_summary(
+                None,
+                now,
+                error=exc,
+                backup_state=backup_internet_state,
+                backup_error=backup_internet_error,
+            ),
             "thermal": thermal_decision_summary(thermal_state),
             "rpi_cooling": rpi_cooling_state,
         }
@@ -10726,12 +11050,16 @@ def run_once():
                 "uncapped_download_window": uncapped_window,
                 "uncapped_download_window_active": uncapped_window["active"],
             },
-            udm=udm_decision_summary(udm_client, now),
+            udm=udm_decision_summary(
+                udm_client,
+                now,
+                backup_state=backup_internet_state,
+                backup_error=backup_internet_error,
+            ),
         )
         log_info("No qBittorrent clients reachable; leaving quota state unchanged")
         return 0
 
-    thermal_state = full_guard_thermal_state()
     base_decision_context = {
         "budget": {
             "monthly_usage_bytes": usage_bytes,
@@ -10745,10 +11073,17 @@ def run_once():
             "uncapped_download_window": uncapped_window,
             "uncapped_download_window_active": uncapped_window["active"],
         },
-        "udm": udm_decision_summary(udm_client, now),
-        "thermal": thermal_decision_summary(thermal_state),
+        "udm": udm_decision_summary(
+            udm_client,
+            now,
+            backup_state=backup_internet_state,
+            backup_error=backup_internet_error,
+        ),
         "rpi_cooling": rpi_cooling_state,
     }
+
+    thermal_state = full_guard_thermal_state()
+    base_decision_context["thermal"] = thermal_decision_summary(thermal_state)
 
     if apply_rpi_cooling_stop(clients, rpi_cooling_state, base_decision_context):
         return 0

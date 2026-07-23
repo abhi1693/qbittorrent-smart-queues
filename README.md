@@ -63,6 +63,19 @@ Quota control from UniFi Network / UDM is optional. When quota data is
 unavailable and `UDM_FAIL_CLOSED=false`, the controller uses
 `QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC`.
 
+The optional backup-internet guard stops every torrent before queue selection
+when UniFi has failed over to a backup WAN. It reads configured WAN roles from
+UniFi Network's `networkconf` response, where backup connections are marked
+`failover-only`, and resolves the gateway's actual active uplink from
+`stat/device`. It deliberately does not use `last_wan_status`: that historical
+field can disagree with the active routed uplink. Editable UniFi display names
+are recorded for observability only; decisions use WAN groups, logical
+interfaces, and uplink interface identifiers read dynamically from UniFi. No
+WAN name, network group, or physical port identifier is configured in Smart
+Queues. On failover, the controller sets the configured stop-rate limits and
+calls qBittorrent's stop-all endpoint on every poll. Normal queue selection can
+resume on the first successful poll that resolves the primary uplink again.
+
 Download-rate limits are integer bytes per second. Use binary examples when
 translating ISP speed into qBittorrent caps: `10485760` = `10 MiB/s`,
 `8388608` = `8 MiB/s`, `2097152` = `2 MiB/s`, and `524288` = `512 KiB/s`.
@@ -77,6 +90,8 @@ after router/VPN/protocol overhead.
 | `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
 | `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
 | `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
+| `UDM_BACKUP_INTERNET_STOP_ENABLED` | `false` | Stop all torrents while UniFi reports a configured failover-only WAN as the gateway's active uplink. |
+| `UDM_BACKUP_INTERNET_FAIL_CLOSED` | `true` | Stop all torrents when the backup-internet guard is enabled but its UniFi role or active-uplink state cannot be read or mapped safely. |
 | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `10485760` | Hard ISP usable download cap in bytes/s. This caps smoothed quota rates, burst mode, and single-download mode. Example: `10485760` = `10 MiB/s`. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_ENABLED` | `false` | Set qBittorrent's download limit to `0` during the configured local-time window, which qBittorrent treats as unlimited. Monthly/daily quota stop guardrails, thermal checks, storage checks, and queue selection still apply. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_TIMEZONE` | `Asia/Kolkata` | IANA timezone used for the uncapped window. |
@@ -172,6 +187,13 @@ Optional single-download selection tuning:
 | `QBT_STATUS_HTTP_ENABLED` | `false` | Enable the in-process queue status endpoint. |
 | `QBT_STATUS_HTTP_HOST` | `0.0.0.0` | Bind address for the status endpoint. |
 | `QBT_STATUS_HTTP_PORT` | `8081` | Bind port for `/healthz`, `/status`, and `/metrics`. |
+
+When the status endpoint is enabled, backup-WAN state is exposed as
+`qbt_guard_backup_internet_active`,
+`qbt_guard_backup_internet_state_available`, and
+`qbt_guard_active_wan_info`. The last metric labels the resolved network,
+network group, logical interface, uplink, and primary/backup role without
+exposing WAN addresses or credentials.
 
 Cooldown state is canonical in `QBT_TORRENT_HEALTH_STATE_PATH`, including the
 reason, scope, current cooldown failure count, first-seen time, last-tried time,

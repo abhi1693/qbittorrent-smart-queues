@@ -216,6 +216,42 @@ class StatusEndpointTests(unittest.TestCase):
         self.assertIn('qbt_guard_candidate_count{type="available"} 4.0', metrics)
         self.assertIn('qbt_guard_rejected_count{reason="cooldown"} 2.0', metrics)
 
+    def test_backup_internet_metrics_survive_summary_update(self):
+        self.guard.QUEUE_STATUS.record(
+            "qbt_guard_stop",
+            source="structured",
+            action="pause_all",
+            reason="UniFi backup internet is active on Internet 2 via eth7",
+            udm={
+                "available": True,
+                "backup_internet": {
+                    "enabled": True,
+                    "available": True,
+                    "backup_active": True,
+                    "active_role": "backup",
+                    "active_network": "Internet 2",
+                    "active_network_group": "WAN2",
+                    "active_interface": "wan2",
+                    "active_uplink": "eth7",
+                },
+            },
+        )
+        self.guard.QUEUE_STATUS.record(
+            "qbt_guard_decision",
+            source="summary",
+            action="pause_all",
+            reason="UniFi backup internet is active on Internet 2 via eth7",
+        )
+
+        metrics = self.guard.QUEUE_STATUS.prometheus_metrics()
+        self.assertIn("qbt_guard_backup_internet_active 1.0", metrics)
+        self.assertIn("qbt_guard_backup_internet_state_available 1.0", metrics)
+        self.assertIn(
+            'qbt_guard_active_wan_info{interface="wan2",network="Internet 2",'
+            'network_group="WAN2",role="backup",uplink="eth7"} 1',
+            metrics,
+        )
+
     def test_loop_sleep_does_not_hide_last_guard_stop_decision_metrics(self):
         self.guard.QUEUE_STATUS.record(
             "qbt_guard_stop",

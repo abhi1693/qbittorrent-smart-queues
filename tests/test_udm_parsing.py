@@ -13,6 +13,50 @@ class UdmParsingTests(unittest.TestCase):
     def setUp(self):
         self.guard = importlib.import_module("qbittorrent_smart_queues.guard")
 
+    def wan_network_rows(self):
+        return [
+            {
+                "name": "Internet 1",
+                "purpose": "wan",
+                "wan_networkgroup": "WAN",
+                "wan_type": "pppoe",
+                "wan_load_balance_type": "weighted",
+            },
+            {
+                "name": "Internet 2",
+                "purpose": "wan",
+                "wan_networkgroup": "WAN2",
+                "wan_type": "dhcp",
+                "wan_load_balance_type": "failover-only",
+            },
+        ]
+
+    def gateway_row(self, active_uplink):
+        return {
+            "type": "udm",
+            "last_wan_status": {
+                "WAN": "offline",
+                "WAN2": "online",
+            },
+            "uplink": {
+                "name": active_uplink,
+                "type": "wire",
+                "up": True,
+            },
+            "wan1": {
+                "name": "eth8",
+                "ifname": "eth8",
+                "uplink_ifname": "ppp0",
+                "up": True,
+            },
+            "wan2": {
+                "name": "eth7",
+                "ifname": "eth7",
+                "uplink_ifname": "eth7",
+                "up": active_uplink == "eth7",
+            },
+        }
+
     def test_sum_download_bytes_ignores_time_non_rows_and_nonpositive_values(self):
         client = self.guard.UdmClient()
         rows = [
@@ -88,6 +132,97 @@ class UdmParsingTests(unittest.TestCase):
                     datetime(2026, 6, 2, tzinfo=timezone.utc),
                     ["wan-rx_bytes", "time"],
                 )
+
+    def test_backup_state_uses_active_uplink_instead_of_last_wan_status(self):
+        state = self.guard.classify_udm_backup_internet_state(
+            self.wan_network_rows(),
+            [self.gateway_row("ppp0")],
+        )
+
+        self.assertFalse(state["backup_active"])
+        self.assertEqual("primary", state["active_role"])
+        self.assertEqual("Internet 1", state["active_network"])
+        self.assertEqual("WAN", state["active_network_group"])
+        self.assertEqual("wan1", state["active_interface"])
+        self.assertEqual("ppp0", state["active_uplink"])
+
+    def test_backup_state_detects_failover_only_network_as_active(self):
+        network_rows = self.wan_network_rows()
+        network_rows[1]["name"] = "Editable backup label"
+        state = self.guard.classify_udm_backup_internet_state(
+            network_rows,
+            [self.gateway_row("eth7")],
+        )
+
+        self.assertTrue(state["backup_active"])
+        self.assertEqual("backup", state["active_role"])
+        self.assertEqual("Editable backup label", state["active_network"])
+        self.assertEqual("WAN2", state["active_network_group"])
+        self.assertEqual("wan2", state["active_interface"])
+        self.assertEqual("eth7", state["active_uplink"])
+
+    def test_backup_state_requires_dynamic_failover_role(self):
+        with self.assertRaisesRegex(
+            self.guard.ApiError,
+            "no WAN configured with failover-only role",
+        ):
+            self.guard.classify_udm_backup_internet_state(
+                [
+                    {
+                        "name": "Internet 1",
+                        "purpose": "wan",
+                        "wan_networkgroup": "WAN",
+                        "wan_load_balance_type": "weighted",
+                    },
+                    {
+                        "name": "Cellular",
+                        "purpose": "wan",
+                        "wan_networkgroup": "WAN2",
+                        "wan_load_balance_type": "weighted",
+                    },
+                ],
+                [self.gateway_row("eth7")],
+            )
+
+    def test_backup_state_rejects_unmapped_active_uplink(self):
+        with self.assertRaisesRegex(
+            self.guard.ApiError,
+            "Could not uniquely map active UniFi uplink",
+        ):
+            self.guard.classify_udm_backup_internet_state(
+                self.wan_network_rows(),
+                [self.gateway_row("wwan0")],
+            )
+
+    def test_backup_internet_state_reads_network_configuration_and_device_status(self):
+        calls = []
+
+        def fake_request_json(opener, method, url, headers=None, body=None, timeout=30):
+            calls.append({"method": method, "url": url, "headers": headers})
+            if url.endswith("/rest/networkconf"):
+                return {"data": self.wan_network_rows()}, FakeResponse()
+            if url.endswith("/stat/device"):
+                return {"data": [self.gateway_row("eth7")]}, FakeResponse()
+            self.fail(f"Unexpected URL {url}")
+
+        env = {
+            "UDM_URL": "https://unifi.test",
+            "UDM_API_KEY": "test-api-key",
+        }
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(self.guard, "request_json", side_effect=fake_request_json):
+            state = self.guard.UdmClient().backup_internet_state()
+
+        self.assertTrue(state["backup_active"])
+        self.assertEqual(
+            [
+                "https://unifi.test/proxy/network/api/s/default/rest/networkconf",
+                "https://unifi.test/proxy/network/api/s/default/stat/device",
+            ],
+            [call["url"] for call in calls],
+        )
+        self.assertEqual(["GET", "GET"], [call["method"] for call in calls])
+        self.assertEqual("test-api-key", calls[0]["headers"]["X-API-KEY"])
 
 
 if __name__ == "__main__":
