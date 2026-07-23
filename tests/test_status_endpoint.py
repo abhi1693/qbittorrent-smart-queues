@@ -224,6 +224,10 @@ class StatusEndpointTests(unittest.TestCase):
             reason="UniFi backup internet is active on Internet 2 via eth7",
             udm={
                 "available": True,
+                "stats_timezone": "Asia/Kolkata",
+                "stats_timezone_source": "stat/sysinfo",
+                "usage_anomaly_count": 1,
+                "usage_corrected_bytes": 1906917897720,
                 "backup_internet": {
                     "enabled": True,
                     "available": True,
@@ -246,6 +250,16 @@ class StatusEndpointTests(unittest.TestCase):
         metrics = self.guard.QUEUE_STATUS.prometheus_metrics()
         self.assertIn("qbt_guard_backup_internet_active 1.0", metrics)
         self.assertIn("qbt_guard_backup_internet_state_available 1.0", metrics)
+        self.assertIn("qbt_guard_udm_usage_anomaly_count 1.0", metrics)
+        self.assertIn(
+            "qbt_guard_udm_usage_corrected_bytes 1906917897720.0",
+            metrics,
+        )
+        self.assertIn(
+            'qbt_guard_udm_stats_timezone_info{source="stat/sysinfo",'
+            'timezone="Asia/Kolkata"} 1',
+            metrics,
+        )
         self.assertIn(
             'qbt_guard_active_wan_info{interface="wan2",network="Internet 2",'
             'network_group="WAN2",role="backup",uplink="eth7"} 1',

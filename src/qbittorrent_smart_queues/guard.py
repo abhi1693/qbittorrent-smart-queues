@@ -718,6 +718,32 @@ class QueueStatusStore:
             )
 
         udm = last_event.get("udm")
+        if isinstance(udm, dict):
+            append_gauge_family(
+                lines,
+                "qbt_guard_udm_usage_anomaly_count",
+                "Impossible UniFi usage fields corrected in the current local day.",
+                [({}, udm.get("usage_anomaly_count"))],
+            )
+            append_gauge_family(
+                lines,
+                "qbt_guard_udm_usage_corrected_bytes",
+                "UniFi usage bytes removed by persisted counter corrections.",
+                [({}, udm.get("usage_corrected_bytes"))],
+            )
+            if udm.get("stats_timezone"):
+                lines.extend([
+                    "# HELP qbt_guard_udm_stats_timezone_info UniFi usage reporting timezone.",
+                    "# TYPE qbt_guard_udm_stats_timezone_info gauge",
+                    prometheus_metric_line(
+                        "qbt_guard_udm_stats_timezone_info",
+                        {
+                            "source": udm.get("stats_timezone_source") or "",
+                            "timezone": udm.get("stats_timezone") or "",
+                        },
+                        1,
+                    ),
+                ])
         backup_internet = udm.get("backup_internet") if isinstance(udm, dict) else None
         if isinstance(backup_internet, dict) and backup_internet.get("enabled"):
             append_gauge_family(
@@ -937,6 +963,27 @@ def utc_day_start(now):
 
 def utc_day_end(now):
     return utc_day_start(now) + timedelta(days=1) - timedelta(seconds=1)
+
+
+def local_calendar_starts(now, local_timezone):
+    local_now = now.astimezone(local_timezone)
+    local_day_start = datetime(
+        local_now.year,
+        local_now.month,
+        local_now.day,
+        tzinfo=local_timezone,
+    )
+    local_month_start = datetime(
+        local_now.year,
+        local_now.month,
+        1,
+        tzinfo=local_timezone,
+    )
+    return (
+        local_month_start.astimezone(timezone.utc),
+        local_day_start.astimezone(timezone.utc),
+        local_now.date().isoformat(),
+    )
 
 
 def parse_local_clock_time(value, default):
@@ -1351,6 +1398,27 @@ def latest_udm_row_time(rows):
         if row_time and (latest is None or row_time > latest):
             latest = row_time
     return latest
+
+
+def filter_udm_rows(rows, start, end):
+    filtered = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_time = parse_udm_row_time(row.get("time"))
+        if row_time is None or start <= row_time < end:
+            filtered.append(row)
+    return filtered
+
+
+def udm_stats_interval_seconds(interval):
+    normalized = str(interval or "").strip().lower()
+    return {
+        "5minutes": 300,
+        "hourly": 3600,
+        "daily": 86400,
+        "monthly": 2_678_400,
+    }.get(normalized)
 
 
 def request_json(opener, method, url, headers=None, body=None, timeout=30):
@@ -2787,6 +2855,81 @@ def classify_udm_backup_internet_state(network_rows, device_rows):
     }
 
 
+class UdmUsageCorrectionStore:
+    def __init__(self, path):
+        self.path = path
+        self.data = {"version": 1, "days": {}}
+        self.load()
+
+    def load(self):
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as state_file:
+                payload = json.load(state_file)
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError) as exc:
+            log_warning(f"Failed to read UniFi usage correction state: {exc}")
+            return
+        days = payload.get("days") if isinstance(payload, dict) else None
+        if isinstance(days, dict):
+            self.data = {"version": 1, "days": days}
+
+    def save(self):
+        if not self.path:
+            return
+        directory = os.path.dirname(self.path)
+        tmp_path = f"{self.path}.tmp"
+        try:
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as state_file:
+                json.dump(
+                    json_safe(self.data),
+                    state_file,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                state_file.write("\n")
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            os.replace(tmp_path, self.path)
+        except OSError as exc:
+            log_warning(f"Failed to save UniFi usage correction state: {exc}")
+
+    def corrections_for(self, local_day, attrs):
+        day_state = (self.data.get("days") or {}).get(local_day) or {}
+        corrections = day_state.get("corrections") or {}
+        return {
+            attr: max(0, int(corrections.get(attr, 0) or 0))
+            for attr in attrs
+        }
+
+    def correction_bytes(self, local_day, attrs):
+        return sum(self.corrections_for(local_day, attrs).values())
+
+    def update(self, local_day, corrections, timezone_name):
+        normalized = {
+            str(attr): max(0, int(value))
+            for attr, value in corrections.items()
+            if int(value) > 0
+        }
+        if not normalized:
+            return False
+        days = self.data.setdefault("days", {})
+        existing = days.get(local_day) or {}
+        if existing.get("corrections") == normalized:
+            return False
+        days[local_day] = {
+            "corrections": normalized,
+            "timezone": timezone_name,
+            "updated_at": format_utc(datetime.now(timezone.utc)),
+        }
+        self.save()
+        return True
+
+
 class UdmClient:
     def __init__(self):
         self.base_url = os.environ.get("UDM_URL", "").strip().rstrip("/")
@@ -2806,6 +2949,19 @@ class UdmClient:
         self.password = (os.environ.get("UDM_PASSWORD") or os.environ.get("UNIFI_PASSWORD") or "").strip()
         self.csrf_token = ""
         self.latest_stats_at = None
+        self.network_rows = None
+        self.device_rows = None
+        self.stats_timezone_name = ""
+        self.stats_timezone_info = None
+        self.stats_timezone_source = ""
+        self.usage_anomalies = []
+        self.usage_corrected_bytes = 0
+        self.usage_correction_store = UdmUsageCorrectionStore(
+            os.environ.get(
+                "UDM_USAGE_CORRECTION_STATE_PATH",
+                "/state/udm-usage-corrections.json",
+            ).strip()
+        )
         self.cookie_jar = CookieJar()
         context = None
         if not self.verify_tls:
@@ -2894,42 +3050,302 @@ class UdmClient:
         log_debug(f"UDM returned {len(rows)} {interval}.{report_type} rows")
         return rows
 
-    def sum_download_bytes(self, rows, attrs):
+    def resolve_stats_timezone(self):
+        configured = os.environ.get("UDM_STATS_TIMEZONE", "").strip()
+        source = "UDM_STATS_TIMEZONE"
+        timezone_name = configured
+        if not timezone_name:
+            endpoint = f"{self.api_base_path}/api/s/{self.site}/stat/sysinfo"
+            sysinfo_rows = self.api_rows(endpoint, "UDM system information")
+            timezone_names = {
+                str(row.get("timezone") or "").strip()
+                for row in sysinfo_rows
+                if isinstance(row, dict) and str(row.get("timezone") or "").strip()
+            }
+            if len(timezone_names) != 1:
+                raise ApiError(
+                    "Could not resolve one UniFi reporting timezone from stat/sysinfo"
+                )
+            timezone_name = timezone_names.pop()
+            source = "stat/sysinfo"
+        try:
+            local_timezone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ApiError(
+                f"UniFi reporting timezone {timezone_name!r} is not available"
+            ) from exc
+        self.stats_timezone_name = timezone_name
+        self.stats_timezone_info = local_timezone
+        self.stats_timezone_source = source
+        return local_timezone
+
+    def stats_rate_limits(self, attrs):
+        download_attrs = [attr for attr in attrs if attr != "time"]
+        configured_limit = max(
+            0,
+            env_int("UDM_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC", 0),
+        )
+        if configured_limit:
+            return {
+                attr: configured_limit
+                for attr in download_attrs
+                if str(attr).strip().lower().endswith("-rx_bytes")
+            }
+
+        if self.network_rows is None:
+            network_endpoint = (
+                f"{self.api_base_path}/api/s/{self.site}/rest/networkconf"
+            )
+            self.network_rows = self.api_rows(
+                network_endpoint,
+                "UDM network configuration",
+            )
+
+        wan_capabilities = {}
+        for row in self.network_rows:
+            if (
+                not isinstance(row, dict)
+                or str(row.get("purpose") or "").strip().lower() != "wan"
+            ):
+                continue
+            network_group = normalize_udm_wan_identifier(
+                row.get("wan_networkgroup")
+            )
+            capabilities = row.get("wan_provider_capabilities")
+            if not network_group or not isinstance(capabilities, dict):
+                continue
+            download_kbps = capabilities.get("download_kilobits_per_second")
+            upload_kbps = capabilities.get("upload_kilobits_per_second")
+            try:
+                download_rate = max(
+                    0,
+                    math.floor(float(download_kbps) * 1000 / 8),
+                )
+            except (TypeError, ValueError):
+                download_rate = 0
+            try:
+                upload_rate = max(
+                    0,
+                    math.floor(float(upload_kbps) * 1000 / 8),
+                )
+            except (TypeError, ValueError):
+                upload_rate = 0
+            wan_capabilities[network_group] = {
+                "rx": download_rate,
+                "tx": upload_rate,
+            }
+
+        limits = {}
+        for attr in download_attrs:
+            match = re.fullmatch(
+                r"(wan\d*)-(rx|tx)_bytes",
+                str(attr).strip().lower(),
+            )
+            if not match:
+                continue
+            network_group = normalize_udm_wan_identifier(match.group(1))
+            direction = match.group(2)
+            rate = (wan_capabilities.get(network_group) or {}).get(direction, 0)
+            if rate > 0:
+                limits[attr] = rate
+        return limits
+
+    def sum_download_bytes(
+        self,
+        rows,
+        attrs,
+        local_timezone=None,
+        apply_saved_corrections=False,
+    ):
         total = 0
         download_attrs = [attr for attr in attrs if attr != "time"]
         for row in rows:
             if not isinstance(row, dict):
                 continue
+            saved_corrections = {}
+            if apply_saved_corrections and local_timezone is not None:
+                row_time = parse_udm_row_time(row.get("time"))
+                if row_time is not None:
+                    local_day = row_time.astimezone(
+                        local_timezone
+                    ).date().isoformat()
+                    saved_corrections = (
+                        self.usage_correction_store.corrections_for(
+                            local_day,
+                            download_attrs,
+                        )
+                    )
+            row_total = 0
             for attr in download_attrs:
                 value = row.get(attr)
                 if isinstance(value, (int, float)) and value > 0:
-                    total += int(value)
+                    attr_value = int(value)
+                    applied_correction = min(
+                        attr_value,
+                        saved_corrections.get(attr, 0),
+                    )
+                    row_total += attr_value - applied_correction
+                    self.usage_corrected_bytes += applied_correction
+            total += row_total
+        return total
+
+    def corrected_download_bytes(self, rows, attrs, interval, local_day):
+        download_attrs = [attr for attr in attrs if attr != "time"]
+        interval_seconds = udm_stats_interval_seconds(interval)
+        rate_limits = self.stats_rate_limits(attrs) if interval_seconds else {}
+        multiplier = max(
+            1.0,
+            env_float("UDM_STATS_RATE_LIMIT_MULTIPLIER", 1.25),
+        )
+        values_by_attr = {
+            attr: [
+                int(row.get(attr))
+                if (
+                    isinstance(row, dict)
+                    and isinstance(row.get(attr), (int, float))
+                    and row.get(attr) > 0
+                )
+                else 0
+                for row in rows
+            ]
+            for attr in download_attrs
+        }
+        total = 0
+        anomalies = []
+        corrections = {}
+        for attr, values in values_by_attr.items():
+            rate_limit = rate_limits.get(attr, 0)
+            bucket_limit = (
+                math.floor(rate_limit * interval_seconds * multiplier)
+                if rate_limit and interval_seconds
+                else 0
+            )
+            for index, observed in enumerate(values):
+                if not bucket_limit or observed <= bucket_limit:
+                    total += observed
+                    continue
+                previous_value = next(
+                    (
+                        value
+                        for value in reversed(values[:index])
+                        if value <= bucket_limit
+                    ),
+                    0,
+                )
+                next_value = next(
+                    (
+                        value
+                        for value in values[index + 1 :]
+                        if value <= bucket_limit
+                    ),
+                    0,
+                )
+                replacement = max(previous_value, next_value)
+                correction = max(0, observed - replacement)
+                total += replacement
+                corrections[attr] = corrections.get(attr, 0) + correction
+                row = rows[index] if index < len(rows) else {}
+                row_time = (
+                    parse_udm_row_time(row.get("time"))
+                    if isinstance(row, dict)
+                    else None
+                )
+                anomalies.append({
+                    "attribute": attr,
+                    "time": format_utc(row_time) if row_time else None,
+                    "observed_bytes": observed,
+                    "replacement_bytes": replacement,
+                    "bucket_limit_bytes": bucket_limit,
+                    "correction_bytes": correction,
+                })
+
+        existing_correction = self.usage_correction_store.correction_bytes(
+            local_day,
+            download_attrs,
+        )
+        if corrections:
+            changed = self.usage_correction_store.update(
+                local_day,
+                corrections,
+                self.stats_timezone_name,
+            )
+            if changed:
+                for anomaly in anomalies:
+                    log_warning(
+                        "Corrected impossible UniFi usage bucket",
+                        **anomaly,
+                    )
+        elif existing_correction:
+            total = self.sum_download_bytes(
+                rows,
+                attrs,
+                local_timezone=self.stats_timezone_info,
+                apply_saved_corrections=True,
+            )
+
+        self.usage_anomalies = anomalies
+        if corrections:
+            self.usage_corrected_bytes += sum(corrections.values())
         return total
 
     def download_usage_snapshot(self, now):
         self.login()
-        month_start, _ = utc_month_window(now)
-        today_start = utc_day_start(now)
+        self.usage_anomalies = []
+        self.usage_corrected_bytes = 0
+        local_timezone = self.resolve_stats_timezone()
+        month_start, today_start, local_day = local_calendar_starts(
+            now,
+            local_timezone,
+        )
         interval = os.environ.get("UDM_STATS_INTERVAL", "split-daily-hourly").strip()
         attrs = self.stats_attrs()
 
         if interval != "split-daily-hourly":
             month_rows = self.stats_rows(interval, month_start, now, attrs)
             day_rows = self.stats_rows(interval, today_start, now, attrs)
-            return self.sum_download_bytes(month_rows, attrs), self.sum_download_bytes(day_rows, attrs)
+            month_rows = filter_udm_rows(month_rows, month_start, now)
+            day_rows = filter_udm_rows(day_rows, today_start, now)
+            day_raw = self.sum_download_bytes(day_rows, attrs)
+            month_total = self.sum_download_bytes(
+                month_rows,
+                attrs,
+                local_timezone=local_timezone,
+                apply_saved_corrections=True,
+            )
+            day_total = self.corrected_download_bytes(
+                day_rows,
+                attrs,
+                interval,
+                local_day,
+            )
+            return max(0, month_total - day_raw + day_total), day_total
 
         month_total = 0
         if month_start < today_start:
             history_interval = os.environ.get("UDM_HISTORY_STATS_INTERVAL", "daily").strip()
             rows = self.stats_rows(history_interval, month_start, today_start, attrs)
-            month_total += self.sum_download_bytes(rows, attrs)
+            rows = filter_udm_rows(rows, month_start, today_start)
+            month_total += self.sum_download_bytes(
+                rows,
+                attrs,
+                local_timezone=local_timezone,
+                apply_saved_corrections=True,
+            )
 
         current_interval = os.environ.get("UDM_CURRENT_STATS_INTERVAL", "hourly").strip()
         current_rows = self.stats_rows(current_interval, today_start, now, attrs)
+        current_rows = filter_udm_rows(current_rows, today_start, now)
         if not current_rows:
             fallback_interval = os.environ.get("UDM_CURRENT_STATS_FALLBACK_INTERVAL", "daily").strip()
             current_rows = self.stats_rows(fallback_interval, today_start, now, attrs)
-        day_total = self.sum_download_bytes(current_rows, attrs)
+            current_rows = filter_udm_rows(current_rows, today_start, now)
+            current_interval = fallback_interval
+        day_total = self.corrected_download_bytes(
+            current_rows,
+            attrs,
+            current_interval,
+            local_day,
+        )
         month_total += day_total
         return month_total, day_total
 
@@ -2956,11 +3372,14 @@ class UdmClient:
         device_endpoint = (
             f"{self.api_base_path}/api/s/{self.site}/stat/device"
         )
-        network_rows = self.api_rows(network_endpoint, "UDM network configuration")
-        device_rows = self.api_rows(device_endpoint, "UDM device status")
+        self.network_rows = self.api_rows(
+            network_endpoint,
+            "UDM network configuration",
+        )
+        self.device_rows = self.api_rows(device_endpoint, "UDM device status")
         return classify_udm_backup_internet_state(
-            network_rows,
-            device_rows,
+            self.network_rows,
+            self.device_rows,
         )
 
 
@@ -4177,6 +4596,26 @@ def udm_decision_summary(
         "latest_stats_at": format_utc(latest_stats_at) if latest_stats_at else None,
         "stats_age_seconds": age_seconds,
     }
+    if udm_client is not None:
+        summary["stats_timezone"] = getattr(
+            udm_client,
+            "stats_timezone_name",
+            "",
+        )
+        summary["stats_timezone_source"] = getattr(
+            udm_client,
+            "stats_timezone_source",
+            "",
+        )
+        usage_anomalies = getattr(udm_client, "usage_anomalies", None) or []
+        summary["usage_anomaly_count"] = len(usage_anomalies)
+        summary["usage_corrected_bytes"] = getattr(
+            udm_client,
+            "usage_corrected_bytes",
+            0,
+        )
+        if usage_anomalies:
+            summary["usage_anomalies"] = usage_anomalies
     if backup_state is not None:
         summary["backup_internet"] = dict(backup_state)
         if backup_error:
@@ -11020,6 +11459,15 @@ def run_once():
         )
         cleanup_qbt_clients(clients)
         return 0
+
+    stats_timezone_info = getattr(udm_client, "stats_timezone_info", None)
+    if stats_timezone_info is not None:
+        billing_now = now.astimezone(stats_timezone_info)
+        days_in_month = calendar.monthrange(
+            billing_now.year,
+            billing_now.month,
+        )[1]
+        daily_cap_bytes = max(1, math.floor(cap_bytes / days_in_month))
 
     usage_percent = (usage_bytes / cap_bytes) * 100 if cap_bytes else 0
     day_usage_percent = (day_usage_bytes / daily_cap_bytes) * 100 if daily_cap_bytes else 0

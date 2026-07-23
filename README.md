@@ -63,6 +63,17 @@ Quota control from UniFi Network / UDM is optional. When quota data is
 unavailable and `UDM_FAIL_CLOSED=false`, the controller uses
 `QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC`.
 
+Month and day boundaries follow UniFi's reporting timezone, discovered from
+`stat/sysinfo` unless `UDM_STATS_TIMEZONE` overrides it. In the default
+`split-daily-hourly` mode, completed local days use UniFi daily reports and the
+open local day uses hourly reports, with explicit timestamp filtering so the
+open day cannot appear in both totals. Hourly values above the WAN provider
+capability reported by UniFi, plus the configured safety multiplier, are
+treated as counter discontinuities rather than traffic. The invalid field is
+replaced with the larger adjacent valid hourly value; other WAN fields in the
+same bucket remain counted. The subtracted correction is persisted by local
+date so a later UniFi daily rollup cannot restore the bad counter value.
+
 The optional backup-internet guard stops every torrent before queue selection
 when UniFi has failed over to a backup WAN. It reads configured WAN roles from
 UniFi Network's `networkconf` response, where backup connections are marked
@@ -90,6 +101,10 @@ after router/VPN/protocol overhead.
 | `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
 | `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
 | `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
+| `UDM_STATS_TIMEZONE` | unset | Optional IANA timezone override for UniFi usage periods. When unset, the controller discovers the timezone from UniFi `stat/sysinfo`. |
+| `UDM_STATS_RATE_LIMIT_MULTIPLIER` | `1.25` | Safety allowance above UniFi's WAN provider capability before an hourly field is classified as an impossible counter discontinuity. |
+| `UDM_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC` | `0` | Optional per-WAN-field byte/s ceiling when UniFi has no provider capability. `0` leaves fields without a discovered capability unbounded. |
+| `UDM_USAGE_CORRECTION_STATE_PATH` | `/state/udm-usage-corrections.json` | Persistent per-local-day corrections for impossible UniFi report buckets. |
 | `UDM_BACKUP_INTERNET_STOP_ENABLED` | `false` | Stop all torrents while UniFi reports a configured failover-only WAN as the gateway's active uplink. |
 | `UDM_BACKUP_INTERNET_FAIL_CLOSED` | `true` | Stop all torrents when the backup-internet guard is enabled but its UniFi role or active-uplink state cannot be read or mapped safely. |
 | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `10485760` | Hard ISP usable download cap in bytes/s. This caps smoothed quota rates, burst mode, and single-download mode. Example: `10485760` = `10 MiB/s`. |
