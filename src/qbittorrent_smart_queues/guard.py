@@ -750,6 +750,21 @@ class QueueStatusStore:
                         1,
                     ),
                 ])
+            if udm.get("usage_scope"):
+                lines.extend([
+                    "# HELP qbt_guard_udm_usage_scope_info UniFi WAN usage accounting scope.",
+                    "# TYPE qbt_guard_udm_usage_scope_info gauge",
+                    prometheus_metric_line(
+                        "qbt_guard_udm_usage_scope_info",
+                        {
+                            "network_groups": ",".join(
+                                udm.get("usage_network_groups") or []
+                            ),
+                            "scope": udm.get("usage_scope") or "",
+                        },
+                        1,
+                    ),
+                ])
         backup_internet = udm.get("backup_internet") if isinstance(udm, dict) else None
         if isinstance(backup_internet, dict) and backup_internet.get("enabled"):
             append_gauge_family(
@@ -2757,6 +2772,48 @@ def udm_wan_interface_aliases(interface_name, interface):
     return {alias for alias in aliases if alias}
 
 
+def udm_wan_stats_prefix(network_group):
+    normalized = normalize_udm_wan_identifier(network_group)
+    if normalized in {"wan", "wan1"}:
+        return "wan"
+    if re.fullmatch(r"wan[2-9]\d*", normalized):
+        return normalized
+    return ""
+
+
+def udm_primary_usage_stats_attrs(network_rows, include_upload=False):
+    attrs = []
+    network_groups = []
+    for row in network_rows:
+        if (
+            not isinstance(row, dict)
+            or str(row.get("purpose") or "").strip().lower() != "wan"
+        ):
+            continue
+        load_balance_type = str(
+            row.get("wan_load_balance_type") or ""
+        ).strip().lower()
+        if load_balance_type in {"failover", "failover-only"}:
+            continue
+        network_group = str(row.get("wan_networkgroup") or "").strip()
+        stats_prefix = udm_wan_stats_prefix(network_group)
+        if not stats_prefix:
+            raise ApiError(
+                "Could not map primary UniFi WAN group "
+                f"{network_group!r} to a report field"
+            )
+        attrs.append(f"{stats_prefix}-rx_bytes")
+        if include_upload:
+            attrs.append(f"{stats_prefix}-tx_bytes")
+        network_groups.append(network_group)
+    if not attrs:
+        raise ApiError(
+            "UniFi has no primary WAN report fields after excluding failover-only roles"
+        )
+    attrs.append("time")
+    return list(dict.fromkeys(attrs)), sorted(set(network_groups))
+
+
 def classify_udm_backup_internet_state(network_rows, device_rows):
     wan_networks = {}
     backup_network_groups = set()
@@ -2960,6 +3017,8 @@ class UdmClient:
         self.stats_timezone_name = ""
         self.stats_timezone_info = None
         self.stats_timezone_source = ""
+        self.usage_scope = "all"
+        self.usage_network_groups = []
         self.usage_anomalies = []
         self.usage_corrected_bytes = 0
         self.usage_correction_store = UdmUsageCorrectionStore(
@@ -3026,11 +3085,30 @@ class UdmClient:
         raise ApiError("UDM login failed: " + " | ".join(errors))
 
     def stats_attrs(self):
+        if env_bool("UDM_BACKUP_INTERNET_STOP_ENABLED", False):
+            if self.network_rows is None:
+                network_endpoint = (
+                    f"{self.api_base_path}/api/s/{self.site}/rest/networkconf"
+                )
+                self.network_rows = self.api_rows(
+                    network_endpoint,
+                    "UDM network configuration",
+                )
+            attrs, network_groups = udm_primary_usage_stats_attrs(
+                self.network_rows,
+                include_upload=env_bool("UDM_INCLUDE_UPLOAD", False),
+            )
+            self.usage_scope = "primary"
+            self.usage_network_groups = network_groups
+            return attrs
+
         attrs = split_lines_or_csv(os.environ.get("UDM_DOWNLOAD_ATTRS")) or ["wan-rx_bytes", "wan2-rx_bytes"]
         if env_bool("UDM_INCLUDE_UPLOAD", False):
             attrs.extend(["wan-tx_bytes", "wan2-tx_bytes"])
         if "time" not in attrs:
             attrs.append("time")
+        self.usage_scope = "all"
+        self.usage_network_groups = []
         return attrs
 
     def stats_rows(self, interval, start, end, attrs):
@@ -4612,6 +4690,12 @@ def udm_decision_summary(
             udm_client,
             "stats_timezone_source",
             "",
+        )
+        summary["usage_scope"] = getattr(udm_client, "usage_scope", "all")
+        summary["usage_network_groups"] = getattr(
+            udm_client,
+            "usage_network_groups",
+            [],
         )
         usage_anomalies = getattr(udm_client, "usage_anomalies", None) or []
         summary["usage_anomaly_count"] = len(usage_anomalies)

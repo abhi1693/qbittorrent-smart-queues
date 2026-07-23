@@ -72,6 +72,33 @@ class UdmParsingTests(unittest.TestCase):
 
         self.assertEqual(132, total)
 
+    def test_stats_attrs_follow_dynamic_primary_role_not_wan_name(self):
+        network_rows = self.wan_network_rows()
+        network_rows[0]["name"] = "Editable backup label"
+        network_rows[0]["wan_load_balance_type"] = "failover-only"
+        network_rows[1]["name"] = "Editable primary label"
+        network_rows[1]["wan_load_balance_type"] = "weighted"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UDM_BACKUP_INTERNET_STOP_ENABLED": "true",
+                "UDM_INCLUDE_UPLOAD": "true",
+                "UDM_DOWNLOAD_ATTRS": "wan-rx_bytes,wan2-rx_bytes",
+            },
+        ):
+            client = self.guard.UdmClient()
+            client.network_rows = network_rows
+
+            attrs = client.stats_attrs()
+
+        self.assertEqual(
+            ["wan2-rx_bytes", "wan2-tx_bytes", "time"],
+            attrs,
+        )
+        self.assertEqual("primary", client.usage_scope)
+        self.assertEqual(["WAN2"], client.usage_network_groups)
+
     def test_usage_snapshot_uses_unifi_timezone_and_corrects_counter_spike(self):
         now = datetime(2026, 7, 23, 16, 0, tzinfo=timezone.utc)
         history_total = 1_746_254_978_409

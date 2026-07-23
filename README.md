@@ -86,6 +86,12 @@ WAN name, network group, or physical port identifier is configured in Smart
 Queues. On failover, the controller sets the configured stop-rate limits and
 calls qBittorrent's stop-all endpoint on every poll. Normal queue selection can
 resume on the first successful poll that resolves the primary uplink again.
+While this guard is enabled, quota usage is also limited to WANs whose UniFi
+role is not `failover-only`. Smart Queues generates the required UniFi report
+fields from those roles at runtime; configured download attributes, editable
+WAN names, network-group identifiers, and physical ports are not configured to
+select the primary. This keeps backup-provider traffic out of the primary ISP's
+monthly quota because qBittorrent is stopped for the entire backup session.
 
 Download-rate limits are integer bytes per second. Use binary examples when
 translating ISP speed into qBittorrent caps: `10485760` = `10 MiB/s`,

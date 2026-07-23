@@ -226,6 +226,8 @@ class StatusEndpointTests(unittest.TestCase):
                 "available": True,
                 "stats_timezone": "Asia/Kolkata",
                 "stats_timezone_source": "stat/sysinfo",
+                "usage_scope": "primary",
+                "usage_network_groups": ["WAN"],
                 "usage_anomaly_count": 1,
                 "usage_corrected_bytes": 1906917897720,
                 "backup_internet": {
@@ -258,6 +260,11 @@ class StatusEndpointTests(unittest.TestCase):
         self.assertIn(
             'qbt_guard_udm_stats_timezone_info{source="stat/sysinfo",'
             'timezone="Asia/Kolkata"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'qbt_guard_udm_usage_scope_info{network_groups="WAN",'
+            'scope="primary"} 1',
             metrics,
         )
         self.assertIn(
