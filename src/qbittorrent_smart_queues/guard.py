@@ -2982,10 +2982,13 @@ class UdmUsageCorrectionStore:
             return False
         days = self.data.setdefault("days", {})
         existing = days.get(local_day) or {}
-        if existing.get("corrections") == normalized:
+        merged = dict(existing.get("corrections") or {})
+        merged.update(normalized)
+        if existing.get("corrections") == merged:
             return False
         days[local_day] = {
-            "corrections": normalized,
+            **existing,
+            "corrections": merged,
             "timezone": timezone_name,
             "updated_at": format_utc(datetime.now(timezone.utc)),
         }
@@ -3243,6 +3246,7 @@ class UdmClient:
     ):
         total = 0
         download_attrs = [attr for attr in attrs if attr != "time"]
+        remaining_corrections_by_day = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -3253,12 +3257,16 @@ class UdmClient:
                     local_day = row_time.astimezone(
                         local_timezone
                     ).date().isoformat()
-                    saved_corrections = (
-                        self.usage_correction_store.corrections_for(
-                            local_day,
-                            download_attrs,
+                    if local_day not in remaining_corrections_by_day:
+                        remaining_corrections_by_day[local_day] = (
+                            self.usage_correction_store.corrections_for(
+                                local_day,
+                                download_attrs,
+                            )
                         )
-                    )
+                    saved_corrections = remaining_corrections_by_day[
+                        local_day
+                    ]
             row_total = 0
             for attr in download_attrs:
                 value = row.get(attr)
@@ -3269,6 +3277,8 @@ class UdmClient:
                         saved_corrections.get(attr, 0),
                     )
                     row_total += attr_value - applied_correction
+                    if applied_correction:
+                        saved_corrections[attr] -= applied_correction
                     self.usage_corrected_bytes += applied_correction
             total += row_total
         return total
@@ -3367,10 +3377,112 @@ class UdmClient:
                 apply_saved_corrections=True,
             )
 
-        self.usage_anomalies = anomalies
+        self.usage_anomalies.extend(anomalies)
         if corrections:
             self.usage_corrected_bytes += sum(corrections.values())
         return total
+
+    def backfill_daily_history_corrections(
+        self,
+        rows,
+        attrs,
+        interval,
+        local_timezone,
+    ):
+        if str(interval or "").strip().lower() != "daily":
+            return
+
+        download_attrs = [attr for attr in attrs if attr != "time"]
+        rate_limits = self.stats_rate_limits(attrs)
+        multiplier = max(
+            1.0,
+            env_float("UDM_STATS_RATE_LIMIT_MULTIPLIER", 1.25),
+        )
+        daily_limits = {
+            attr: math.floor(rate * 86400 * multiplier)
+            for attr, rate in rate_limits.items()
+            if rate > 0
+        }
+        suspicious_attrs_by_day = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_time = parse_udm_row_time(row.get("time"))
+            if row_time is None:
+                continue
+            local_date = row_time.astimezone(local_timezone).date()
+            local_day = local_date.isoformat()
+            saved_corrections = (
+                self.usage_correction_store.corrections_for(
+                    local_day,
+                    download_attrs,
+                )
+            )
+            for attr in download_attrs:
+                observed = row.get(attr)
+                daily_limit = daily_limits.get(attr, 0)
+                if (
+                    isinstance(observed, (int, float))
+                    and observed > daily_limit > 0
+                    and saved_corrections.get(attr, 0) <= 0
+                ):
+                    suspicious_attrs_by_day.setdefault(
+                        local_date,
+                        set(),
+                    ).add(attr)
+
+        for local_date, suspicious_attrs in sorted(
+            suspicious_attrs_by_day.items()
+        ):
+            local_day = local_date.isoformat()
+            day_start = datetime.combine(
+                local_date,
+                datetime_time.min,
+                tzinfo=local_timezone,
+            )
+            day_end = day_start + timedelta(days=1)
+            replay_attrs = sorted(suspicious_attrs)
+            replay_attrs.append("time")
+            hourly_rows = self.stats_rows(
+                "hourly",
+                day_start,
+                day_end,
+                replay_attrs,
+            )
+            hourly_rows = filter_udm_rows(
+                hourly_rows,
+                day_start,
+                day_end,
+            )
+            corrected_bytes_before = self.usage_corrected_bytes
+            if hourly_rows:
+                self.corrected_download_bytes(
+                    hourly_rows,
+                    replay_attrs,
+                    "hourly",
+                    local_day,
+                )
+                # The daily rollup applies and counts the persisted correction
+                # below. Do not count the replay itself as corrected usage too.
+                self.usage_corrected_bytes = corrected_bytes_before
+
+            persisted = self.usage_correction_store.corrections_for(
+                local_day,
+                suspicious_attrs,
+            )
+            unresolved = sorted(
+                attr
+                for attr in suspicious_attrs
+                if persisted.get(attr, 0) <= 0
+            )
+            if unresolved:
+                log_warning(
+                    "Could not backfill impossible UniFi daily usage fields; "
+                    "counting their raw values",
+                    local_day=local_day,
+                    attributes=unresolved,
+                    hourly_row_count=len(hourly_rows),
+                )
 
     def download_usage_snapshot(self, now):
         self.login()
@@ -3409,6 +3521,12 @@ class UdmClient:
             history_interval = os.environ.get("UDM_HISTORY_STATS_INTERVAL", "daily").strip()
             rows = self.stats_rows(history_interval, month_start, today_start, attrs)
             rows = filter_udm_rows(rows, month_start, today_start)
+            self.backfill_daily_history_corrections(
+                rows,
+                attrs,
+                history_interval,
+                local_timezone,
+            )
             month_total += self.sum_download_bytes(
                 rows,
                 attrs,

@@ -72,6 +72,44 @@ class UdmParsingTests(unittest.TestCase):
 
         self.assertEqual(132, total)
 
+    def test_sum_download_bytes_applies_saved_day_correction_only_once(self):
+        local_day_start = datetime(2026, 7, 22, 18, 30, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as state_dir:
+            state_path = os.path.join(state_dir, "usage-corrections.json")
+            with mock.patch.dict(
+                os.environ,
+                {"UDM_USAGE_CORRECTION_STATE_PATH": state_path},
+            ):
+                client = self.guard.UdmClient()
+                client.usage_correction_store.update(
+                    "2026-07-23",
+                    {"wan-rx_bytes": 150},
+                    "Asia/Kolkata",
+                )
+                rows = [
+                    {
+                        "time": int(
+                            (
+                                local_day_start
+                                + self.guard.timedelta(hours=index)
+                            ).timestamp()
+                            * 1000
+                        ),
+                        "wan-rx_bytes": 100,
+                    }
+                    for index in range(3)
+                ]
+
+                total = client.sum_download_bytes(
+                    rows,
+                    ["wan-rx_bytes", "time"],
+                    local_timezone=self.guard.ZoneInfo("Asia/Kolkata"),
+                    apply_saved_corrections=True,
+                )
+
+        self.assertEqual(150, total)
+        self.assertEqual(150, client.usage_corrected_bytes)
+
     def test_stats_attrs_follow_dynamic_primary_role_not_wan_name(self):
         network_rows = self.wan_network_rows()
         network_rows[0]["name"] = "Editable backup label"
@@ -232,6 +270,195 @@ class UdmParsingTests(unittest.TestCase):
                     month_total,
                 )
                 self.assertEqual(correction, client.usage_corrected_bytes)
+
+    def test_usage_correction_store_merges_new_counter_corrections(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            state_path = os.path.join(state_dir, "usage-corrections.json")
+            store = self.guard.UdmUsageCorrectionStore(state_path)
+
+            self.assertTrue(
+                store.update(
+                    "2026-07-23",
+                    {"wan-rx_bytes": 1_906_917_897_720},
+                    "Asia/Kolkata",
+                )
+            )
+            self.assertTrue(
+                store.update(
+                    "2026-07-23",
+                    {"wan-tx_bytes": 4_565_054_403_750},
+                    "Asia/Kolkata",
+                )
+            )
+            self.assertFalse(
+                store.update(
+                    "2026-07-23",
+                    {"wan-tx_bytes": 4_565_054_403_750},
+                    "Asia/Kolkata",
+                )
+            )
+
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            self.assertEqual(
+                {
+                    "wan-rx_bytes": 1_906_917_897_720,
+                    "wan-tx_bytes": 4_565_054_403_750,
+                },
+                state["days"]["2026-07-23"]["corrections"],
+            )
+
+    def test_usage_snapshot_backfills_new_upload_counter_correction(self):
+        local_month_start = datetime(2026, 6, 30, 18, 30, tzinfo=timezone.utc)
+        affected_day_start = datetime(2026, 7, 22, 18, 30, tzinfo=timezone.utc)
+        current_day_start = datetime(2026, 7, 23, 18, 30, tzinfo=timezone.utc)
+        rx_correction = 1_906_917_897_720
+        tx_correction = 4_565_054_403_750
+        affected_rx = 3_849_226_992
+        affected_tx = 566_331_938
+        earlier_usage = 3_000
+        current_usage = 150
+        attrs = ["wan-rx_bytes", "wan-tx_bytes", "time"]
+
+        daily_rows = [
+            {
+                "time": int(local_month_start.timestamp() * 1000),
+                "wan-rx_bytes": 1_000,
+                "wan-tx_bytes": 2_000,
+            },
+            {
+                "time": int(affected_day_start.timestamp() * 1000),
+                "wan-rx_bytes": affected_rx + rx_correction,
+                "wan-tx_bytes": affected_tx + tx_correction,
+            },
+        ]
+        replay_rows = [
+            {
+                "time": int(affected_day_start.timestamp() * 1000),
+                "wan-tx_bytes": 233_165_969,
+            },
+            {
+                "time": int(
+                    datetime(2026, 7, 22, 19, 30, tzinfo=timezone.utc).timestamp()
+                    * 1000
+                ),
+                "wan-tx_bytes": 4_565_287_569_719,
+            },
+            {
+                "time": int(
+                    datetime(2026, 7, 22, 20, 30, tzinfo=timezone.utc).timestamp()
+                    * 1000
+                ),
+                "wan-tx_bytes": 100_000_000,
+            },
+        ]
+        current_rows = [
+            {
+                "time": int(current_day_start.timestamp() * 1000),
+                "wan-rx_bytes": 100,
+                "wan-tx_bytes": 50,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            state_path = os.path.join(state_dir, "usage-corrections.json")
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(
+                    {
+                        "version": 1,
+                        "days": {
+                            "2026-07-23": {
+                                "corrections": {
+                                    "wan-rx_bytes": rx_correction,
+                                },
+                                "timezone": "Asia/Kolkata",
+                            }
+                        },
+                    },
+                    state_file,
+                )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UDM_STATS_TIMEZONE": "Asia/Kolkata",
+                    "UDM_USAGE_CORRECTION_STATE_PATH": state_path,
+                },
+            ):
+                client = self.guard.UdmClient()
+                client.authenticated = True
+                client.network_rows = [
+                    {
+                        "purpose": "wan",
+                        "wan_networkgroup": "WAN",
+                        "wan_provider_capabilities": {
+                            "download_kilobits_per_second": 300000,
+                            "upload_kilobits_per_second": 100000,
+                        },
+                    }
+                ]
+                calls = []
+
+                def fake_stats_rows(interval, start, end, requested_attrs):
+                    calls.append((interval, start, end, requested_attrs))
+                    if interval == "daily":
+                        return daily_rows
+                    if start == affected_day_start:
+                        return replay_rows
+                    return current_rows
+
+                with (
+                    mock.patch.object(client, "stats_attrs", return_value=attrs),
+                    mock.patch.object(
+                        client,
+                        "stats_rows",
+                        side_effect=fake_stats_rows,
+                    ),
+                ):
+                    month_total, day_total = client.download_usage_snapshot(
+                        datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+                    )
+
+                    self.assertEqual(current_usage, day_total)
+                    self.assertEqual(
+                        earlier_usage
+                        + affected_rx
+                        + affected_tx
+                        + current_usage,
+                        month_total,
+                    )
+                    self.assertEqual(
+                        rx_correction + tx_correction,
+                        client.usage_corrected_bytes,
+                    )
+                    self.assertEqual(1, len(client.usage_anomalies))
+                    self.assertEqual(
+                        ["daily", "hourly", "hourly"],
+                        [call[0] for call in calls],
+                    )
+
+                    calls.clear()
+                    repeated_month_total, repeated_day_total = (
+                        client.download_usage_snapshot(
+                            datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+                        )
+                    )
+
+                self.assertEqual(month_total, repeated_month_total)
+                self.assertEqual(day_total, repeated_day_total)
+                self.assertEqual(
+                    ["daily", "hourly"],
+                    [call[0] for call in calls],
+                )
+                with open(state_path, "r", encoding="utf-8") as state_file:
+                    state = json.load(state_file)
+                self.assertEqual(
+                    {
+                        "wan-rx_bytes": rx_correction,
+                        "wan-tx_bytes": tx_correction,
+                    },
+                    state["days"]["2026-07-23"]["corrections"],
+                )
 
     def test_stats_rate_limits_use_unifi_provider_capabilities(self):
         client = self.guard.UdmClient()

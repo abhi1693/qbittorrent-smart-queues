@@ -72,7 +72,17 @@ capability reported by UniFi, plus the configured safety multiplier, are
 treated as counter discontinuities rather than traffic. The invalid field is
 replaced with the larger adjacent valid hourly value; other WAN fields in the
 same bucket remain counted. The subtracted correction is persisted by local
-date so a later UniFi daily rollup cannot restore the bad counter value.
+date so a later UniFi daily rollup cannot restore the bad counter value. If a
+newly enabled counter makes an already completed daily rollup physically
+impossible, the controller replays that day's retained hourly report once and
+merges the new field correction into the existing state. If the hourly data is
+unavailable or inconclusive, it keeps the raw daily value so quota enforcement
+remains conservative.
+
+Set `UDM_INCLUDE_UPLOAD=true` to make the monthly and daily guardrails count
+download plus upload usage. The legacy quota variable names retain
+`DOWNLOAD` for compatibility, but their byte budgets apply to the combined
+total when upload counting is enabled.
 
 The optional backup-internet guard stops every torrent before queue selection
 when UniFi has failed over to a backup WAN. It reads configured WAN roles from
@@ -106,6 +116,7 @@ after router/VPN/protocol overhead.
 | `UDM_USER`, `UDM_PASSWORD` | unset | Login authentication fallback. |
 | `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
 | `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
+| `UDM_INCLUDE_UPLOAD` | `false` | Include WAN upload bytes in the monthly and daily quota guardrails. |
 | `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
 | `UDM_STATS_TIMEZONE` | unset | Optional IANA timezone override for UniFi usage periods. When unset, the controller discovers the timezone from UniFi `stat/sysinfo`. |
 | `UDM_STATS_RATE_LIMIT_MULTIPLIER` | `1.25` | Safety allowance above UniFi's WAN provider capability before an hourly field is classified as an impossible counter discontinuity. |

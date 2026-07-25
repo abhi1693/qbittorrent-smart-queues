@@ -58,11 +58,12 @@ class BackupInternetGuardTests(unittest.TestCase):
             "active_uplink": "eth7",
         }
 
-    def run_guard(self, udm_client, client):
+    def run_guard(self, udm_client, client, env_overrides=None):
         env = {
             "QBT_DECISION_LOGS_ENABLED": "false",
             "UDM_BACKUP_INTERNET_STOP_ENABLED": "true",
         }
+        env.update(env_overrides or {})
         with mock.patch.dict("os.environ", env, clear=True), \
                 mock.patch.object(self.guard, "UdmClient", return_value=udm_client), \
                 mock.patch.object(self.guard, "reachable_qbt_clients", return_value=[client]), \
@@ -150,6 +151,34 @@ class BackupInternetGuardTests(unittest.TestCase):
         self.assertEqual(0, client.stop_all_calls)
         thermal_state.assert_called_once()
         apply_single_download.assert_called_once()
+
+    def test_quota_read_failure_stops_all_torrents_when_fail_closed(self):
+        client = FakeQbtClient()
+        primary_state = {
+            **self.backup_state,
+            "backup_active": False,
+            "active_role": "primary",
+            "active_network": "Internet 1",
+            "active_network_group": "WAN",
+            "active_interface": "wan1",
+            "active_uplink": "ppp0",
+        }
+
+        result, thermal_state, apply_single_download = self.run_guard(
+            FakeUdmClient(
+                backup_state=primary_state,
+                usage_error=self.guard.ApiError("quota stats unavailable"),
+            ),
+            client,
+            env_overrides={"UDM_FAIL_CLOSED": "true"},
+        )
+
+        self.assertEqual(1, result)
+        self.assertEqual([1], client.download_limits)
+        self.assertEqual([1], client.upload_limits)
+        self.assertEqual(1, client.stop_all_calls)
+        thermal_state.assert_not_called()
+        apply_single_download.assert_not_called()
 
     def test_state_read_failure_stops_all_torrents_by_default(self):
         client = FakeQbtClient()
