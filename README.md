@@ -200,6 +200,7 @@ Optional single-download selection tuning:
 | `QBT_NO_PROGRESS_MISSING_FINAL_PIECE_MAX_AVAILABILITY` | `1.0` | Upper availability bound for `missing-final-piece` classification. |
 | `QBT_NO_PROGRESS_CLASS_SCORE_MAX_AGE_SECONDS` | `86400` | How long the last no-progress class influences candidate scoring. |
 | `QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY` | `0` | Optional normal-mode category worker limit. When set above `0`, the selector keeps or starts up to this many active download workers for each qBittorrent category, while parked stalled torrents remain active outside the per-category worker count. |
+| `QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS` | `0` | Optional aggregate normal-mode worker cap across all categories. `0` leaves the total governed by the per-category and effective-rate limits. Parked stalled listeners remain outside this worker count. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES` | storage recovery stall samples | No-progress samples required before a non-productive running torrent is parked. qBittorrent `stalledDL`/`metaDL` torrents park immediately. |
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
@@ -350,10 +351,12 @@ controller excludes them from replacement selection and raises qBittorrent's
 active download limit enough to start replacement candidates beside them. Set
 `QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY` above `0` to run a
 normal-mode batch with that many active download workers per qBittorrent
-category. The controller tracks qBittorrent active slots separately from Smart
-Queue worker slots: `qB active download limit = useful worker slots + parked
-listener slots`. Parked listeners stay active for peer discovery but do not
-consume the limited useful download worker slots or category worker counts.
+category. `QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS` can additionally cap
+the useful worker count across all categories. The controller tracks qBittorrent
+active slots separately from Smart Queue worker slots: `qB active download
+limit = useful worker slots + parked listener slots`. Parked listeners stay
+active for peer discovery but do not consume the limited useful download worker
+slots or category worker counts.
 Internally the selector classifies every torrent into a lifecycle state:
 `candidate`, `selected-worker`, `productive`, `parked-listener`, `cooldown`,
 `retryable`, or `stale`. Worker states consume a useful download slot;

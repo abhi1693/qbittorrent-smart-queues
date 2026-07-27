@@ -201,10 +201,15 @@ def cap_aware_total_worker_limit(
     normal_worker_limit,
     download_limit,
     min_rate_bytes_per_sec,
+    max_total_active_downloads=0,
     uncapped_window_active=False,
 ):
     normal_worker_limit = max(1, int(normal_worker_limit or 1))
     max_active_per_category = max(0, int(max_active_per_category or 0))
+    max_total_active_downloads = max(
+        0,
+        int(max_total_active_downloads or 0),
+    )
     if max_active_per_category <= 0:
         requested_workers = normal_worker_limit
     else:
@@ -216,6 +221,11 @@ def cap_aware_total_worker_limit(
         requested_workers = max_active_per_category * max(1, len(active_categories))
         if uncapped_window_active:
             requested_workers = min(requested_workers, normal_worker_limit)
+    if max_total_active_downloads > 0:
+        requested_workers = min(
+            requested_workers,
+            max_total_active_downloads,
+        )
     return cap_aware_worker_limit(requested_workers, download_limit, min_rate_bytes_per_sec)
 
 
@@ -9633,6 +9643,10 @@ def apply_single_download(
         0,
         env_int("QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY", 0),
     )
+    max_total_active_downloads = max(
+        0,
+        env_int("QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS", 0),
+    )
     base_productive_rate_floor_bytes = cap_aware_productive_rate_floor(
         slow_min_rate_bytes,
         download_limit,
@@ -10481,6 +10495,7 @@ def apply_single_download(
                     normal_worker_limit,
                     download_limit,
                     slow_min_rate_bytes,
+                    max_total_active_downloads=max_total_active_downloads,
                     uncapped_window_active=uncapped_window_active,
                 )
                 category_productive_rate_floor_bytes = cap_aware_productive_rate_floor(
@@ -10547,15 +10562,24 @@ def apply_single_download(
                     client.start_hashes(selected_hashes)
 
                     batch_action = "try_category_batch" if new_worker_torrents else "keep_category_batch"
+                    total_worker_cap_description = (
+                        str(max_total_active_downloads)
+                        if max_total_active_downloads > 0
+                        else "disabled"
+                    )
                     batch_reason = (
                         f"running up to {max_active_downloads_per_category} active "
-                        "download worker(s) per category; parked stalled torrents "
-                        "do not count toward category workers"
+                        "download worker(s) per category; aggregate useful worker "
+                        f"cap {total_worker_cap_description}; parked stalled torrents "
+                        "do not count toward useful workers"
                     )
                     batch_candidate_counts = {
                         **candidate_counts,
                         "normal_category_workers": len(selected_hashes),
                         "normal_category_deferred": deferred_by_category_limit,
+                        "normal_category_max_total_active_downloads": (
+                            max_total_active_downloads
+                        ),
                         "normal_category_total_worker_limit": category_worker_limit,
                         "productive_rate_floor_bytes_per_sec": category_productive_rate_floor_bytes,
                         **category_slot_plan.as_counts(),
@@ -10589,6 +10613,7 @@ def apply_single_download(
                         f"Running {len(selected_hashes)} torrent(s) across "
                         f"{len(selected_by_category)} category/categories; "
                         f"up to {max_active_downloads_per_category} worker(s) per category; "
+                        f"aggregate useful worker cap {total_worker_cap_description}; "
                         f"{len(normal_parked_stalled_torrents)} stalled torrent(s) parked; "
                         f"qB active download limit {category_slot_plan.qbt_active_download_limit}",
                         selected=", ".join(torrent_name(torrent) for torrent in selected_batch[:5]),

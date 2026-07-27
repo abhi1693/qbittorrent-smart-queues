@@ -157,6 +157,27 @@ class TorrentLifecycleTests(unittest.TestCase):
         self.assertEqual(0, plan.parked_listener_slots)
         self.assertEqual(1, plan.qbt_active_download_limit)
 
+    def test_total_worker_limit_caps_workers_across_categories(self):
+        candidates = [
+            self.torrent(
+                hash=f"{category}-{index}",
+                category=category,
+            )
+            for category in ("tv", "movies", "other")
+            for index in range(20)
+        ]
+
+        worker_limit = self.guard.cap_aware_total_worker_limit(
+            candidates,
+            max_active_per_category=20,
+            normal_worker_limit=20,
+            download_limit=10_485_760,
+            min_rate_bytes_per_sec=65_536,
+            max_total_active_downloads=20,
+        )
+
+        self.assertEqual(20, worker_limit)
+
 
 if __name__ == "__main__":
     unittest.main()
