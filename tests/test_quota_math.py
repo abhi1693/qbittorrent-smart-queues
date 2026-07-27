@@ -44,6 +44,46 @@ class QuotaMathTests(unittest.TestCase):
         self.assertEqual(10, state["aggregate_limit"])
         self.assertEqual(10, state["smart_download_limit"])
 
+    def test_rate_state_uses_billing_cycle_and_local_day_ends(self):
+        now = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        billing_cycle_end = datetime(
+            2026,
+            8,
+            16,
+            18,
+            30,
+            tzinfo=timezone.utc,
+        )
+        local_day_end = datetime(
+            2026,
+            7,
+            20,
+            18,
+            30,
+            tzinfo=timezone.utc,
+        )
+
+        state = self.guard.quota_rate_state(
+            now,
+            usage_bytes=100,
+            day_usage_bytes=10,
+            cap_bytes=1000,
+            daily_cap_bytes=100,
+            headroom=0.5,
+            max_download_limit=1000,
+            billing_cycle_end=billing_cycle_end,
+            day_end=local_day_end,
+        )
+
+        self.assertEqual(
+            int((billing_cycle_end - now).total_seconds()),
+            state["month_seconds_remaining"],
+        )
+        self.assertEqual(
+            int((local_day_end - now).total_seconds()),
+            state["day_seconds_remaining"],
+        )
+
     def test_rate_state_can_burst_above_smoothed_quota_rate(self):
         now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
 

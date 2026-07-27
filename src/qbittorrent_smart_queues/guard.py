@@ -986,7 +986,45 @@ def utc_day_end(now):
     return utc_day_start(now) + timedelta(days=1) - timedelta(seconds=1)
 
 
-def local_calendar_starts(now, local_timezone):
+def billing_cycle_day():
+    day = env_int("UDM_BILLING_CYCLE_DAY", 1)
+    if not 1 <= day <= 31:
+        raise ValueError("UDM_BILLING_CYCLE_DAY must be between 1 and 31")
+    return day
+
+
+def local_billing_cycle_window(now, local_timezone, cycle_day):
+    if not 1 <= cycle_day <= 31:
+        raise ValueError("billing cycle day must be between 1 and 31")
+
+    local_now = now.astimezone(local_timezone)
+
+    def local_anchor(year, month):
+        anchor_day = min(cycle_day, calendar.monthrange(year, month)[1])
+        return datetime(year, month, anchor_day, tzinfo=local_timezone)
+
+    current_anchor = local_anchor(local_now.year, local_now.month)
+    if local_now >= current_anchor:
+        start = current_anchor
+        if local_now.month == 12:
+            end = local_anchor(local_now.year + 1, 1)
+        else:
+            end = local_anchor(local_now.year, local_now.month + 1)
+    else:
+        end = current_anchor
+        if local_now.month == 1:
+            start = local_anchor(local_now.year - 1, 12)
+        else:
+            start = local_anchor(local_now.year, local_now.month - 1)
+
+    return (
+        start.astimezone(timezone.utc),
+        end.astimezone(timezone.utc),
+        (end.date() - start.date()).days,
+    )
+
+
+def local_calendar_starts(now, local_timezone, cycle_day=1):
     local_now = now.astimezone(local_timezone)
     local_day_start = datetime(
         local_now.year,
@@ -994,14 +1032,13 @@ def local_calendar_starts(now, local_timezone):
         local_now.day,
         tzinfo=local_timezone,
     )
-    local_month_start = datetime(
-        local_now.year,
-        local_now.month,
-        1,
-        tzinfo=local_timezone,
+    local_cycle_start, _, _ = local_billing_cycle_window(
+        now,
+        local_timezone,
+        cycle_day,
     )
     return (
-        local_month_start.astimezone(timezone.utc),
+        local_cycle_start,
         local_day_start.astimezone(timezone.utc),
         local_now.date().isoformat(),
     )
@@ -3020,6 +3057,11 @@ class UdmClient:
         self.stats_timezone_name = ""
         self.stats_timezone_info = None
         self.stats_timezone_source = ""
+        self.billing_cycle_day = 1
+        self.billing_cycle_start = None
+        self.billing_cycle_end = None
+        self.billing_cycle_days = 0
+        self.local_day_end = None
         self.usage_scope = "all"
         self.usage_network_groups = []
         self.usage_anomalies = []
@@ -3489,10 +3531,31 @@ class UdmClient:
         self.usage_anomalies = []
         self.usage_corrected_bytes = 0
         local_timezone = self.resolve_stats_timezone()
+        self.billing_cycle_day = billing_cycle_day()
+        (
+            self.billing_cycle_start,
+            self.billing_cycle_end,
+            self.billing_cycle_days,
+        ) = local_billing_cycle_window(
+            now,
+            local_timezone,
+            self.billing_cycle_day,
+        )
         month_start, today_start, local_day = local_calendar_starts(
             now,
             local_timezone,
+            self.billing_cycle_day,
         )
+        local_now = now.astimezone(local_timezone)
+        self.local_day_end = (
+            datetime(
+                local_now.year,
+                local_now.month,
+                local_now.day,
+                tzinfo=local_timezone,
+            )
+            + timedelta(days=1)
+        ).astimezone(timezone.utc)
         interval = os.environ.get("UDM_STATS_INTERVAL", "split-daily-hourly").strip()
         attrs = self.stats_attrs()
 
@@ -4326,18 +4389,24 @@ def quota_rate_state(
     burst_min_monthly_remaining_fraction=0.0,
     burst_min_daily_remaining_fraction=0.0,
     uncapped_downloads_active=False,
+    billing_cycle_end=None,
+    day_end=None,
 ):
     if usage_bytes >= cap_bytes:
         return {"stop_reason": "monthly UDM quota guardrail reached"}
     if day_usage_bytes >= daily_cap_bytes:
         return {"stop_reason": "daily UDM quota guardrail reached"}
 
-    day_end = utc_day_end(now)
+    day_end = day_end or utc_day_end(now)
     day_seconds_remaining = max(1, int((day_end - now).total_seconds()))
     daily_remaining_bytes = daily_cap_bytes - day_usage_bytes
 
-    _, month_end = utc_month_window(now)
-    month_seconds_remaining = max(1, int((month_end - now).total_seconds()))
+    if billing_cycle_end is None:
+        _, billing_cycle_end = utc_month_window(now)
+    month_seconds_remaining = max(
+        1,
+        int((billing_cycle_end - now).total_seconds()),
+    )
     monthly_remaining_bytes = cap_bytes - usage_bytes
     monthly_limit = math.floor((monthly_remaining_bytes / month_seconds_remaining) * headroom)
     daily_limit = math.floor((daily_remaining_bytes / day_seconds_remaining) * headroom)
@@ -4808,6 +4877,32 @@ def udm_decision_summary(
             udm_client,
             "stats_timezone_source",
             "",
+        )
+        summary["billing_cycle_day"] = getattr(
+            udm_client,
+            "billing_cycle_day",
+            1,
+        )
+        billing_cycle_start = getattr(
+            udm_client,
+            "billing_cycle_start",
+            None,
+        )
+        billing_cycle_end = getattr(
+            udm_client,
+            "billing_cycle_end",
+            None,
+        )
+        summary["billing_cycle_start"] = (
+            format_utc(billing_cycle_start) if billing_cycle_start else None
+        )
+        summary["billing_cycle_end"] = (
+            format_utc(billing_cycle_end) if billing_cycle_end else None
+        )
+        summary["billing_cycle_days"] = getattr(
+            udm_client,
+            "billing_cycle_days",
+            0,
         )
         summary["usage_scope"] = getattr(udm_client, "usage_scope", "all")
         summary["usage_network_groups"] = getattr(
@@ -11522,8 +11617,21 @@ def run_once():
         "UDM_MONTHLY_DOWNLOAD_GUARDRAIL_BYTES",
         math.floor(monthly_quota * cap_fraction),
     )
-    days_in_month = calendar.monthrange(now.year, now.month)[1]
-    daily_cap_bytes = max(1, math.floor(cap_bytes / days_in_month))
+    configured_billing_cycle_day = billing_cycle_day()
+    (
+        billing_cycle_start,
+        billing_cycle_end,
+        days_in_billing_cycle,
+    ) = local_billing_cycle_window(
+        now,
+        timezone.utc,
+        configured_billing_cycle_day,
+    )
+    local_day_end = utc_day_start(now) + timedelta(days=1)
+    daily_cap_bytes = max(
+        1,
+        math.floor(cap_bytes / days_in_billing_cycle),
+    )
     headroom = env_float("QBT_RATE_HEADROOM_FRACTION", 0.95)
     max_download_limit = env_int("QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC", 10_485_760)
     fallback_download_limit = env_int(
@@ -11632,6 +11740,10 @@ def run_once():
                 "monthly_usage_bytes": 0,
                 "monthly_guardrail_bytes": monthly_quota,
                 "monthly_remaining_bytes": monthly_quota,
+                "billing_cycle_day": configured_billing_cycle_day,
+                "billing_cycle_start": format_utc(billing_cycle_start),
+                "billing_cycle_end": format_utc(billing_cycle_end),
+                "days_in_billing_cycle": days_in_billing_cycle,
                 "quota_source": "fallback",
                 "uncapped_download_window": uncapped_window,
                 "uncapped_download_window_active": uncapped_window["active"],
@@ -11670,12 +11782,14 @@ def run_once():
 
     stats_timezone_info = getattr(udm_client, "stats_timezone_info", None)
     if stats_timezone_info is not None:
-        billing_now = now.astimezone(stats_timezone_info)
-        days_in_month = calendar.monthrange(
-            billing_now.year,
-            billing_now.month,
-        )[1]
-        daily_cap_bytes = max(1, math.floor(cap_bytes / days_in_month))
+        billing_cycle_start = udm_client.billing_cycle_start
+        billing_cycle_end = udm_client.billing_cycle_end
+        days_in_billing_cycle = udm_client.billing_cycle_days
+        local_day_end = udm_client.local_day_end
+        daily_cap_bytes = max(
+            1,
+            math.floor(cap_bytes / days_in_billing_cycle),
+        )
 
     usage_percent = (usage_bytes / cap_bytes) * 100 if cap_bytes else 0
     day_usage_percent = (day_usage_bytes / daily_cap_bytes) * 100 if daily_cap_bytes else 0
@@ -11687,7 +11801,8 @@ def run_once():
     log_debug(
         "UDM day-to-date WAN download usage: "
         f"{human_size(day_usage_bytes)} of {human_size(daily_cap_bytes)} daily guardrail "
-        f"({day_usage_percent:.2f}%; {human_size(cap_bytes)} / {days_in_month} days)"
+        f"({day_usage_percent:.2f}%; {human_size(cap_bytes)} / "
+        f"{days_in_billing_cycle} billing-cycle days)"
     )
 
     clients = reachable_qbt_clients()
@@ -11703,6 +11818,10 @@ def run_once():
                 "day_usage_bytes": day_usage_bytes,
                 "daily_guardrail_bytes": daily_cap_bytes,
                 "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
+                "billing_cycle_day": configured_billing_cycle_day,
+                "billing_cycle_start": format_utc(billing_cycle_start),
+                "billing_cycle_end": format_utc(billing_cycle_end),
+                "days_in_billing_cycle": days_in_billing_cycle,
                 "uncapped_download_window": uncapped_window,
                 "uncapped_download_window_active": uncapped_window["active"],
             },
@@ -11724,7 +11843,10 @@ def run_once():
             "day_usage_bytes": day_usage_bytes,
             "daily_guardrail_bytes": daily_cap_bytes,
             "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
-            "days_in_month": days_in_month,
+            "billing_cycle_day": configured_billing_cycle_day,
+            "billing_cycle_start": format_utc(billing_cycle_start),
+            "billing_cycle_end": format_utc(billing_cycle_end),
+            "days_in_billing_cycle": days_in_billing_cycle,
             "rate_headroom_fraction": headroom,
             "uncapped_download_window": uncapped_window,
             "uncapped_download_window_active": uncapped_window["active"],
@@ -11760,6 +11882,8 @@ def run_once():
         quota_burst_min_monthly_remaining_fraction,
         quota_burst_min_daily_remaining_fraction,
         uncapped_window["active"],
+        billing_cycle_end,
+        local_day_end,
     )
     base_decision_context["budget"].update({
         "monthly_limit_bytes_per_sec": quota_state.get("monthly_limit"),

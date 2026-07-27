@@ -63,21 +63,23 @@ Quota control from UniFi Network / UDM is optional. When quota data is
 unavailable and `UDM_FAIL_CLOSED=false`, the controller uses
 `QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC`.
 
-Month and day boundaries follow UniFi's reporting timezone, discovered from
-`stat/sysinfo` unless `UDM_STATS_TIMEZONE` overrides it. In the default
-`split-daily-hourly` mode, completed local days use UniFi daily reports and the
-open local day uses hourly reports, with explicit timestamp filtering so the
-open day cannot appear in both totals. Hourly values above the WAN provider
-capability reported by UniFi, plus the configured safety multiplier, are
-treated as counter discontinuities rather than traffic. The invalid field is
-replaced with the larger adjacent valid hourly value; other WAN fields in the
-same bucket remain counted. The subtracted correction is persisted by local
-date so a later UniFi daily rollup cannot restore the bad counter value. If a
-newly enabled counter makes an already completed daily rollup physically
-impossible, the controller replays that day's retained hourly report once and
-merges the new field correction into the existing state. If the hourly data is
-unavailable or inconclusive, it keeps the raw daily value so quota enforcement
-remains conservative.
+Billing-cycle and day boundaries follow UniFi's reporting timezone, discovered
+from `stat/sysinfo` unless `UDM_STATS_TIMEZONE` overrides it.
+`UDM_BILLING_CYCLE_DAY` selects the local calendar day when each monthly quota
+cycle starts; for example, `17` covers the 17th through the 16th inclusive. In
+the default `split-daily-hourly` mode, completed local days use UniFi daily
+reports and the open local day uses hourly reports, with explicit timestamp
+filtering so the open day cannot appear in both totals. Hourly values above the
+WAN provider capability reported by UniFi, plus the configured safety
+multiplier, are treated as counter discontinuities rather than traffic. The
+invalid field is replaced with the larger adjacent valid hourly value; other
+WAN fields in the same bucket remain counted. The subtracted correction is
+persisted by local date so a later UniFi daily rollup cannot restore the bad
+counter value. If a newly enabled counter makes an already completed daily
+rollup physically impossible, the controller replays that day's retained
+hourly report once and merges the new field correction into the existing state.
+If the hourly data is unavailable or inconclusive, it keeps the raw daily value
+so quota enforcement remains conservative.
 
 Set `UDM_INCLUDE_UPLOAD=true` to make the monthly and daily guardrails count
 download plus upload usage. The legacy quota variable names retain
@@ -116,6 +118,7 @@ after router/VPN/protocol overhead.
 | `UDM_USER`, `UDM_PASSWORD` | unset | Login authentication fallback. |
 | `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
 | `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
+| `UDM_BILLING_CYCLE_DAY` | `1` | Local calendar day from `1` to `31` when the monthly quota cycle starts. Days beyond a shorter month's end are clamped to that month's final day. |
 | `UDM_INCLUDE_UPLOAD` | `false` | Include WAN upload bytes in the monthly and daily quota guardrails. |
 | `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
 | `UDM_STATS_TIMEZONE` | unset | Optional IANA timezone override for UniFi usage periods. When unset, the controller discovers the timezone from UniFi `stat/sysinfo`. |

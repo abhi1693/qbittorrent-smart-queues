@@ -110,6 +110,115 @@ class UdmParsingTests(unittest.TestCase):
         self.assertEqual(150, total)
         self.assertEqual(150, client.usage_corrected_bytes)
 
+    def test_billing_cycle_window_uses_configured_local_day(self):
+        local_timezone = self.guard.ZoneInfo("Asia/Kolkata")
+
+        before_start, before_end, before_days = (
+            self.guard.local_billing_cycle_window(
+                datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+                local_timezone,
+                17,
+            )
+        )
+        after_start, after_end, after_days = (
+            self.guard.local_billing_cycle_window(
+                datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
+                local_timezone,
+                17,
+            )
+        )
+
+        self.assertEqual(
+            datetime(2026, 6, 16, 18, 30, tzinfo=timezone.utc),
+            before_start,
+        )
+        self.assertEqual(
+            datetime(2026, 7, 16, 18, 30, tzinfo=timezone.utc),
+            before_end,
+        )
+        self.assertEqual(30, before_days)
+        self.assertEqual(before_end, after_start)
+        self.assertEqual(
+            datetime(2026, 8, 16, 18, 30, tzinfo=timezone.utc),
+            after_end,
+        )
+        self.assertEqual(31, after_days)
+
+    def test_billing_cycle_day_must_be_in_calendar_range(self):
+        for invalid_day in (0, 32):
+            with self.subTest(invalid_day=invalid_day):
+                with self.assertRaises(ValueError):
+                    self.guard.local_billing_cycle_window(
+                        datetime(2026, 7, 20, tzinfo=timezone.utc),
+                        timezone.utc,
+                        invalid_day,
+                    )
+
+    def test_usage_snapshot_starts_at_configured_billing_cycle_day(self):
+        now = datetime(2026, 7, 23, 16, 0, tzinfo=timezone.utc)
+        cycle_start = datetime(2026, 7, 16, 18, 30, tzinfo=timezone.utc)
+        local_day_start = datetime(2026, 7, 22, 18, 30, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "UDM_BILLING_CYCLE_DAY": "17",
+                    "UDM_STATS_TIMEZONE": "Asia/Kolkata",
+                    "UDM_USAGE_CORRECTION_STATE_PATH": os.path.join(
+                        state_dir,
+                        "usage-corrections.json",
+                    ),
+                },
+            ):
+                client = self.guard.UdmClient()
+                client.authenticated = True
+                client.network_rows = [
+                    {
+                        "purpose": "wan",
+                        "wan_networkgroup": "WAN",
+                        "wan_provider_capabilities": {
+                            "download_kilobits_per_second": 300000,
+                        },
+                    }
+                ]
+                calls = []
+
+                def fake_stats_rows(interval, start, end, attrs):
+                    calls.append((interval, start, end, attrs))
+                    if interval == "daily":
+                        return [
+                            {
+                                "time": int(cycle_start.timestamp() * 1000),
+                                "wan-rx_bytes": 100,
+                            }
+                        ]
+                    return [
+                        {
+                            "time": int(local_day_start.timestamp() * 1000),
+                            "wan-rx_bytes": 50,
+                        }
+                    ]
+
+                with mock.patch.object(
+                    client,
+                    "stats_rows",
+                    side_effect=fake_stats_rows,
+                ):
+                    cycle_total, day_total = client.download_usage_snapshot(now)
+
+        self.assertEqual(150, cycle_total)
+        self.assertEqual(50, day_total)
+        self.assertEqual(17, client.billing_cycle_day)
+        self.assertEqual(cycle_start, client.billing_cycle_start)
+        self.assertEqual(
+            datetime(2026, 8, 16, 18, 30, tzinfo=timezone.utc),
+            client.billing_cycle_end,
+        )
+        self.assertEqual(31, client.billing_cycle_days)
+        self.assertEqual(cycle_start, calls[0][1])
+        self.assertEqual(local_day_start, calls[0][2])
+
     def test_stats_attrs_follow_dynamic_primary_role_not_wan_name(self):
         network_rows = self.wan_network_rows()
         network_rows[0]["name"] = "Editable backup label"
