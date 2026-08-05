@@ -117,6 +117,7 @@ TORRENT_LIFECYCLE_PARKED_LISTENER = "parked-listener"
 TORRENT_LIFECYCLE_COOLDOWN = "cooldown"
 TORRENT_LIFECYCLE_RETRYABLE = "retryable"
 TORRENT_LIFECYCLE_STALE = "stale"
+TORRENT_LIFECYCLE_MANUAL_OVERRIDE = "manual-override"
 STOPPED_TORRENT_SCORE_PENALTY = -35.0
 MANUAL_BLACKLIST_TAG = "blacklist"
 MANUAL_BLACKLIST_FAILED_TAG = "blacklist-failed"
@@ -6660,7 +6661,7 @@ def maintain_stale_stalled_torrents(client, torrents, health_store, now):
 
     running_hashes = [
         torrent_hash(torrent) for torrent, _ in stale_torrents
-        if is_running_torrent(torrent)
+        if is_running_torrent(torrent) and not is_force_started_torrent(torrent)
     ]
     if stop_running and running_hashes:
         client.stop_hashes(running_hashes)
@@ -6736,6 +6737,45 @@ def single_download_reject_reason(torrent, min_progress, max_remaining_bytes, ca
 def is_stopped_torrent(torrent):
     state = torrent_state(torrent).lower()
     return state.startswith("stopped") or state.startswith("paused")
+
+
+def is_force_started_torrent(torrent):
+    return torrent_state(torrent).lower().startswith("forced")
+
+
+def force_started_torrents(torrents):
+    return [
+        torrent for torrent in torrents or []
+        if torrent_hash(torrent) and is_force_started_torrent(torrent)
+    ]
+
+
+def queue_managed_stop_hashes(torrents, protected_hashes=None):
+    protected_hashes = set(protected_hashes or [])
+    return [
+        torrent_hash(torrent) for torrent in torrents or []
+        if (
+            torrent_hash(torrent)
+            and torrent_hash(torrent) not in protected_hashes
+            and not is_force_started_torrent(torrent)
+        )
+    ]
+
+
+def stop_queue_managed_torrents(client, torrents=None, protected_hashes=None):
+    if torrents is None:
+        try:
+            torrents = single_download_torrents(client)
+        except ApiError as exc:
+            log_warning(
+                "Skipping queue-managed stop because torrent state could not be "
+                f"inspected safely: {exc}",
+            )
+            return []
+    stop_hashes = queue_managed_stop_hashes(torrents, protected_hashes)
+    if stop_hashes:
+        client.stop_hashes(stop_hashes)
+    return stop_hashes
 
 
 def is_stalled_torrent(torrent):
@@ -6816,6 +6856,14 @@ def torrent_lifecycle(
 ):
     item_hash = torrent_hash(torrent)
     active_cooldown_tags = active_cooldown_tags or []
+    if is_force_started_torrent(torrent):
+        return TorrentLifecycle(
+            TORRENT_LIFECYCLE_MANUAL_OVERRIDE,
+            reason="force-started in qBittorrent",
+            listener_slot=is_running_torrent(torrent),
+            selectable=False,
+            retryable=False,
+        )
     if (
         health_store
         and now is not None
@@ -8561,6 +8609,7 @@ class SmartQueuePolicyObservation:
 class SmartQueuePolicyClassification:
     eligible_torrents: list
     metadata_bootstrap_torrents: list
+    manual_override_torrents: list
     rejected_counts: Counter
     tracker_health_observed: int
 
@@ -8583,6 +8632,8 @@ class SmartQueuePolicyFilterResult:
 
 @dataclass(frozen=True)
 class SmartQueuePolicyScoreResult:
+    manual_override_torrents: list
+    manual_override_hashes: set
     watch_priority_candidates: list
     priority_candidates: list
     storage_recovery_parked_torrents: list
@@ -8739,7 +8790,12 @@ class SmartQueuePolicyEngine:
         rejected_counts = Counter()
         eligible_torrents = []
         metadata_bootstrap_torrents = []
+        manual_override_torrents = []
         for torrent in observation.torrents:
+            if is_force_started_torrent(torrent):
+                rejected_counts["manual_force_started"] += 1
+                manual_override_torrents.append(torrent)
+                continue
             reject_reason = single_download_reject_reason(
                 torrent,
                 self.min_progress,
@@ -8764,6 +8820,7 @@ class SmartQueuePolicyEngine:
         return SmartQueuePolicyClassification(
             eligible_torrents=eligible_torrents,
             metadata_bootstrap_torrents=metadata_bootstrap_torrents,
+            manual_override_torrents=manual_override_torrents,
             rejected_counts=rejected_counts,
             tracker_health_observed=tracker_health_observed,
         )
@@ -8942,6 +8999,12 @@ class SmartQueuePolicyEngine:
 
     def score(self, observation, classification, filters):
         rejected_counts = classification.rejected_counts
+        manual_override_torrents = list(classification.manual_override_torrents)
+        manual_override_hashes = {
+            torrent_hash(torrent)
+            for torrent in manual_override_torrents
+            if torrent_hash(torrent)
+        }
         watch_priority_candidates = [
             torrent for torrent in filters.available_candidates
             if torrent_hash(torrent) in observation.tv_order_state.get("watch_priorities", {})
@@ -9105,6 +9168,8 @@ class SmartQueuePolicyEngine:
             productive_candidates.append(torrent)
 
         return SmartQueuePolicyScoreResult(
+            manual_override_torrents=manual_override_torrents,
+            manual_override_hashes=manual_override_hashes,
             watch_priority_candidates=watch_priority_candidates,
             priority_candidates=priority_candidates,
             storage_recovery_parked_torrents=storage_recovery_parked_torrents,
@@ -9135,6 +9200,8 @@ class SmartQueuePolicyEngine:
         return SmartQueuePolicyAllocation(slot_plan=slot_plan)
 
     def act(self, observation, filters, scoring):
+        if scoring.manual_override_torrents:
+            return SmartQueuePolicyActionPlan("keep_manual_override")
         if observation.storage_constrained_mode and scoring.selection_candidates:
             return SmartQueuePolicyActionPlan("storage_recovery_batch")
         if observation.storage_constrained_mode and scoring.storage_recovery_parked_torrents:
@@ -9153,11 +9220,16 @@ class SmartQueuePolicyEngine:
         rejected_counts = classification.rejected_counts
         candidate_counts = {
             "total": len(observation.torrents),
-            "eligible": len(filters.all_candidates) + len(classification.metadata_bootstrap_torrents),
+            "eligible": (
+                len(filters.all_candidates)
+                + len(classification.metadata_bootstrap_torrents)
+                + len(classification.manual_override_torrents)
+            ),
             "after_storage": len(filters.candidates),
             "metadata_unknown": len(classification.metadata_bootstrap_torrents),
             "metadata_bootstrap_available": len(filters.metadata_bootstrap_candidates),
             "metadata_bootstrap_cooldown": filters.metadata_bootstrap_cooldown_count,
+            "manual_force_started": len(classification.manual_override_torrents),
             "tv_queue_order_blocked": filters.tv_order_blocked_count,
             "available": len(filters.available_candidates),
             "selection_pool": len(scoring.selection_candidates),
@@ -9811,7 +9883,7 @@ def apply_single_download(
 
         while True:
             if max_attempts > 0 and attempt >= max_attempts:
-                client.stop_all()
+                stop_queue_managed_torrents(client)
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
@@ -9828,7 +9900,7 @@ def apply_single_download(
                 )
                 break
             if time.monotonic() >= deadline:
-                client.stop_all()
+                stop_queue_managed_torrents(client)
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
@@ -9898,6 +9970,42 @@ def apply_single_download(
                     succeeded=manual_blacklist_result["succeeded"],
                     failed=manual_blacklist_result["failed"],
                     no_arr_match=manual_blacklist_result["no_arr_match"],
+                )
+                break
+            manual_override_torrents = force_started_torrents(torrents)
+            if manual_override_torrents:
+                manual_override_hashes = {
+                    torrent_hash(torrent)
+                    for torrent in manual_override_torrents
+                    if torrent_hash(torrent)
+                }
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="keep_manual_override",
+                    reason="force-started torrent(s) are treated as manual operator action",
+                    selected_torrent=torrent_decision_summary(manual_override_torrents[0]),
+                    selected_torrents=[
+                        torrent_decision_summary(torrent)
+                        for torrent in manual_override_torrents[:5]
+                    ],
+                    rejected_counts={
+                        "manual_force_started": len(manual_override_torrents),
+                    },
+                    candidate_counts={
+                        "total": len(torrents),
+                        "eligible": len(manual_override_torrents),
+                        "manual_force_started": len(manual_override_torrents),
+                    },
+                )
+                log_decision_info(
+                    "keep_manual_override",
+                    f"Leaving {len(manual_override_torrents)} force-started torrent(s) running "
+                    "because qBittorrent force start is a manual operator action",
+                    selected=", ".join(
+                        torrent_name(torrent) for torrent in manual_override_torrents[:5]
+                    ),
+                    hashes=sorted(manual_override_hashes),
                 )
                 break
             storage_constrained_mode = storage_state_is_reserve_constrained(storage_guard, storage_state)
@@ -10177,10 +10285,7 @@ def apply_single_download(
                     active_queue_limit,
                     smart_queue_slot_plan(0, len(parked_hashes)),
                 )
-                client.stop_hashes([
-                    torrent_hash(torrent) for torrent in torrents
-                    if torrent_hash(torrent) and torrent_hash(torrent) not in set(parked_hashes)
-                ])
+                stop_queue_managed_torrents(client, torrents, set(parked_hashes))
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
@@ -10224,10 +10329,7 @@ def apply_single_download(
                     active_queue_limit,
                     smart_queue_slot_plan(0, len(parked_hashes)),
                 )
-                client.stop_hashes([
-                    torrent_hash(torrent) for torrent in torrents
-                    if torrent_hash(torrent) and torrent_hash(torrent) not in set(parked_hashes)
-                ])
+                stop_queue_managed_torrents(client, torrents, set(parked_hashes))
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
@@ -10268,11 +10370,7 @@ def apply_single_download(
                 for torrent in selection_candidates:
                     health_store.record_attempt(torrent, now)
                 attempt += 1
-                stop_hashes = [
-                    torrent_hash(torrent) for torrent in torrents
-                    if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
-                ]
-                client.stop_hashes(stop_hashes)
+                stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
                 for selected in selection_candidates:
                     selected_hash = torrent_hash(selected)
                     apply_tv_episode_file_priorities(
@@ -10537,11 +10635,7 @@ def apply_single_download(
                     if new_worker_torrents:
                         attempt += 1
 
-                    stop_hashes = [
-                        torrent_hash(torrent) for torrent in torrents
-                        if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
-                    ]
-                    client.stop_hashes(stop_hashes)
+                    stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
                     for selected in selected_batch:
                         selected_hash = torrent_hash(selected)
                         apply_tv_episode_file_priorities(
@@ -10699,7 +10793,7 @@ def apply_single_download(
                             parked_after_sample.append(no_progress_torrent)
                             continue
 
-                        if selected_hash:
+                        if selected_hash and not is_force_started_torrent(no_progress_torrent):
                             client.stop_hashes([selected_hash])
                             attempted_hashes.add(selected_hash)
                         cooldown_reason = progress_classification.cooldown_reason
@@ -10816,7 +10910,8 @@ def apply_single_download(
                         f"productive torrent score {keep_score.total:.1f} by at least "
                         f"{preempt_productive_score_margin:.1f}"
                     )
-                    client.stop_hashes([keep_hash])
+                    if not is_force_started_torrent(keep):
+                        client.stop_hashes([keep_hash])
                     attempted_hashes.add(keep_hash)
                     rejected_counts["preempted_productive"] += 1
                     candidate_counts["preempted_productive"] = 1
@@ -10859,11 +10954,7 @@ def apply_single_download(
                 if keep_lease_reason:
                     candidate_counts["selection_lease_active"] = 1
                 protected_hashes = {keep_hash} | normal_parked_stalled_hashes
-                stop_hashes = [
-                    torrent_hash(torrent) for torrent in torrents
-                    if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
-                ]
-                client.stop_hashes(stop_hashes)
+                stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
                 apply_tv_episode_file_priorities(
                     client,
                     keep,
@@ -11034,7 +11125,8 @@ def apply_single_download(
                     )
                     break
 
-                client.stop_hashes([keep_hash])
+                if not is_force_started_torrent(keep_refreshed or keep):
+                    client.stop_hashes([keep_hash])
                 attempted_hashes.add(keep_hash)
                 cooldown_reason = progress_classification.cooldown_reason
                 health_store.record_failure(
@@ -11090,11 +11182,7 @@ def apply_single_download(
                 keep, keep_lease_reason = leased_worker_candidates[0]
                 keep_hash = torrent_hash(keep)
                 protected_hashes = {keep_hash} | normal_parked_stalled_hashes
-                stop_hashes = [
-                    torrent_hash(torrent) for torrent in torrents
-                    if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
-                ]
-                client.stop_hashes(stop_hashes)
+                stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
                 apply_tv_episode_file_priorities(
                     client,
                     keep,
@@ -11151,10 +11239,7 @@ def apply_single_download(
                     else:
                         terminal_stalled_candidates.append(torrent)
                 if terminal_stalled_candidates:
-                    terminal_hashes = [
-                        torrent_hash(torrent) for torrent in terminal_stalled_candidates
-                        if torrent_hash(torrent)
-                    ]
+                    terminal_hashes = queue_managed_stop_hashes(terminal_stalled_candidates)
                     client.stop_hashes(terminal_hashes)
                     for torrent in terminal_stalled_candidates:
                         classification = stalled_classifications.get(torrent_hash(torrent))
@@ -11228,10 +11313,7 @@ def apply_single_download(
                     active_queue_limit,
                     slot_plan,
                 )
-                client.stop_hashes([
-                    torrent_hash(torrent) for torrent in torrents
-                    if torrent_hash(torrent) and torrent_hash(torrent) not in normal_parked_stalled_hashes
-                ])
+                stop_queue_managed_torrents(client, torrents, normal_parked_stalled_hashes)
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
@@ -11260,7 +11342,7 @@ def apply_single_download(
             if stalled_candidates:
                 rejected_counts["stalled_zero_speed"] += len(stalled_candidates)
                 candidate_counts["stalled"] = len(stalled_candidates)
-                stalled_hashes = [torrent_hash(torrent) for torrent in stalled_candidates]
+                stalled_hashes = queue_managed_stop_hashes(stalled_candidates)
                 client.stop_hashes(stalled_hashes)
                 emit_decision_log(
                     "qbt_guard_decision",
@@ -11382,11 +11464,7 @@ def apply_single_download(
             health_store.record_attempt(selected, now)
             attempt += 1
             protected_hashes = {selected_hash} | normal_parked_stalled_hashes
-            stop_hashes = [
-                torrent_hash(torrent) for torrent in torrents
-                if torrent_hash(torrent) and torrent_hash(torrent) not in protected_hashes
-            ]
-            client.stop_hashes(stop_hashes)
+            stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
             apply_tv_episode_file_priorities(
                 client,
                 selected,
@@ -11571,7 +11649,8 @@ def apply_single_download(
                 )
                 break
 
-            client.stop_hashes([selected_hash])
+            if not is_force_started_torrent(selected_refreshed or selected):
+                client.stop_hashes([selected_hash])
             cooldown_reason = progress_classification.cooldown_reason
             health_store.record_failure(
                 selected_refreshed or selected,

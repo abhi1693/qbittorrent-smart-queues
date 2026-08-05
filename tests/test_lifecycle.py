@@ -55,6 +55,15 @@ class TorrentLifecycleTests(unittest.TestCase):
         self.assertTrue(lifecycle.worker_slot)
         self.assertFalse(lifecycle.listener_slot)
 
+    def test_force_started_torrent_is_manual_override(self):
+        lifecycle = self.guard.torrent_lifecycle(self.torrent(state="forcedDL", dlspeed=0))
+
+        self.assertEqual(self.guard.TORRENT_LIFECYCLE_MANUAL_OVERRIDE, lifecycle.state)
+        self.assertFalse(lifecycle.selectable)
+        self.assertFalse(lifecycle.retryable)
+        self.assertFalse(lifecycle.worker_slot)
+        self.assertTrue(lifecycle.listener_slot)
+
     def test_productive_torrent_uses_worker_slot(self):
         lifecycle = self.guard.torrent_lifecycle(self.torrent(state="downloading", dlspeed=65_536))
 

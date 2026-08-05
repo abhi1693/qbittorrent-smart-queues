@@ -185,6 +185,12 @@ that Arr marks with permanent corrupt media/sample-detection failures.
 
 Optional single-download selection tuning:
 
+If a torrent is force-started in qBittorrent (`forcedDL`/`forced*` state), Smart
+Queues treats that as a manual operator override. Normal queue selection stands
+down, does not start a replacement candidate, and does not stop the forced
+torrent while it remains force-started. Explicit safety stops such as quota,
+backup-internet, thermal, storage hard-stop, and shutdown hooks still apply.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QBT_SINGLE_DOWNLOAD_SELECTION_STRATEGY` | `tiered` | `tiered` keeps Arr/queue order as the primary sort key. `balanced` lets the unified score weigh queue order with health, progress, ETA, sources, availability, priority, cooldown, and storage-fit components. |

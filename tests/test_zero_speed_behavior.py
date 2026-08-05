@@ -123,6 +123,80 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
 
         self.assertTrue(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 65_536}))
 
+    def test_apply_single_download_leaves_force_started_torrent_running(self):
+        forced = {
+            "hash": "forced",
+            "name": "Human.Override.Movie.1080p",
+            "category": "movies",
+            "state": "forcedDL",
+            "dlspeed": 0,
+            "amount_left": 1000,
+            "downloaded": 100,
+            "progress": 0.5,
+            "availability": 1.0,
+            "num_seeds": 1,
+            "num_complete": 1,
+            "tags": "",
+        }
+        ready = {
+            "hash": "ready",
+            "name": "Ready.Movie.1080p",
+            "category": "movies",
+            "state": "stoppedDL",
+            "dlspeed": 0,
+            "amount_left": 1000,
+            "downloaded": 100,
+            "progress": 0.5,
+            "availability": 1.0,
+            "num_seeds": 1,
+            "num_complete": 1,
+            "tags": "",
+        }
+        client = FakeQbtClient([forced, ready])
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+            "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                    decision_context={},
+                )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        override_event = next(
+            item for item in decision_events
+            if item.get("action") == "keep_manual_override"
+        )
+
+        self.assertEqual("forced", override_event["selected_torrent"]["hash"])
+        self.assertEqual(1, override_event["rejected_counts"]["manual_force_started"])
+        self.assertEqual(1, override_event["candidate_counts"]["manual_force_started"])
+        self.assertEqual([], client.started)
+        self.assertEqual([], client.stopped)
+        self.assertEqual(0, client.stop_all_calls)
+        self.assertEqual([], client.queue_limits)
+
     def test_productive_torrents_must_meet_slow_rate_floor(self):
         env = {"QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC": "65536"}
 

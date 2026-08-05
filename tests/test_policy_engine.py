@@ -188,6 +188,21 @@ class PolicyEngineTests(unittest.TestCase):
         self.assertEqual(1, classification.rejected_counts["cooldown"])
         self.assertEqual(1, classification.rejected_counts["cooldown_no_progress"])
 
+    def test_force_started_torrent_makes_policy_stand_down(self):
+        forced = self.torrent("forced", state="forcedDL", dlspeed=0)
+        ready = self.torrent("ready")
+        result = self.engine([forced, ready]).run()
+
+        self.assertEqual("keep_manual_override", result.action_plan.action)
+        self.assertEqual(["forced"], [
+            torrent["hash"] for torrent in result.classification.manual_override_torrents
+        ])
+        self.assertEqual(["ready"], [
+            torrent["hash"] for torrent in result.scoring.selection_candidates
+        ])
+        self.assertEqual(1, result.rejected_counts["manual_force_started"])
+        self.assertEqual(1, result.candidate_counts["manual_force_started"])
+
     def test_over_cap_parked_listeners_are_not_selected_as_workers(self):
         parked = self.torrent("parked", state="stalledDL")
         deferred = self.torrent("deferred", state="stalledDL")
