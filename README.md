@@ -350,6 +350,12 @@ what the current effective download cap can support. This keeps fallback, quota,
 thermal, or burst caps from making every worker look stalled just because the
 configured static thresholds assume a higher link speed.
 
+Torrents force-started in qBittorrent (`forcedDL`/`forcedUP`) are treated as
+manual overrides. The controller excludes them from normal selection,
+stale/no-progress cooldowns, queue-managed replacement stops, and broad hard
+pause operations, leaving the human-started torrent running while stopping only
+queue-managed peers.
+
 By default, normal single-download mode now parks stalled/no-progress torrents
 instead of pausing and cooldown-tagging them. Parked torrents stay active in
 qBittorrent so they can resume immediately if a needed peer appears, while the

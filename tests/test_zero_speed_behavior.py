@@ -197,6 +197,54 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual(0, client.stop_all_calls)
         self.assertEqual([], client.queue_limits)
 
+    def test_pause_all_leaves_force_started_torrent_running(self):
+        forced = {
+            "hash": "forced",
+            "name": "Human.Override.Movie.1080p",
+            "state": "forcedDL",
+            "amount_left": 1000,
+            "progress": 0.5,
+        }
+        active = {
+            "hash": "active",
+            "name": "Queue.Managed.Movie.1080p",
+            "state": "downloading",
+            "amount_left": 1000,
+            "progress": 0.5,
+        }
+        client = FakeQbtClient([forced, active])
+        stdout = io.StringIO()
+
+        env = {"QBT_LOG_FORMAT": "json"}
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            self.guard.apply_qbt_limits(
+                [client],
+                "daily UDM quota guardrail reached",
+                True,
+                1,
+                1,
+                {"budget": {"daily_remaining_bytes": 0}},
+            )
+
+        self.assertEqual([], client.download_limits)
+        self.assertEqual([], client.upload_limits)
+        self.assertEqual(0, client.stop_all_calls)
+        self.assertEqual([["active"]], client.stopped)
+
+        records = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.strip()
+        ]
+        pause_record = next(
+            record for record in records
+            if record.get("action") == "pause_all"
+        )
+        self.assertEqual(2, pause_record["active_download_count"])
+        self.assertEqual(1, pause_record["force_started_active_count"])
+        self.assertEqual(1, pause_record["protected_force_started_count"])
+        self.assertEqual(1, pause_record["stopped_torrent_count"])
+
     def test_productive_torrents_must_meet_slow_rate_floor(self):
         env = {"QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC": "65536"}
 

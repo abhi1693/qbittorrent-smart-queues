@@ -4008,9 +4008,20 @@ def client_active_download_summary(client):
     if not isinstance(torrents, list):
         raise ApiError(f"qBittorrent torrents info has unexpected shape: {type(torrents).__name__}")
     active = [torrent for torrent in torrents if torrent_is_active_download(torrent)]
+    force_started_active = [
+        torrent for torrent in active if is_force_started_torrent(torrent)
+    ]
     return {
         "active": bool(active),
+        "active_torrents": active,
         "active_count": len(active),
+        "force_started_active_count": len(force_started_active),
+        "force_started_active_hashes": [
+            torrent_hash(torrent)
+            for torrent in force_started_active
+            if torrent_hash(torrent)
+        ],
+        "torrents": torrents,
         "total_count": len(torrents),
     }
 
@@ -4187,8 +4198,10 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
                 **idle_fields,
             )
             continue
-        client.set_download_limit(download_limit)
-        client.set_upload_limit(upload_limit)
+        force_started_hashes = set(active_summary.get("force_started_active_hashes") or [])
+        if not (pause_torrents and force_started_hashes):
+            client.set_download_limit(download_limit)
+            client.set_upload_limit(upload_limit)
         emit_decision_log(
             "qbt_guard_stop",
             **decision_base_context(context, client),
@@ -4200,7 +4213,15 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
             },
         )
         if pause_torrents:
-            client.stop_all()
+            stop_hashes = []
+            if force_started_hashes:
+                stop_hashes = stop_queue_managed_torrents(
+                    client,
+                    active_summary.get("torrents"),
+                    force_started_hashes,
+                )
+            else:
+                client.stop_all()
             message, thermal_fields = thermal_qbt_limit_message(
                 True,
                 download_limit,
@@ -4214,6 +4235,13 @@ def apply_qbt_limits(clients, reason, pause_torrents, download_limit, upload_lim
                 summary_key=summary_key,
                 text_omit_fields={"action", "reason", *thermal_fields.keys()},
                 reason=reason,
+                qbt_url=getattr(client, "base_url", ""),
+                active_download_count=active_summary["active_count"],
+                force_started_active_count=active_summary.get("force_started_active_count", 0),
+                protected_force_started_count=len(force_started_hashes),
+                stopped_torrent_count=(
+                    len(stop_hashes) if force_started_hashes else active_summary["active_count"]
+                ),
                 **thermal_fields,
             )
         else:
