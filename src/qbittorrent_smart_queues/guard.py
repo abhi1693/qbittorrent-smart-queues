@@ -10007,6 +10007,22 @@ def apply_single_download(
                     for torrent in manual_override_torrents
                     if torrent_hash(torrent)
                 }
+                tv_order_state = build_tv_order_state(
+                    torrents,
+                    tv_order_categories,
+                    sonarr_queue,
+                    jellyfin_watch,
+                )
+                for torrent in manual_override_torrents:
+                    item_hash = torrent_hash(torrent)
+                    apply_tv_episode_file_priorities(
+                        client,
+                        torrent,
+                        tv_order_categories,
+                        tv_file_priority_enabled,
+                        tv_file_priority_lookahead,
+                        tv_order_state.get("watch_priorities", {}).get(item_hash),
+                    )
                 emit_decision_log(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),

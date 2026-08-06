@@ -23,6 +23,7 @@ class FakeQbtClient:
         self.reannounced = []
         self.added_tags = []
         self.queue_limits = []
+        self.file_priority_calls = []
 
     def set_download_limit(self, limit):
         self.download_limits.append(limit)
@@ -46,6 +47,9 @@ class FakeQbtClient:
 
     def torrent_files(self, item_hash):
         return [dict(item) for item in self.files.get(item_hash, [])]
+
+    def set_file_priority(self, item_hash, file_ids, priority):
+        self.file_priority_calls.append((item_hash, list(file_ids), priority))
 
     def stop_hashes(self, hashes):
         self.stopped.append(list(hashes))
@@ -196,6 +200,82 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual([], client.stopped)
         self.assertEqual(0, client.stop_all_calls)
         self.assertEqual([], client.queue_limits)
+
+    def test_force_started_tv_torrent_still_gets_episode_file_priorities(self):
+        forced = {
+            "hash": "forced-tv",
+            "name": "Example.Show.S01.1080p",
+            "category": "tv",
+            "state": "forcedDL",
+            "dlspeed": 0,
+            "amount_left": 1000,
+            "downloaded": 100,
+            "progress": 0.5,
+            "availability": 1.0,
+            "num_seeds": 1,
+            "num_complete": 1,
+            "tags": "",
+        }
+        ready = {
+            "hash": "ready",
+            "name": "Ready.Movie.1080p",
+            "category": "movies",
+            "state": "stoppedDL",
+            "dlspeed": 0,
+            "amount_left": 1000,
+            "downloaded": 100,
+            "progress": 0.5,
+            "availability": 1.0,
+            "num_seeds": 1,
+            "num_complete": 1,
+            "tags": "",
+        }
+        files = {
+            "forced-tv": [
+                {"index": 1, "name": "Example.Show.S01E01.mkv", "priority": 1, "progress": 0.0},
+                {"index": 2, "name": "Example.Show.S01E02.mkv", "priority": 1, "progress": 0.0},
+                {"index": 3, "name": "Example.Show.S01E03.mkv", "priority": 1, "progress": 0.0},
+                {"index": 4, "name": "Example.Show.S01E04.mkv", "priority": 1, "progress": 0.0},
+            ],
+        }
+        client = FakeQbtClient([forced, ready], files=files)
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "true",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_LOOKAHEAD_EPISODES": "2",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+            "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                    decision_context={},
+                )
+
+        self.assertIn(
+            ("forced-tv", [1], self.guard.QBT_FILE_PRIORITY_MAXIMUM),
+            client.file_priority_calls,
+        )
+        self.assertIn(
+            ("forced-tv", [2, 3], self.guard.QBT_FILE_PRIORITY_HIGH),
+            client.file_priority_calls,
+        )
+        self.assertEqual([], client.started)
+        self.assertEqual([], client.stopped)
+        self.assertEqual(0, client.stop_all_calls)
 
     def test_pause_all_leaves_force_started_torrent_running(self):
         forced = {
