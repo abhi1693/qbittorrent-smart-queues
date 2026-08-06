@@ -151,6 +151,18 @@ hard per-series order. A later season or episode for the same show cannot be
 selected while an older incomplete queued item for that show remains in
 qBittorrent; priority tags and Jellyfin watch boosts do not bypass this rule.
 
+For multi-file torrents, Smart Queues can also manage qBittorrent file
+priorities without parsing filenames. The first incomplete selected media file
+in natural filename order is raised to maximum priority, the next configured
+lookahead files are raised to high priority, and later selected media files are
+returned to normal priority.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_ENABLED` | `QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED` or `true` | Manage selected media-file priorities inside eligible multi-file torrents. |
+| `QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_CATEGORIES` | `QBT_SINGLE_DOWNLOAD_CATEGORIES` or `tv,movies,anime,priority-tv,priority-movies,priority-anime` | qBittorrent categories whose selected media files should be reprioritized. |
+| `QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_LOOKAHEAD_FILES` | `QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_LOOKAHEAD_EPISODES` or `2` | Number of incomplete selected media files after the first one to raise to high priority. |
+
 Optional stale torrent maintenance:
 
 | Variable | Default | Purpose |

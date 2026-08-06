@@ -229,7 +229,7 @@ class TvOrderingTests(unittest.TestCase):
         self.assertNotIn("p-pack", state["watch_priorities"])
         self.assertNotIn("p-current", state["watch_priorities"])
 
-    def test_watch_priority_file_order_starts_at_next_episode(self):
+    def test_file_priority_order_starts_at_first_incomplete_media_file(self):
         client = FakeFilePriorityClient([
             {"index": 1, "name": "Beta.S01E01.mkv", "priority": 1, "progress": 0.0},
             {"index": 2, "name": "Beta.S01E02.mkv", "priority": 1, "progress": 0.0},
@@ -254,8 +254,8 @@ class TvOrderingTests(unittest.TestCase):
                 },
             )
 
-        self.assertIn(("season-pack", [5], self.guard.QBT_FILE_PRIORITY_HIGH), client.calls)
-        self.assertIn(("season-pack", [4], self.guard.QBT_FILE_PRIORITY_MAXIMUM), client.calls)
+        self.assertIn(("season-pack", [1], self.guard.QBT_FILE_PRIORITY_MAXIMUM), client.calls)
+        self.assertIn(("season-pack", [2, 3], self.guard.QBT_FILE_PRIORITY_HIGH), client.calls)
 
 
 if __name__ == "__main__":

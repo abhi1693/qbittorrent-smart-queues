@@ -4990,6 +4990,18 @@ def normalize_tv_sort_text(value):
     return text.strip().lower()
 
 
+def natural_media_file_sort_key(value):
+    parts = []
+    for part in re.split(r"(\d+)", normalize_tv_sort_text(value)):
+        if not part:
+            continue
+        if part.isdigit():
+            parts.append((0, int(part), len(part)))
+        else:
+            parts.append((1, part))
+    return parts
+
+
 def normalize_download_id(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
 
@@ -6008,83 +6020,48 @@ def is_media_file(file_item):
 def apply_tv_episode_file_priorities(
     client,
     torrent,
-    tv_order_categories,
+    file_priority_categories,
     enabled,
-    lookahead_episodes,
+    lookahead_files,
     watch_priority=None,
 ):
     item_hash = torrent_hash(torrent)
-    if not enabled or not item_hash or torrent_category(torrent).lower() not in tv_order_categories:
+    if not enabled or not item_hash or torrent_category(torrent).lower() not in file_priority_categories:
         return
 
     try:
         files = client.torrent_files(item_hash)
     except ApiError as exc:
         log_warning(
-            f"Failed to read qBittorrent file list for TV ordering "
+            f"Failed to read qBittorrent file list for file priority ordering "
             f"{torrent_name(torrent)}; {exc}",
         )
         return
 
-    episode_files = []
+    media_files = []
     for fallback, file_item in enumerate(files):
         if not is_media_file(file_item) or file_priority(file_item) <= 0:
             continue
-        episode_order = parse_tv_episode_order(file_path(file_item))
-        if not episode_order:
-            continue
-        episode_files.append((
-            (
-                episode_order["season"],
-                episode_order["episode"],
-                normalize_tv_sort_text(file_path(file_item)),
-            ),
+        media_files.append((
             file_index(file_item, fallback),
+            natural_media_file_sort_key(file_path(file_item)),
             file_item,
         ))
 
-    incomplete_episode_files = [
-        item for item in episode_files
+    incomplete_media_files = [
+        item for item in media_files
         if file_progress(item[2]) < 1.0
     ]
-    if not incomplete_episode_files:
+    if not incomplete_media_files:
         return
 
-    incomplete_episode_files.sort(key=lambda item: item[0])
-    ordered_episode_keys = []
-    for episode_key, _, _ in incomplete_episode_files:
-        short_key = episode_key[:2]
-        if short_key not in ordered_episode_keys:
-            ordered_episode_keys.append(short_key)
-
-    high_candidate_keys = ordered_episode_keys
-    if watch_priority:
-        watched_season = int_or_none(watch_priority.get("season"))
-        watched_episode = int_or_none(watch_priority.get("episode")) or 0
-        watch_ordered_keys = [
-            episode_key for episode_key in ordered_episode_keys
-            if episode_key[0] == watched_season and episode_key[1] > watched_episode
-        ]
-        if watch_ordered_keys:
-            high_candidate_keys = watch_ordered_keys
-            ordered_episode_keys = watch_ordered_keys + [
-                episode_key for episode_key in ordered_episode_keys
-                if episode_key not in watch_ordered_keys
-            ]
-
-    maximum_keys = set(ordered_episode_keys[:1])
-    high_keys = set(high_candidate_keys[1:1 + max(0, lookahead_episodes)])
-    maximum_ids = [
-        file_id for episode_key, file_id, _ in episode_files
-        if episode_key[:2] in maximum_keys
-    ]
-    high_ids = [
-        file_id for episode_key, file_id, _ in episode_files
-        if episode_key[:2] in high_keys
-    ]
+    incomplete_media_files.sort(key=lambda item: (item[1], item[0]))
+    ordered_file_ids = [file_id for file_id, _, _ in incomplete_media_files]
+    maximum_ids = ordered_file_ids[:1]
+    high_ids = ordered_file_ids[1:1 + max(0, lookahead_files)]
     raised_ids = set(maximum_ids + high_ids)
     normal_ids = [
-        file_id for _, file_id, file_item in episode_files
+        file_id for file_id, _, file_item in media_files
         if file_id not in raised_ids and file_priority(file_item) != QBT_FILE_PRIORITY_NORMAL
     ]
 
@@ -6095,19 +6072,10 @@ def apply_tv_episode_file_priorities(
     if maximum_ids:
         client.set_file_priority(item_hash, maximum_ids, QBT_FILE_PRIORITY_MAXIMUM)
 
-    season, episode = ordered_episode_keys[0]
-    if watch_priority:
-        watched_episode = int(watch_priority.get("episode") or 0)
-        log_debug(
-            f"Prioritized watched TV episode files: "
-            f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first "
-            f"after watched S{int(watch_priority['season']):02d}E{watched_episode:02d}"
-        )
-    else:
-        log_debug(
-            f"Prioritized TV episode files: "
-            f"{torrent_name(torrent)} S{season:02d}E{episode:02d} first"
-        )
+    log_debug(
+        f"Prioritized torrent media files: {torrent_name(torrent)} "
+        f"file {ordered_file_ids[0]} first"
+    )
 
 
 def torrent_priority_reason(torrent, priority_tags, priority_categories):
@@ -9801,13 +9769,26 @@ def apply_single_download(
     selection_strategy_name = selection_strategy()
     preempt_productive_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED", False)
     preempt_productive_score_margin = env_float("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN", 25.0)
-    tv_file_priority_enabled = env_bool("QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED", True)
-    tv_file_priority_lookahead = env_int("QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_LOOKAHEAD_EPISODES", 2)
+    file_priority_enabled = env_bool(
+        "QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_ENABLED",
+        env_bool("QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED", True),
+    )
+    file_priority_lookahead = env_int(
+        "QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_LOOKAHEAD_FILES",
+        env_int("QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_LOOKAHEAD_EPISODES", 2),
+    )
     categories = {
         item.strip()
         for item in split_lines_or_csv(os.environ.get("QBT_SINGLE_DOWNLOAD_CATEGORIES", ""))
         if item.strip()
     }
+    file_priority_categories = normalized_set(
+        split_lines_or_csv(
+            os.environ.get("QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_CATEGORIES")
+            or os.environ.get("QBT_SINGLE_DOWNLOAD_CATEGORIES")
+            or "tv,movies,anime,priority-tv,priority-movies,priority-anime"
+        )
+    )
     tv_order_categories = normalized_set(
         split_lines_or_csv(os.environ.get("QBT_SINGLE_DOWNLOAD_TV_ORDER_CATEGORIES", "tv,priority-tv"))
     )
@@ -10018,9 +9999,9 @@ def apply_single_download(
                     apply_tv_episode_file_priorities(
                         client,
                         torrent,
-                        tv_order_categories,
-                        tv_file_priority_enabled,
-                        tv_file_priority_lookahead,
+                        file_priority_categories,
+                        file_priority_enabled,
+                        file_priority_lookahead,
                         tv_order_state.get("watch_priorities", {}).get(item_hash),
                     )
                 emit_decision_log(
@@ -10420,9 +10401,9 @@ def apply_single_download(
                     apply_tv_episode_file_priorities(
                         client,
                         selected,
-                        tv_order_categories,
-                        tv_file_priority_enabled,
-                        tv_file_priority_lookahead,
+                        file_priority_categories,
+                        file_priority_enabled,
+                        file_priority_lookahead,
                         tv_order_state.get("watch_priorities", {}).get(selected_hash),
                     )
                 client.top_priority(selected_hashes)
@@ -10685,9 +10666,9 @@ def apply_single_download(
                         apply_tv_episode_file_priorities(
                             client,
                             selected,
-                            tv_order_categories,
-                            tv_file_priority_enabled,
-                            tv_file_priority_lookahead,
+                            file_priority_categories,
+                            file_priority_enabled,
+                            file_priority_lookahead,
                             tv_order_state.get("watch_priorities", {}).get(selected_hash),
                         )
                     client.top_priority(selected_hashes)
@@ -11002,9 +10983,9 @@ def apply_single_download(
                 apply_tv_episode_file_priorities(
                     client,
                     keep,
-                    tv_order_categories,
-                    tv_file_priority_enabled,
-                    tv_file_priority_lookahead,
+                    file_priority_categories,
+                    file_priority_enabled,
+                    file_priority_lookahead,
                     tv_order_state.get("watch_priorities", {}).get(keep_hash),
                 )
                 client.top_priority([keep_hash])
@@ -11230,9 +11211,9 @@ def apply_single_download(
                 apply_tv_episode_file_priorities(
                     client,
                     keep,
-                    tv_order_categories,
-                    tv_file_priority_enabled,
-                    tv_file_priority_lookahead,
+                    file_priority_categories,
+                    file_priority_enabled,
+                    file_priority_lookahead,
                     tv_order_state.get("watch_priorities", {}).get(keep_hash),
                 )
                 client.top_priority([keep_hash])
@@ -11512,9 +11493,9 @@ def apply_single_download(
             apply_tv_episode_file_priorities(
                 client,
                 selected,
-                tv_order_categories,
-                tv_file_priority_enabled,
-                tv_file_priority_lookahead,
+                file_priority_categories,
+                file_priority_enabled,
+                file_priority_lookahead,
                 tv_order_state.get("watch_priorities", {}).get(selected_hash),
             )
             client.top_priority([selected_hash])

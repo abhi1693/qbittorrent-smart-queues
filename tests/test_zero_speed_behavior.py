@@ -277,6 +277,89 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual([], client.stopped)
         self.assertEqual(0, client.stop_all_calls)
 
+    def test_force_started_anime_torrent_gets_file_order_priorities(self):
+        forced = {
+            "hash": "forced-anime",
+            "name": "[JySzE] Naruto Shippuden [Dual Audio] [Complete] [Extras] [x264] [v2]",
+            "category": "anime",
+            "state": "forcedDL",
+            "dlspeed": 0,
+            "amount_left": 1000,
+            "downloaded": 100,
+            "progress": 0.5,
+            "availability": 1.0,
+            "num_seeds": 1,
+            "num_complete": 1,
+            "tags": "",
+        }
+        files = {
+            "forced-anime": [
+                {
+                    "index": 0,
+                    "name": "[JySzE] Naruto Shippuden - 473 [v2].mkv",
+                    "priority": 1,
+                    "progress": 0.01,
+                },
+                {
+                    "index": 1,
+                    "name": "[JySzE] Naruto Shippuden - 002 [v2].mkv",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+                {
+                    "index": 2,
+                    "name": "[JySzE] Naruto Shippuden - 003 [v2].mkv",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+                {
+                    "index": 3,
+                    "name": "[JySzE] Naruto Shippuden - 004 [v2].mkv",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+            ],
+        }
+        client = FakeQbtClient([forced], files=files)
+        env = {
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+            "QBT_SINGLE_DOWNLOAD_CATEGORIES": "tv,movies,anime,priority-tv,priority-movies,priority-anime",
+            "QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_ENABLED": "true",
+            "QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_LOOKAHEAD_FILES": "2",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+            "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1000,
+                    download_limit=1024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                    decision_context={},
+                )
+
+        self.assertIn(
+            ("forced-anime", [1], self.guard.QBT_FILE_PRIORITY_MAXIMUM),
+            client.file_priority_calls,
+        )
+        self.assertIn(
+            ("forced-anime", [2, 3], self.guard.QBT_FILE_PRIORITY_HIGH),
+            client.file_priority_calls,
+        )
+        self.assertEqual([], client.started)
+        self.assertEqual([], client.stopped)
+        self.assertEqual(0, client.stop_all_calls)
+
     def test_pause_all_leaves_force_started_torrent_running(self):
         forced = {
             "hash": "forced",
