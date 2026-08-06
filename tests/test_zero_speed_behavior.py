@@ -295,6 +295,12 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         files = {
             "forced-anime": [
                 {
+                    "index": 500,
+                    "name": "Extras/Creditless Endings/Ending 01.mkv",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+                {
                     "index": 0,
                     "name": "[JySzE] Naruto Shippuden - 473 [v2].mkv",
                     "priority": 1,

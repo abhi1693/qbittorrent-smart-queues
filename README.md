@@ -155,7 +155,8 @@ For multi-file torrents, Smart Queues can also manage qBittorrent file
 priorities without parsing filenames. The first incomplete selected media file
 in natural filename order is raised to maximum priority, the next configured
 lookahead files are raised to high priority, and later selected media files are
-returned to normal priority.
+returned to normal priority. Secondary media paths such as extras, samples, and
+trailers are sorted behind primary media files.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

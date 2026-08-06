@@ -47,6 +47,22 @@ MEDIA_FILE_EXTENSIONS = {
     ".webm",
     ".wmv",
 }
+SECONDARY_MEDIA_PATH_MARKERS = {
+    "behind the scenes",
+    "creditless endings",
+    "creditless openings",
+    "deleted scenes",
+    "extra",
+    "extras",
+    "featurette",
+    "featurettes",
+    "interview",
+    "interviews",
+    "sample",
+    "samples",
+    "trailer",
+    "trailers",
+}
 QBT_FILE_PRIORITY_NORMAL = 1
 QBT_FILE_PRIORITY_HIGH = 6
 QBT_FILE_PRIORITY_MAXIMUM = 7
@@ -5002,6 +5018,20 @@ def natural_media_file_sort_key(value):
     return parts
 
 
+def media_file_sort_group(value):
+    normalized_path = normalize_tv_sort_text(value)
+    path_parts = {
+        normalize_tv_sort_text(part)
+        for part in re.split(r"[\\/]", str(value or ""))
+        if part.strip()
+    }
+    if path_parts & SECONDARY_MEDIA_PATH_MARKERS:
+        return 1
+    if any(marker in normalized_path for marker in SECONDARY_MEDIA_PATH_MARKERS):
+        return 1
+    return 0
+
+
 def normalize_download_id(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
 
@@ -6043,6 +6073,7 @@ def apply_tv_episode_file_priorities(
         if not is_media_file(file_item) or file_priority(file_item) <= 0:
             continue
         media_files.append((
+            media_file_sort_group(file_path(file_item)),
             file_index(file_item, fallback),
             natural_media_file_sort_key(file_path(file_item)),
             file_item,
@@ -6050,18 +6081,18 @@ def apply_tv_episode_file_priorities(
 
     incomplete_media_files = [
         item for item in media_files
-        if file_progress(item[2]) < 1.0
+        if file_progress(item[3]) < 1.0
     ]
     if not incomplete_media_files:
         return
 
-    incomplete_media_files.sort(key=lambda item: (item[1], item[0]))
-    ordered_file_ids = [file_id for file_id, _, _ in incomplete_media_files]
+    incomplete_media_files.sort(key=lambda item: (item[0], item[2], item[1]))
+    ordered_file_ids = [file_id for _, file_id, _, _ in incomplete_media_files]
     maximum_ids = ordered_file_ids[:1]
     high_ids = ordered_file_ids[1:1 + max(0, lookahead_files)]
     raised_ids = set(maximum_ids + high_ids)
     normal_ids = [
-        file_id for file_id, _, file_item in media_files
+        file_id for _, file_id, _, file_item in media_files
         if file_id not in raised_ids and file_priority(file_item) != QBT_FILE_PRIORITY_NORMAL
     ]
 
