@@ -296,31 +296,31 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             "forced-anime": [
                 {
                     "index": 500,
-                    "name": "Extras/Creditless Endings/Ending 01.mkv",
+                    "name": "[JySzE] Naruto Shippuden [Dual Audio] [Complete] [Extras] [x264] [v2]/Extras/Creditless Endings/Ending 01.mkv",
                     "priority": 1,
                     "progress": 0.0,
                 },
                 {
                     "index": 0,
-                    "name": "[JySzE] Naruto Shippuden - 473 [v2].mkv",
+                    "name": "[JySzE] Naruto Shippuden [Dual Audio] [Complete] [Extras] [x264] [v2]/[JySzE] Naruto Shippuden - 473 [v2].mkv",
                     "priority": 1,
                     "progress": 0.01,
                 },
                 {
                     "index": 1,
-                    "name": "[JySzE] Naruto Shippuden - 002 [v2].mkv",
+                    "name": "[JySzE] Naruto Shippuden [Dual Audio] [Complete] [Extras] [x264] [v2]/[JySzE] Naruto Shippuden - 002 [v2].mkv",
                     "priority": 1,
                     "progress": 0.0,
                 },
                 {
                     "index": 2,
-                    "name": "[JySzE] Naruto Shippuden - 003 [v2].mkv",
+                    "name": "[JySzE] Naruto Shippuden [Dual Audio] [Complete] [Extras] [x264] [v2]/[JySzE] Naruto Shippuden - 003 [v2].mkv",
                     "priority": 1,
                     "progress": 0.0,
                 },
                 {
                     "index": 3,
-                    "name": "[JySzE] Naruto Shippuden - 004 [v2].mkv",
+                    "name": "[JySzE] Naruto Shippuden [Dual Audio] [Complete] [Extras] [x264] [v2]/[JySzE] Naruto Shippuden - 004 [v2].mkv",
                     "priority": 1,
                     "progress": 0.0,
                 },

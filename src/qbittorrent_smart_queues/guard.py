@@ -5019,15 +5019,20 @@ def natural_media_file_sort_key(value):
 
 
 def media_file_sort_group(value):
-    normalized_path = normalize_tv_sort_text(value)
-    path_parts = {
+    path_parts = [
         normalize_tv_sort_text(part)
         for part in re.split(r"[\\/]", str(value or ""))
         if part.strip()
-    }
-    if path_parts & SECONDARY_MEDIA_PATH_MARKERS:
+    ]
+    if len(path_parts) > 1:
+        path_parts = path_parts[1:]
+    if set(path_parts) & SECONDARY_MEDIA_PATH_MARKERS:
         return 1
-    if any(marker in normalized_path for marker in SECONDARY_MEDIA_PATH_MARKERS):
+    if any(
+        part == marker or part.startswith(f"{marker} ")
+        for part in path_parts
+        for marker in SECONDARY_MEDIA_PATH_MARKERS
+    ):
         return 1
     return 0
 
