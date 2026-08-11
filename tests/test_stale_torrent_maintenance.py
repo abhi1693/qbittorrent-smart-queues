@@ -372,6 +372,101 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertEqual([(["deletefail"], ["Blacklist"])], client.removed_tags)
         self.assertEqual([(["deletefail"], ["blacklist-failed"])], client.added_tags)
 
+    def test_metadata_timeout_blocklists_sonarr_queue_record(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "meta123",
+            "name": "Metadata Timeout Show S01E01",
+            "state": "stoppedDL",
+            "progress": 0,
+            "amount_left": 0,
+            "category": "tv",
+        }
+        sonarr = StaticQueue({
+            "queue_id": 123,
+            "source": "sonarr",
+            "series": "metadata timeout show",
+            "season": 1,
+            "episode": 1,
+        })
+        radarr = StaticQueue(None, configs=[])
+
+        with mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
+            result = self.guard.process_metadata_timeout_torrent(
+                client,
+                torrent,
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual({"attempted": 1, "succeeded": 1, "failed": 0, "no_arr_match": 0}, result)
+        request_json.assert_called_once()
+        delete_url = request_json.call_args.args[2]
+        self.assertIn("/api/v3/queue/123?", delete_url)
+        self.assertIn("removeFromClient=true", delete_url)
+        self.assertIn("blocklist=true", delete_url)
+        self.assertIn("skipRedownload=false", delete_url)
+        self.assertEqual([], client.deleted)
+        self.assertEqual([], client.added_tags)
+
+    def test_metadata_timeout_deletes_torrent_when_no_arr_queue_record_matches(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "nometaarr",
+            "name": "Metadata Timeout Manual",
+            "state": "stoppedDL",
+            "progress": 0,
+            "amount_left": 0,
+            "category": "anime",
+        }
+        sonarr = StaticQueue(None, configs=[])
+        radarr = StaticQueue(None, configs=[])
+
+        with mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
+            result = self.guard.process_metadata_timeout_torrent(
+                client,
+                torrent,
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual({"attempted": 1, "succeeded": 1, "failed": 0, "no_arr_match": 1}, result)
+        request_json.assert_not_called()
+        self.assertEqual([(["nometaarr"], True)], client.deleted)
+        self.assertEqual([], client.added_tags)
+
+    def test_metadata_timeout_marks_failure_when_arr_delete_fails(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "metafail",
+            "name": "Metadata Timeout Failure",
+            "state": "stoppedDL",
+            "progress": 0,
+            "amount_left": 0,
+            "category": "movies",
+        }
+        sonarr = StaticQueue(None, configs=[])
+        radarr = StaticQueue(
+            {"queue_id": 88, "source": "radarr", "title": "metadata timeout failure"},
+            configs=[("radarr", "http://radarr.test", "radarr-key")],
+        )
+
+        with mock.patch.object(
+            self.guard,
+            "request_json",
+            side_effect=self.guard.ApiError("radarr unavailable"),
+        ):
+            result = self.guard.process_metadata_timeout_torrent(
+                client,
+                torrent,
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual({"attempted": 1, "succeeded": 0, "failed": 1, "no_arr_match": 0}, result)
+        self.assertEqual([], client.deleted)
+        self.assertEqual([(["metafail"], ["metadata-timeout-failed"])], client.added_tags)
+
     def test_long_stalled_torrent_is_tagged_reannounced_and_parked(self):
         now = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
         torrent = {

@@ -175,7 +175,8 @@ Optional stale torrent maintenance:
 | `QBT_STALE_TORRENT_PARK_RUNNING_ENABLED` | `true` | Stop running stale stalled torrents after tagging/reannouncing so other downloads can run. |
 | `QBT_STALE_TORRENT_REMOVE_IMPORTED_COMPLETED` | `true` | Remove completed Sonarr leftovers when every queue warning says the episode file was already imported. |
 | `QBT_STALE_TORRENT_FAIL_PERMANENT_IMPORT_FAILURES` | `true` | Remove and blocklist completed Radarr downloads with permanent corrupt/sample-detection import failures. |
-| `QBT_STALE_TORRENT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls. |
+| `QBT_STALE_TORRENT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls during stale cleanup. |
+| `QBT_METADATA_TIMEOUT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls after metadata bootstrap timeouts. |
 
 The qBittorrent tag `blacklist` is a built-in manual operator action. On each
 successful qBittorrent connection, the controller ensures the global
@@ -193,8 +194,13 @@ Stale maintenance is intentionally conservative. It does not delete incomplete
 14-day stalled torrents just because they are old; it tags, reannounces, and
 parks them so they can resume later while the selector moves on to torrents that
 can make progress. Destructive cleanup is limited to completed downloads where
-Arr confirms that the media was already imported, or completed Radarr downloads
-that Arr marks with permanent corrupt media/sample-detection failures.
+Arr confirms that the media was already imported, completed Radarr downloads
+that Arr marks with permanent corrupt media/sample-detection failures, and
+metadata bootstrap timeouts. When a metadata timeout matches a Sonarr or Radarr
+queue record, Smart Queues asks that app to remove the torrent from the client,
+blocklist the release, and allow redownload so the app can search for another
+release. If no Arr queue record matches, it deletes the torrent directly from
+qBittorrent with `deleteFiles=true`.
 
 Optional single-download selection tuning:
 
@@ -266,9 +272,12 @@ storage reserve. It temporarily opens one queue slot, applies the per-torrent
 traffic caps above, starts the stopped magnet, polls `has_metadata`, and always
 attempts to stop it before restoring its previous limits. If both targeted and
 global stop calls fail, the low traffic caps remain in place. A timeout enters
-the existing metadata cooldown so unreachable magnets do not monopolize every
-pass. The path is disabled automatically when torrent-fit enforcement is not
-active, when storage is already at/below reserve, or when qBittorrent file
+the existing metadata cooldown, then removes and blocklists the associated
+Sonarr/Radarr queue item so unreachable magnets do not monopolize every pass and
+the media app can grab another release. When no Sonarr/Radarr queue item
+matches, Smart Queues deletes the timed-out torrent and its files directly from
+qBittorrent. The path is disabled automatically when torrent-fit enforcement is
+not active, when storage is already at/below reserve, or when qBittorrent file
 preallocation is enabled. Disabling bootstrap with preallocation avoids
 allocating an unknown-size payload before its storage fit can be verified.
 

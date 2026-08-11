@@ -137,6 +137,7 @@ TORRENT_LIFECYCLE_MANUAL_OVERRIDE = "manual-override"
 STOPPED_TORRENT_SCORE_PENALTY = -35.0
 MANUAL_BLACKLIST_TAG = "blacklist"
 MANUAL_BLACKLIST_FAILED_TAG = "blacklist-failed"
+METADATA_TIMEOUT_FAILED_TAG = "metadata-timeout-failed"
 
 
 @dataclass(frozen=True)
@@ -6437,6 +6438,122 @@ def mark_manual_blacklist_failure(client, torrent, failure_tag):
         )
 
 
+def mark_torrent_failure_tag(client, torrent, failure_tag):
+    item_hash = torrent_hash(torrent)
+    if not item_hash:
+        return
+    try:
+        client.add_tags([item_hash], [failure_tag])
+    except ApiError as exc:
+        log_warning(
+            f"Failed to mark torrent action failure for {torrent_name(torrent)}: {exc}",
+            hash=item_hash,
+            failure_tag=failure_tag,
+        )
+
+
+def remove_and_blocklist_arr_torrent(
+    client,
+    torrent,
+    sonarr_queue,
+    radarr_queue,
+    timeout,
+    delete_files=True,
+    failure_tag=METADATA_TIMEOUT_FAILED_TAG,
+    reason="torrent action",
+):
+    item_hash = torrent_hash(torrent)
+    result = {
+        "attempted": 1 if item_hash else 0,
+        "succeeded": 0,
+        "failed": 0,
+        "no_arr_match": 0,
+    }
+    if not item_hash:
+        result["failed"] = 1
+        return result
+
+    candidates = arr_queue_candidates_for_torrent(torrent, sonarr_queue, radarr_queue)
+    deleted = False
+    matched = False
+    for source, queue, metadata in candidates:
+        queue_id = metadata.get("queue_id") if metadata else None
+        configs = queue.configs() if queue else []
+        if queue_id is None or not configs:
+            continue
+        matched = True
+        deleted = arr_delete_queue_record_from_configs(
+            configs,
+            metadata.get("source"),
+            queue_id,
+            blocklist=True,
+            timeout=timeout,
+        )
+        if deleted:
+            result["succeeded"] = 1
+            log_info(
+                f"Removed and blocklisted torrent through {source} after {reason}: "
+                f"{torrent_name(torrent)}",
+                hash=item_hash,
+                queue_id=queue_id,
+                delete_files=True,
+            )
+            break
+
+    if deleted:
+        return result
+
+    if matched:
+        result["failed"] = 1
+        mark_torrent_failure_tag(client, torrent, failure_tag)
+        log_warning(
+            f"Failed to remove and blocklist torrent through Arr after {reason}: "
+            f"{torrent_name(torrent)}",
+            hash=item_hash,
+            failure_tag=failure_tag,
+        )
+        return result
+
+    result["no_arr_match"] = 1
+    try:
+        client.delete_hashes([item_hash], delete_files)
+        result["succeeded"] = 1
+        log_info(
+            f"Deleted torrent directly after {reason} because no Sonarr/Radarr "
+            f"queue record matched: {torrent_name(torrent)}",
+            hash=item_hash,
+            delete_files=delete_files,
+        )
+    except ApiError as exc:
+        result["failed"] = 1
+        mark_torrent_failure_tag(client, torrent, failure_tag)
+        log_warning(
+            f"Failed to delete torrent directly after {reason}: "
+            f"{torrent_name(torrent)}: {exc}",
+            hash=item_hash,
+            delete_files=delete_files,
+            failure_tag=failure_tag,
+        )
+    return result
+
+
+def process_metadata_timeout_torrent(client, torrent, sonarr_queue, radarr_queue):
+    timeout = env_int(
+        "QBT_METADATA_TIMEOUT_ARR_TIMEOUT",
+        env_int("QBT_ARR_QUEUE_TIMEOUT", 10),
+    )
+    return remove_and_blocklist_arr_torrent(
+        client,
+        torrent,
+        sonarr_queue,
+        radarr_queue,
+        timeout,
+        delete_files=True,
+        failure_tag=METADATA_TIMEOUT_FAILED_TAG,
+        reason="metadata bootstrap timeout",
+    )
+
+
 def process_manual_blacklist_torrents(client, torrents=None, sonarr_queue=None, radarr_queue=None):
     if torrents is None:
         torrents = single_download_torrents(client)
@@ -10281,7 +10398,22 @@ def apply_single_download(
                         STALL_COOLDOWN_REASON_METADATA,
                         health_store=health_store,
                     )
+                    metadata_timeout_result = process_metadata_timeout_torrent(
+                        client,
+                        bootstrap_torrent,
+                        sonarr_queue,
+                        radarr_queue,
+                    )
                     bootstrap_rejected_counts["metadata_bootstrap_timeout"] = 1
+                    bootstrap_rejected_counts["metadata_timeout_blocklist_succeeded"] = (
+                        metadata_timeout_result["succeeded"]
+                    )
+                    bootstrap_rejected_counts["metadata_timeout_blocklist_failed"] = (
+                        metadata_timeout_result["failed"]
+                    )
+                    bootstrap_rejected_counts["metadata_timeout_blocklist_no_arr_match"] = (
+                        metadata_timeout_result["no_arr_match"]
+                    )
                     bootstrap_action = "bootstrap_metadata_timeout"
                 else:
                     bootstrap_rejected_counts["metadata_bootstrap_error"] = 1
