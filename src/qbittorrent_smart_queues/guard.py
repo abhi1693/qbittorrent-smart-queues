@@ -1529,6 +1529,53 @@ def request_json(opener, method, url, headers=None, body=None, timeout=30):
         raise ApiError(f"{method} {url} failed: {exc}") from exc
 
 
+class RyokanImportReconcilerClient:
+    def __init__(self, base_url, api_key, timeout=10):
+        self.base_url = str(base_url or "").rstrip("/")
+        self.api_key = str(api_key or "")
+        self.timeout = max(1, int(timeout))
+        self.opener = urllib.request.build_opener()
+
+    def reconcile(self, item_hash, expected_files):
+        if not self.base_url or not self.api_key:
+            raise ApiError("Ryokan import reconciler URL and API key are required")
+        payload, _ = request_json(
+            self.opener,
+            "POST",
+            join_url(self.base_url, "/v1/imports/reconcile"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Api-Key": self.api_key,
+            },
+            body=json.dumps({
+                "hash": item_hash,
+                "expected_files": expected_files,
+            }).encode("utf-8"),
+            timeout=self.timeout,
+        )
+        if not isinstance(payload, dict):
+            raise ApiError(
+                "Ryokan import reconciler response has unexpected shape: "
+                f"{type(payload).__name__}"
+            )
+        return payload
+
+
+def ryokan_import_reconciler_from_env():
+    base_url = os.environ.get("QBT_RYOKAN_IMPORT_RECONCILER_URL", "").strip()
+    api_key = os.environ.get("QBT_RYOKAN_IMPORT_RECONCILER_API_KEY", "").strip()
+    if not api_key:
+        api_key = os.environ.get("SONARR_ANIME_API_KEY", "").strip()
+    if not base_url or not api_key:
+        return None
+    return RyokanImportReconcilerClient(
+        base_url,
+        api_key,
+        env_int("QBT_RYOKAN_IMPORT_RECONCILER_TIMEOUT", 10),
+    )
+
+
 def response_rows(data, label, key="data"):
     if isinstance(data, dict):
         rows = data.get(key, [])
@@ -3878,6 +3925,15 @@ class QbtClient:
             self.request("POST", "/api/v2/torrents/start", form)
         except ApiError:
             self.request("POST", "/api/v2/torrents/resume", form)
+
+    def recheck_hashes(self, hashes):
+        if not hashes:
+            return
+        self.request(
+            "POST",
+            "/api/v2/torrents/recheck",
+            {"hashes": "|".join(hashes)},
+        )
 
     def stop_hashes(self, hashes):
         if not hashes:
@@ -7030,6 +7086,22 @@ def ryokan_selected_media_source_state(torrent, files, download_root):
     return state
 
 
+def ryokan_expected_media_files(torrent, files, download_root):
+    expected_files = []
+    for file_item in files or []:
+        if file_priority(file_item) <= 0 or not is_media_file(file_item):
+            continue
+        expected_files.append({
+            "source_path_candidates": download_source_path_candidates(
+                torrent,
+                file_item,
+                download_root,
+            ),
+            "size_bytes": file_size(file_item),
+        })
+    return expected_files
+
+
 def ryokan_imported_anime_source_verifies_moved(source_state):
     selected_media_count = source_state.get("selected_media_count", 0)
     return (
@@ -7041,12 +7113,13 @@ def ryokan_imported_anime_source_verifies_moved(source_state):
     )
 
 
-def process_ryokan_imported_anime_torrents(client, torrents, now=None):
+def process_ryokan_imported_anime_torrents(client, torrents, now=None, reconciler=None):
     if not env_bool("QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED", False):
         return {
             "attempted": 0,
             "succeeded": 0,
             "failed": 0,
+            "requeued": 0,
             "verification_failed": 0,
             "skipped": 0,
         }
@@ -7061,10 +7134,13 @@ def process_ryokan_imported_anime_torrents(client, torrents, now=None):
         env_bool("QBT_DELETE_FILES", True),
     )
     now = now or datetime.now(timezone.utc)
+    if reconciler is None:
+        reconciler = ryokan_import_reconciler_from_env()
     result = {
         "attempted": 0,
         "succeeded": 0,
         "failed": 0,
+        "requeued": 0,
         "verification_failed": 0,
         "skipped": 0,
     }
@@ -7098,10 +7174,80 @@ def process_ryokan_imported_anime_torrents(client, torrents, now=None):
             continue
 
         source_state = ryokan_selected_media_source_state(torrent, files, download_root)
+        if (
+            not source_state.get("download_root_available")
+            or source_state.get("selected_media_count", 0) <= 0
+            or source_state.get("unresolved_media_count", 0) > 0
+        ):
+            result["verification_failed"] += 1
+            log_warning(
+                f"Leaving completed Ryokan anime torrent in qBittorrent because "
+                f"its selected source paths could not be resolved safely: "
+                f"{torrent_name(torrent)}",
+                hash=item_hash,
+                source_state=source_state,
+            )
+            continue
+
+        expected_files = ryokan_expected_media_files(torrent, files, download_root)
+        if reconciler is None:
+            result["verification_failed"] += 1
+            log_warning(
+                f"Leaving completed Ryokan anime torrent in qBittorrent because "
+                f"the Ryokan import reconciler is not configured: {torrent_name(torrent)}",
+                hash=item_hash,
+            )
+            continue
+
+        try:
+            receipt = reconciler.reconcile(item_hash, expected_files)
+        except ApiError as exc:
+            result["verification_failed"] += 1
+            log_warning(
+                f"Leaving completed Ryokan anime torrent in qBittorrent because "
+                f"Ryokan import receipts could not be reconciled: "
+                f"{torrent_name(torrent)}: {exc}",
+                hash=item_hash,
+            )
+            continue
+
+        if receipt.get("status") == "requeued":
+            result["attempted"] += 1
+            try:
+                client.recheck_hashes([item_hash])
+                result["requeued"] += 1
+                log_warning(
+                    f"Requeued incomplete Ryokan import and requested a qBittorrent "
+                    f"recheck instead of deleting it: {torrent_name(torrent)}",
+                    hash=item_hash,
+                    receipt=receipt,
+                )
+            except ApiError as exc:
+                result["failed"] += 1
+                mark_torrent_failure_tag(client, torrent, RYOKAN_IMPORTED_ANIME_FAILED_TAG)
+                log_warning(
+                    f"Ryokan import was requeued but qBittorrent recheck failed for "
+                    f"{torrent_name(torrent)}: {exc}",
+                    hash=item_hash,
+                    failure_tag=RYOKAN_IMPORTED_ANIME_FAILED_TAG,
+                )
+            continue
+
+        if receipt.get("status") != "complete" or receipt.get("delete_allowed") is not True:
+            result["verification_failed"] += 1
+            log_warning(
+                f"Leaving completed Ryokan anime torrent in qBittorrent because "
+                f"Ryokan did not prove one distinct imported library file per "
+                f"selected source: {torrent_name(torrent)}",
+                hash=item_hash,
+                receipt=receipt,
+            )
+            continue
+
         if not ryokan_imported_anime_source_verifies_moved(source_state):
             result["verification_failed"] += 1
             log_debug(
-                f"Leaving completed Ryokan anime torrent in qBittorrent because "
+                f"Leaving receipt-complete Ryokan anime torrent in qBittorrent because "
                 f"not every selected media source file has disappeared from downloads: "
                 f"{torrent_name(torrent)}",
                 hash=item_hash,
@@ -7115,11 +7261,12 @@ def process_ryokan_imported_anime_torrents(client, torrents, now=None):
             result["succeeded"] += 1
             log_info(
                 f"Deleted completed Ryokan-imported anime torrent after source "
-                f"media files were moved out of downloads: {torrent_name(torrent)}",
+                f"and destination receipts matched: {torrent_name(torrent)}",
                 hash=item_hash,
                 delete_files=delete_files,
                 selected_media_count=source_state["selected_media_count"],
                 download_root=source_state["download_root"],
+                receipt_target_count=receipt.get("receipt_target_count"),
             )
         except ApiError as exc:
             result["failed"] += 1
@@ -10666,10 +10813,11 @@ def apply_single_download(
                     "qbt_guard_decision",
                     **decision_base_context(run_decision_context, client, storage_state),
                     action="ryokan_imported_anime_cleanup",
-                    reason="removed completed Ryokan anime leftovers before queue selection",
+                    reason="reconciled completed Ryokan anime leftovers before queue selection",
                     rejected_counts={
                         "ryokan_imported_anime_cleanup_succeeded": ryokan_cleanup_result["succeeded"],
                         "ryokan_imported_anime_cleanup_failed": ryokan_cleanup_result["failed"],
+                        "ryokan_imported_anime_cleanup_requeued": ryokan_cleanup_result["requeued"],
                         "ryokan_imported_anime_cleanup_verification_failed": ryokan_cleanup_result["verification_failed"],
                     },
                     candidate_counts={
@@ -10683,6 +10831,7 @@ def apply_single_download(
                     attempted=ryokan_cleanup_result["attempted"],
                     succeeded=ryokan_cleanup_result["succeeded"],
                     failed=ryokan_cleanup_result["failed"],
+                    requeued=ryokan_cleanup_result["requeued"],
                     verification_failed=ryokan_cleanup_result["verification_failed"],
                 )
                 break

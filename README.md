@@ -28,6 +28,19 @@ The container entrypoint is:
 python -m qbittorrent_smart_queues.guard
 ```
 
+The same image can run the Ryokan database-side reconciliation adapter:
+
+```bash
+python -m qbittorrent_smart_queues.ryokan_reconciler
+```
+
+Run that adapter in Ryokan's pod with the live database at `/data/ryokan.db`
+and the library at `/media/anime`. It requires `RYOKAN_RECONCILER_API_KEY` and
+accepts optional `RYOKAN_RECONCILER_DB_PATH`, `RYOKAN_RECONCILER_MEDIA_ROOT`,
+`RYOKAN_RECONCILER_HOST`, and `RYOKAN_RECONCILER_PORT` overrides. Its write
+scope is limited to returning an exact, already-imported hash with incomplete
+receipts to `pending`; it never changes pending, unknown, or ambiguous grabs.
+
 ## Quick Start
 
 Minimum qBittorrent-only configuration:
@@ -188,11 +201,14 @@ Optional stale torrent maintenance:
 | `QBT_ARR_IMPORT_REJECTION_VERIFY_EXISTING_FILE` | `true` | Require Sonarr/Radarr to show an existing episode or movie file before removing an already-imported or not-an-upgrade queue record. |
 | `QBT_ARR_IMPORT_REJECTION_BLOCKLIST` | `false` | Whether import-rejection cleanup asks Sonarr/Radarr to blocklist the release. The default only removes the queue item and torrent from qBittorrent. |
 | `QBT_ARR_IMPORT_REJECTION_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr verification and queue delete calls during import-rejection cleanup. |
-| `QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED` | `false` | Delete completed Ryokan anime leftovers from qBittorrent only after every selected media source file has disappeared from the downloads root. |
+| `QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED` | `false` | Reconcile completed Ryokan anime leftovers and delete them only after both source movement and Ryokan import receipts are complete. |
 | `QBT_RYOKAN_IMPORTED_ANIME_CATEGORIES` | `anime,priority-anime` | qBittorrent categories treated as Ryokan-managed anime downloads. |
 | `QBT_RYOKAN_IMPORTED_ANIME_DOWNLOAD_ROOT` | `/downloads` | Mounted download root used to verify Ryokan moved the selected media files away before deleting the qBittorrent entry. |
 | `QBT_RYOKAN_IMPORTED_ANIME_MIN_COMPLETED_SECONDS` | `1800` | Minimum age after qBittorrent completion before Ryokan imported-anime cleanup can delete the torrent entry. |
 | `QBT_RYOKAN_IMPORTED_ANIME_DELETE_FILES` | `QBT_DELETE_FILES` or `true` | qBittorrent `deleteFiles` value for Ryokan imported-anime cleanup after source media verification succeeds. |
+| `QBT_RYOKAN_IMPORT_RECONCILER_URL` | unset | Base URL of the Ryokan import reconciler. Cleanup fails closed when it is unset or unavailable. |
+| `QBT_RYOKAN_IMPORT_RECONCILER_API_KEY` | `SONARR_ANIME_API_KEY` | Shared API key sent to the import reconciler. |
+| `QBT_RYOKAN_IMPORT_RECONCILER_TIMEOUT` | `10` | Timeout in seconds for receipt verification and repair. |
 
 The qBittorrent tag `blacklist` is a built-in manual operator action. On each
 successful qBittorrent connection, the controller ensures the global
@@ -217,9 +233,13 @@ corrupt media/sample-detection failures, terminal Sonarr/Radarr import
 rejections verified against an existing library file, and metadata bootstrap
 timeouts. Ryokan imported-anime cleanup is opt-in and does not trust completion
 alone: it requires strict qBittorrent completion, the configured anime category,
-the download root to be mounted, and every selected media source file to be
-missing from that root. Partially moved season batches therefore stay in
-qBittorrent until their remaining selected media files are imported. When a
+the download root to be mounted, every selected media source file to be missing
+from that root, an exact match against Ryokan's imported-source receipts, and one
+distinct library target with the same file size per selected media file. If Ryokan marked a
+grab imported without satisfying that contract, the reconciler atomically moves
+only that grab back to `pending` and Smart Queues requests a qBittorrent recheck
+so Ryokan's normal post-processor can import the complete set. Pending, unknown,
+or ambiguous grabs fail closed without mutation. When a
 metadata timeout matches a Sonarr or Radarr queue record, Smart Queues asks that
 app to remove the torrent from the client, blocklist the release, and allow
 redownload so the app can search for another release. If no Arr queue record

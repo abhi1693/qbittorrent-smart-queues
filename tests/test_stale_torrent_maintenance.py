@@ -12,6 +12,7 @@ class FakeQbtClient:
         self.added_tags = []
         self.removed_tags = []
         self.reannounced = []
+        self.rechecked = []
         self.stopped = []
         self.files_by_hash = dict(files_by_hash or {})
 
@@ -30,6 +31,9 @@ class FakeQbtClient:
     def reannounce_hashes(self, hashes):
         self.reannounced.append(list(hashes))
 
+    def recheck_hashes(self, hashes):
+        self.rechecked.append(list(hashes))
+
     def stop_hashes(self, hashes):
         self.stopped.append(list(hashes))
 
@@ -44,6 +48,16 @@ class StaticQueue:
 
     def configs(self):
         return list(self._configs)
+
+
+class FakeRyokanReconciler:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def reconcile(self, item_hash, expected_files):
+        self.calls.append((item_hash, expected_files))
+        return dict(self.response)
 
 
 class StaleTorrentMaintenanceTests(unittest.TestCase):
@@ -409,11 +423,17 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 "category": "anime",
             }
 
+            reconciler = FakeRyokanReconciler({
+                "status": "complete",
+                "delete_allowed": True,
+                "receipt_target_count": 1,
+            })
             with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
                 result = self.guard.process_ryokan_imported_anime_torrents(
                     client,
                     [torrent],
                     now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                    reconciler=reconciler,
                 )
 
         self.assertEqual(
@@ -421,12 +441,96 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 "attempted": 1,
                 "succeeded": 1,
                 "failed": 0,
+                "requeued": 0,
                 "verification_failed": 0,
                 "skipped": 0,
             },
             result,
         )
         self.assertEqual([(["animegone"], True)], client.deleted)
+        self.assertEqual("animegone", reconciler.calls[0][0])
+        self.assertEqual(1, len(reconciler.calls[0][1]))
+        self.assertEqual(100, reconciler.calls[0][1][0]["size_bytes"])
+
+    def test_completed_ryokan_anime_torrent_is_requeued_when_receipts_are_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeQbtClient({
+                "animeincomplete": [
+                    {"name": "Batch/S01E01.mkv", "priority": 7, "progress": 1, "size": 100},
+                    {"name": "Batch/S01E02.mkv", "priority": 7, "progress": 1, "size": 200},
+                ],
+            })
+            torrent = {
+                "hash": "animeincomplete",
+                "name": "Batch",
+                "state": "stoppedUP",
+                "progress": 1,
+                "amount_left": 0,
+                "category": "anime",
+                "save_path": tmpdir,
+            }
+            reconciler = FakeRyokanReconciler({
+                "status": "requeued",
+                "delete_allowed": False,
+                "expected_count": 2,
+                "receipt_source_count": 2,
+                "distinct_target_count": 1,
+                "existing_target_count": 1,
+            })
+
+            with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
+                result = self.guard.process_ryokan_imported_anime_torrents(
+                    client,
+                    [torrent],
+                    now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                    reconciler=reconciler,
+                )
+
+        self.assertEqual(
+            {
+                "attempted": 1,
+                "succeeded": 0,
+                "failed": 0,
+                "requeued": 1,
+                "verification_failed": 0,
+                "skipped": 0,
+            },
+            result,
+        )
+        self.assertEqual([], client.deleted)
+        self.assertEqual([["animeincomplete"]], client.rechecked)
+
+    def test_completed_ryokan_anime_torrent_is_kept_when_receipts_are_not_complete(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeQbtClient({
+                "animepending": [
+                    {"name": "Show S01E01.mkv", "priority": 7, "progress": 1, "size": 100},
+                ],
+            })
+            torrent = {
+                "hash": "animepending",
+                "name": "Show S01E01",
+                "state": "stoppedUP",
+                "progress": 1,
+                "amount_left": 0,
+                "category": "anime",
+            }
+            reconciler = FakeRyokanReconciler({
+                "status": "pending",
+                "delete_allowed": False,
+            })
+
+            with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
+                result = self.guard.process_ryokan_imported_anime_torrents(
+                    client,
+                    [torrent],
+                    now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                    reconciler=reconciler,
+                )
+
+        self.assertEqual(1, result["verification_failed"])
+        self.assertEqual([], client.deleted)
+        self.assertEqual([], client.rechecked)
 
     def test_completed_ryokan_anime_batch_is_kept_when_any_selected_media_source_remains(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -450,12 +554,18 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 "category": "anime",
                 "content_path": batch_dir,
             }
+            reconciler = FakeRyokanReconciler({
+                "status": "complete",
+                "delete_allowed": True,
+                "receipt_target_count": 2,
+            })
 
             with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
                 result = self.guard.process_ryokan_imported_anime_torrents(
                     client,
                     [torrent],
                     now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                    reconciler=reconciler,
                 )
 
         self.assertEqual(
@@ -463,11 +573,54 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 "attempted": 0,
                 "succeeded": 0,
                 "failed": 0,
+                "requeued": 0,
                 "verification_failed": 1,
                 "skipped": 0,
             },
             result,
         )
+        self.assertEqual([], client.deleted)
+        self.assertEqual(1, len(reconciler.calls))
+
+    def test_false_complete_ryokan_batch_is_requeued_even_when_a_source_remains(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            batch_dir = os.path.join(tmpdir, "Batch")
+            os.mkdir(batch_dir)
+            with open(os.path.join(batch_dir, "S01E02.mkv"), "wb") as handle:
+                handle.write(b"media")
+            client = FakeQbtClient({
+                "animefalsecomplete": [
+                    {"name": "S01E01.mkv", "priority": 7, "progress": 1, "size": 100},
+                    {"name": "S01E02.mkv", "priority": 7, "progress": 1, "size": 100},
+                ],
+            })
+            torrent = {
+                "hash": "animefalsecomplete",
+                "name": "Batch",
+                "state": "stoppedUP",
+                "progress": 1,
+                "amount_left": 0,
+                "category": "anime",
+                "content_path": batch_dir,
+            }
+            reconciler = FakeRyokanReconciler({
+                "status": "requeued",
+                "delete_allowed": False,
+                "expected_count": 2,
+                "receipt_target_count": 1,
+            })
+
+            with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
+                result = self.guard.process_ryokan_imported_anime_torrents(
+                    client,
+                    [torrent],
+                    now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                    reconciler=reconciler,
+                )
+
+        self.assertEqual(1, result["attempted"])
+        self.assertEqual(1, result["requeued"])
+        self.assertEqual([["animefalsecomplete"]], client.rechecked)
         self.assertEqual([], client.deleted)
 
     def test_ryokan_cleanup_ignores_metadata_only_zero_remaining_torrent(self):
@@ -498,6 +651,7 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 "attempted": 0,
                 "succeeded": 0,
                 "failed": 0,
+                "requeued": 0,
                 "verification_failed": 0,
                 "skipped": 0,
             },
@@ -533,6 +687,7 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 "attempted": 0,
                 "succeeded": 0,
                 "failed": 0,
+                "requeued": 0,
                 "verification_failed": 0,
                 "skipped": 0,
             },
