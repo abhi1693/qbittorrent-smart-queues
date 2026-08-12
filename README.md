@@ -146,6 +146,12 @@ Optional media integrations only load when both URL(s) and an API key are set:
 | Radarr movie queue | `QBT_MOVIE_QUEUE_RADARR_URLS`, `RADARR_URLS`, `RADARR_URL` | `QBT_MOVIE_QUEUE_RADARR_API_KEY`, `RADARR_API_KEY` |
 | Jellyfin watch state | `QBT_TV_WATCH_JELLYFIN_URLS`, `JELLYFIN_URLS`, `JELLYFIN_URL` | `QBT_TV_WATCH_JELLYFIN_API_KEY`, `JELLYFIN_API_KEY` |
 
+Sonarr and Radarr queue reads are paginated so large backlogs are visible to
+ordering, cleanup, and rejection filters. `QBT_TV_QUEUE_PAGE_SIZE` controls
+Sonarr page size, `QBT_MOVIE_QUEUE_PAGE_SIZE` controls Radarr page size,
+`QBT_ARR_QUEUE_PAGE_SIZE` is the Radarr fallback, and
+`QBT_ARR_QUEUE_MAX_PAGES` defaults to `100` as a safety cap.
+
 When Sonarr TV queue metadata is available, TV torrents are constrained by a
 hard per-series order. A later season or episode for the same show cannot be
 selected while an older incomplete queued item for that show remains in
@@ -177,6 +183,11 @@ Optional stale torrent maintenance:
 | `QBT_STALE_TORRENT_FAIL_PERMANENT_IMPORT_FAILURES` | `true` | Remove and blocklist completed Radarr downloads with permanent corrupt/sample-detection import failures. |
 | `QBT_STALE_TORRENT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls during stale cleanup. |
 | `QBT_METADATA_TIMEOUT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls after metadata bootstrap timeouts. |
+| `QBT_ARR_IMPORT_REJECTION_CLEANUP_ENABLED` | `true` | Remove Sonarr/Radarr queue records with terminal import rejections, such as already-imported media or releases that are not an upgrade, before normal download selection. |
+| `QBT_ARR_IMPORT_REJECTION_FILTER_ENABLED` | `true` | Keep terminal import-rejected torrents out of Smart Queue worker selection even when cleanup is disabled, verification fails, or Arr deletion fails. |
+| `QBT_ARR_IMPORT_REJECTION_VERIFY_EXISTING_FILE` | `true` | Require Sonarr/Radarr to show an existing episode or movie file before removing an already-imported or not-an-upgrade queue record. |
+| `QBT_ARR_IMPORT_REJECTION_BLOCKLIST` | `false` | Whether import-rejection cleanup asks Sonarr/Radarr to blocklist the release. The default only removes the queue item and torrent from qBittorrent. |
+| `QBT_ARR_IMPORT_REJECTION_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr verification and queue delete calls during import-rejection cleanup. |
 
 The qBittorrent tag `blacklist` is a built-in manual operator action. On each
 successful qBittorrent connection, the controller ensures the global
@@ -195,12 +206,22 @@ Stale maintenance is intentionally conservative. It does not delete incomplete
 parks them so they can resume later while the selector moves on to torrents that
 can make progress. Destructive cleanup is limited to completed downloads where
 Arr confirms that the media was already imported, completed Radarr downloads
-that Arr marks with permanent corrupt media/sample-detection failures, and
+that Arr marks with permanent corrupt media/sample-detection failures, terminal
+Sonarr/Radarr import rejections verified against an existing library file, and
 metadata bootstrap timeouts. When a metadata timeout matches a Sonarr or Radarr
 queue record, Smart Queues asks that app to remove the torrent from the client,
 blocklist the release, and allow redownload so the app can search for another
 release. If no Arr queue record matches, it deletes the torrent directly from
 qBittorrent with `deleteFiles=true`.
+
+Import-rejection cleanup runs before normal queue selection. If Sonarr or Radarr
+marks a queued torrent as already imported or not an upgrade for the existing
+episode/movie file, Smart Queues first verifies the existing library file through
+that Arr instance, then removes the Arr queue record with
+`removeFromClient=true`, `blocklist=false`, and `skipRedownload=false` by
+default. If verification or deletion cannot be completed, the selection filter
+still rejects that torrent so Smart Queues does not assign bandwidth to a release
+Arr has already decided it cannot import.
 
 Optional single-download selection tuning:
 

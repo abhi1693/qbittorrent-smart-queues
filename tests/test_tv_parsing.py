@@ -84,6 +84,49 @@ class TvParsingTests(unittest.TestCase):
         self.assertEqual("epsilon show", queue.by_download_id["abc123"]["series"])
         self.assertEqual(2, queue.by_download_id["abc123"]["episode"])
 
+    def test_sonarr_queue_load_reads_all_pages(self):
+        queue = self.guard.SonarrQueueMetadata.__new__(self.guard.SonarrQueueMetadata)
+        queue.timeout = 10
+        queue.by_download_id = {}
+        queue.by_title = {}
+        records = [
+            {
+                "downloadId": "PAGE-1",
+                "sourceTitle": "Page.One.S01E01.1080p",
+                "series": {"title": "Page One"},
+                "episode": {"seasonNumber": 1, "episodeNumber": 1},
+            },
+            {
+                "downloadId": "PAGE-2",
+                "sourceTitle": "Page.Two.S01E02.1080p",
+                "series": {"title": "Page Two"},
+                "episode": {"seasonNumber": 1, "episodeNumber": 2},
+            },
+        ]
+
+        def fake_request_json(opener, method, url, **kwargs):
+            if "page=1" in url:
+                return {"records": [records[0]], "totalRecords": 2}, object()
+            if "page=2" in url:
+                return {"records": [records[1]], "totalRecords": 2}, object()
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"QBT_TV_QUEUE_PAGE_SIZE": "1", "QBT_ARR_QUEUE_MAX_PAGES": "5"},
+                clear=False,
+            ),
+            mock.patch.object(self.guard, "request_json", side_effect=fake_request_json) as request_json,
+        ):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                queue.load_queue("sonarr", "http://sonarr.test", "api-key")
+
+        self.assertEqual(2, request_json.call_count)
+        self.assertEqual("page one", queue.by_download_id["page1"]["series"])
+        self.assertEqual("page two", queue.by_download_id["page2"]["series"])
+
     def test_radarr_queue_load_accepts_raw_list_response(self):
         queue = self.guard.RadarrQueueMetadata.__new__(self.guard.RadarrQueueMetadata)
         queue.timeout = 10

@@ -55,6 +55,14 @@ class FakeClient:
         self.removed_tags.append((list(hashes), list(tags)))
 
 
+class StaticQueue:
+    def __init__(self, metadata_by_hash):
+        self.metadata_by_hash = metadata_by_hash
+
+    def torrent_metadata(self, torrent):
+        return self.metadata_by_hash.get(torrent.get("hash"))
+
+
 class PolicyEngineTests(unittest.TestCase):
     def setUp(self):
         self.guard = importlib.import_module("qbittorrent_smart_queues.guard")
@@ -88,6 +96,8 @@ class PolicyEngineTests(unittest.TestCase):
         storage_state=None,
         storage_constrained_mode=False,
         metadata_bootstrap_enabled=True,
+        sonarr_queue=None,
+        radarr_queue=None,
     ):
         return self.guard.SmartQueuePolicyEngine(
             client=client or FakeClient(),
@@ -102,11 +112,11 @@ class PolicyEngineTests(unittest.TestCase):
             categories=set(),
             tracker_health_max_candidates=50,
             tracker_health_min_refresh_seconds=300,
-            tv_order_categories=set(),
+            tv_order_categories={"tv"},
             movie_order_categories=set(),
-            sonarr_queue=None,
+            sonarr_queue=sonarr_queue,
             jellyfin_watch=None,
-            radarr_queue=None,
+            radarr_queue=radarr_queue,
             priority_tags={"priority"},
             priority_categories=set(),
             healthy_min_seeds=3,
@@ -503,6 +513,46 @@ class PolicyEngineTests(unittest.TestCase):
         self.assertEqual([], result.classification.metadata_bootstrap_torrents)
         self.assertEqual(1, result.rejected_counts["storage_headroom"])
         self.assertEqual("stop_no_available_candidates", result.action_plan.action)
+
+    def test_arr_not_upgrade_rejection_is_not_selected_for_bandwidth(self):
+        rejected = self.torrent(
+            "rejected",
+            name="Rejected.Show.S01E01.1080p",
+            category="tv",
+            state="stoppedDL",
+            progress=0.25,
+            amount_left=1_000,
+        )
+        ready = self.torrent("ready")
+        sonarr_queue = StaticQueue({
+            "rejected": {
+                "queue_id": 42,
+                "source": "sonarr",
+                "series": "rejected show",
+                "season": 1,
+                "episode": 1,
+                "season_pack": False,
+                "queue_position": 0,
+                "status_reasons": [
+                    "Not an upgrade for existing episode file(s). Existing quality: WEBDL-2160p. New Quality WEBDL-1080p."
+                ],
+                "status_text": "warning importPending Not an upgrade for existing episode file(s)",
+            }
+        })
+
+        result = self.engine(
+            [rejected, ready],
+            sonarr_queue=sonarr_queue,
+        ).run()
+
+        self.assertEqual(["ready"], [
+            torrent["hash"] for torrent in result.classification.eligible_torrents
+        ])
+        self.assertEqual(1, result.rejected_counts["arr_import_rejected"])
+        self.assertEqual(1, result.rejected_counts["arr_sonarr_not_upgrade"])
+        self.assertEqual(["ready"], [
+            torrent["hash"] for torrent in result.scoring.selection_candidates
+        ])
 
 
 if __name__ == "__main__":

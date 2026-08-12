@@ -243,6 +243,178 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertIn("skipRedownload=false", request_json.call_args.args[2])
         self.assertEqual([], client.deleted)
 
+    def test_completed_sonarr_not_upgrade_torrent_is_removed_after_episode_verification(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "noupgrade-tv",
+            "name": "Not Upgrade Show S01E01",
+            "state": "stoppedUP",
+            "progress": 1,
+            "amount_left": 0,
+            "category": "tv",
+        }
+        sonarr = StaticQueue({
+            "queue_id": 52,
+            "source": "sonarr",
+            "series_id": 7,
+            "season": 1,
+            "episode": 1,
+            "season_pack": False,
+            "episode_ids": [1001],
+            "status_reasons": [
+                "Not an upgrade for existing episode file(s). Existing quality: WEBDL-2160p. New Quality WEBDL-1080p."
+            ],
+            "status_messages": [
+                "release title that should not be treated as a reason",
+                "Not an upgrade for existing episode file(s). Existing quality: WEBDL-2160p. New Quality WEBDL-1080p.",
+            ],
+            "status_text": "warning importPending Not an upgrade for existing episode file(s)",
+        })
+        radarr = StaticQueue(None, configs=[])
+
+        def fake_request_json(opener, method, url, **kwargs):
+            if method == "GET" and "/api/v3/episode/1001" in url:
+                return {
+                    "id": 1001,
+                    "seriesId": 7,
+                    "seasonNumber": 1,
+                    "episodeNumber": 1,
+                    "episodeFileId": 5001,
+                    "episodeFile": {"id": 5001, "path": "/tv/Not Upgrade Show/Season 01/S01E01.mkv"},
+                }, object()
+            if method == "DELETE" and "/api/v3/queue/52?" in url:
+                return {}, object()
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json) as request_json:
+            result = self.guard.process_arr_import_rejected_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual(
+            {"attempted": 1, "succeeded": 1, "failed": 0, "verification_failed": 0},
+            result,
+        )
+        urls = [call.args[2] for call in request_json.call_args_list]
+        self.assertTrue(any("/api/v3/episode/1001" in url for url in urls))
+        delete_url = urls[-1]
+        self.assertIn("/api/v3/queue/52?", delete_url)
+        self.assertIn("removeFromClient=true", delete_url)
+        self.assertIn("blocklist=false", delete_url)
+        self.assertIn("skipRedownload=false", delete_url)
+        self.assertEqual([], client.deleted)
+
+    def test_completed_radarr_not_upgrade_torrent_is_removed_after_movie_verification(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "noupgrade-movie",
+            "name": "Not Upgrade Movie 2026",
+            "state": "stoppedUP",
+            "progress": 1,
+            "amount_left": 0,
+            "category": "movies",
+        }
+        sonarr = StaticQueue(None, configs=[])
+        radarr = StaticQueue(
+            {
+                "queue_id": 89,
+                "source": "radarr",
+                "title": "not upgrade movie",
+                "movie_id": 9001,
+                "year": 2026,
+                "status_reasons": [
+                    "Not an upgrade for existing movie file. Existing quality: Remux-2160p. New Quality Bluray-1080p."
+                ],
+                "status_messages": [
+                    "Not Upgrade Movie 2026",
+                    "Not an upgrade for existing movie file. Existing quality: Remux-2160p. New Quality Bluray-1080p.",
+                ],
+                "status_text": "warning importPending Not an upgrade for existing movie file",
+            },
+            configs=[("radarr", "http://radarr.test", "radarr-key")],
+        )
+
+        def fake_request_json(opener, method, url, **kwargs):
+            if method == "GET" and "/api/v3/movie/9001" in url:
+                return {
+                    "id": 9001,
+                    "title": "Not Upgrade Movie",
+                    "year": 2026,
+                    "movieFileId": 7001,
+                    "movieFile": {"id": 7001, "path": "/movies/Not Upgrade Movie (2026)/movie.mkv"},
+                }, object()
+            if method == "DELETE" and "/api/v3/queue/89?" in url:
+                return {}, object()
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json) as request_json:
+            result = self.guard.process_arr_import_rejected_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual(
+            {"attempted": 1, "succeeded": 1, "failed": 0, "verification_failed": 0},
+            result,
+        )
+        urls = [call.args[2] for call in request_json.call_args_list]
+        self.assertTrue(any("/api/v3/movie/9001" in url for url in urls))
+        delete_url = urls[-1]
+        self.assertIn("/api/v3/queue/89?", delete_url)
+        self.assertIn("removeFromClient=true", delete_url)
+        self.assertIn("blocklist=false", delete_url)
+        self.assertIn("skipRedownload=false", delete_url)
+        self.assertEqual([], client.deleted)
+
+    def test_not_upgrade_cleanup_keeps_torrent_without_verified_existing_file(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "verifyfail",
+            "name": "Verify Failure Movie 2026",
+            "state": "stoppedUP",
+            "progress": 1,
+            "amount_left": 0,
+            "category": "movies",
+        }
+        sonarr = StaticQueue(None, configs=[])
+        radarr = StaticQueue(
+            {
+                "queue_id": 90,
+                "source": "radarr",
+                "title": "verify failure movie",
+                "movie_id": 9002,
+                "year": 2026,
+                "status_reasons": ["Not an upgrade for existing movie file."],
+                "status_text": "warning importPending Not an upgrade for existing movie file",
+            },
+            configs=[("radarr", "http://radarr.test", "radarr-key")],
+        )
+
+        def fake_request_json(opener, method, url, **kwargs):
+            if method == "GET" and "/api/v3/movie/9002" in url:
+                return {"id": 9002, "title": "Verify Failure Movie", "year": 2026}, object()
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json) as request_json:
+            result = self.guard.process_arr_import_rejected_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+            )
+
+        self.assertEqual(
+            {"attempted": 1, "succeeded": 0, "failed": 0, "verification_failed": 1},
+            result,
+        )
+        request_json.assert_called_once()
+        self.assertEqual([], client.deleted)
+
     def test_manual_blacklist_tag_blocklists_sonarr_queue_record(self):
         client = FakeQbtClient()
         torrent = {

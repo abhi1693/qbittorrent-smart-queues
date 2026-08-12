@@ -138,6 +138,7 @@ STOPPED_TORRENT_SCORE_PENALTY = -35.0
 MANUAL_BLACKLIST_TAG = "blacklist"
 MANUAL_BLACKLIST_FAILED_TAG = "blacklist-failed"
 METADATA_TIMEOUT_FAILED_TAG = "metadata-timeout-failed"
+ARR_IMPORT_REJECTION_FAILED_TAG = "arr-import-rejection-failed"
 
 
 @dataclass(frozen=True)
@@ -1537,6 +1538,51 @@ def response_rows(data, label, key="data"):
     if not isinstance(rows, list):
         raise ApiError(f"{label} response has unexpected shape: {type(rows).__name__}")
     return rows
+
+
+def paginated_arr_queue_records(
+    opener,
+    label,
+    base_url,
+    api_key,
+    params,
+    page_size,
+    timeout,
+):
+    records = []
+    page = 1
+    max_pages = max(1, env_int("QBT_ARR_QUEUE_MAX_PAGES", 100))
+    page_size = max(1, int_or_none(page_size) or 1)
+    while page <= max_pages:
+        query = dict(params)
+        query["page"] = str(page)
+        query["pageSize"] = str(page_size)
+        url = join_url(base_url, "/api/v3/queue") + "?" + urllib.parse.urlencode(query)
+        data, _ = request_json(
+            opener,
+            "GET",
+            url,
+            headers={"Accept": "application/json", "X-Api-Key": api_key},
+            timeout=timeout,
+        )
+        rows = response_rows(data, f"{label} queue", key="records")
+        records.extend(rows)
+        if not isinstance(data, dict):
+            break
+        total_records = int_or_none(data.get("totalRecords"))
+        if total_records is not None and len(records) >= total_records:
+            break
+        if len(rows) < page_size:
+            break
+        page += 1
+
+    if page > max_pages:
+        log_warning(
+            f"Stopped reading {label} queue after {max_pages} page(s); "
+            f"increase QBT_ARR_QUEUE_MAX_PAGES if records are still missing",
+            loaded_records=len(records),
+        )
+    return records
 
 
 class NvmeThermalGuard:
@@ -5163,6 +5209,25 @@ def queue_record_status_messages(record):
     return messages
 
 
+def queue_record_status_reasons(record):
+    reasons = []
+    status_messages = record.get("statusMessages")
+    if isinstance(status_messages, list):
+        for item in status_messages:
+            if isinstance(item, dict):
+                raw_messages = item.get("messages")
+                if isinstance(raw_messages, list):
+                    reasons.extend(str(message) for message in raw_messages if message)
+            elif item:
+                reasons.append(str(item))
+
+    for key in ("statusMessage", "errorMessage", "message"):
+        value = record.get(key)
+        if value:
+            reasons.append(str(value))
+    return reasons
+
+
 def queue_record_status_text(record):
     parts = [
         record.get("status"),
@@ -5383,22 +5448,20 @@ class SonarrQueueMetadata:
 
     def load_queue(self, label, base_url, api_key):
         opener = urllib.request.build_opener()
-        params = urllib.parse.urlencode({
-            "page": "1",
-            "pageSize": os.environ.get("QBT_TV_QUEUE_PAGE_SIZE", "1000"),
-            "includeUnknownSeriesItems": "true",
-            "includeSeries": "true",
-            "includeEpisode": "true",
-        })
-        url = join_url(base_url, "/api/v3/queue") + "?" + params
-        data, _ = request_json(
+        page_size = os.environ.get("QBT_TV_QUEUE_PAGE_SIZE", "1000")
+        records = paginated_arr_queue_records(
             opener,
-            "GET",
-            url,
-            headers={"Accept": "application/json", "X-Api-Key": api_key},
-            timeout=self.timeout,
+            label,
+            base_url,
+            api_key,
+            {
+                "includeUnknownSeriesItems": "true",
+                "includeSeries": "true",
+                "includeEpisode": "true",
+            },
+            page_size,
+            self.timeout,
         )
-        records = response_rows(data, f"{label} queue", key="records")
 
         loaded = 0
         for position, record in enumerate(records):
@@ -5424,6 +5487,7 @@ class SonarrQueueMetadata:
 
         season, episode, season_pack = episode_order
         status_messages = queue_record_status_messages(record)
+        status_reasons = queue_record_status_reasons(record)
         return {
             "queue_id": int_or_none(record.get("id")),
             "download_id": first_queue_record_download_id(record),
@@ -5439,6 +5503,7 @@ class SonarrQueueMetadata:
             "tracked_download_status": str(record.get("trackedDownloadStatus") or ""),
             "tracked_download_state": str(record.get("trackedDownloadState") or ""),
             "status_messages": status_messages,
+            "status_reasons": status_reasons,
             "status_text": queue_record_status_text(record),
         }
 
@@ -5666,25 +5731,23 @@ class RadarrQueueMetadata:
 
     def load_queue(self, label, base_url, api_key):
         opener = urllib.request.build_opener()
-        params = urllib.parse.urlencode({
-            "page": "1",
-            "pageSize": (
-                os.environ.get("QBT_MOVIE_QUEUE_PAGE_SIZE")
-                or os.environ.get("QBT_ARR_QUEUE_PAGE_SIZE")
-                or os.environ.get("QBT_TV_QUEUE_PAGE_SIZE", "1000")
-            ),
-            "includeUnknownMovieItems": "true",
-            "includeMovie": "true",
-        })
-        url = join_url(base_url, "/api/v3/queue") + "?" + params
-        data, _ = request_json(
-            opener,
-            "GET",
-            url,
-            headers={"Accept": "application/json", "X-Api-Key": api_key},
-            timeout=self.timeout,
+        page_size = (
+            os.environ.get("QBT_MOVIE_QUEUE_PAGE_SIZE")
+            or os.environ.get("QBT_ARR_QUEUE_PAGE_SIZE")
+            or os.environ.get("QBT_TV_QUEUE_PAGE_SIZE", "1000")
         )
-        records = response_rows(data, f"{label} queue", key="records")
+        records = paginated_arr_queue_records(
+            opener,
+            label,
+            base_url,
+            api_key,
+            {
+                "includeUnknownMovieItems": "true",
+                "includeMovie": "true",
+            },
+            page_size,
+            self.timeout,
+        )
 
         loaded = 0
         for position, record in enumerate(records):
@@ -5711,6 +5774,7 @@ class RadarrQueueMetadata:
         movie_id = queue_record_movie_id(record)
         year = int_or_none(movie.get("year"))
         status_messages = queue_record_status_messages(record)
+        status_reasons = queue_record_status_reasons(record)
         return {
             "queue_id": int_or_none(record.get("id")),
             "download_id": first_queue_record_download_id(record),
@@ -5725,6 +5789,7 @@ class RadarrQueueMetadata:
             "tracked_download_status": str(record.get("trackedDownloadStatus") or ""),
             "tracked_download_state": str(record.get("trackedDownloadState") or ""),
             "status_messages": status_messages,
+            "status_reasons": status_reasons,
             "status_text": queue_record_status_text(record),
         }
 
@@ -6183,8 +6248,7 @@ def cleanup_qbt_client(client):
 def arr_queue_record_indicates_already_imported(metadata):
     if not metadata:
         return False
-    text = str(metadata.get("status_text") or "").lower()
-    messages = [str(message).lower() for message in metadata.get("status_messages") or []]
+    messages = arr_queue_metadata_status_reasons(metadata)
     if not messages:
         return False
     imported_messages = [
@@ -6192,6 +6256,43 @@ def arr_queue_record_indicates_already_imported(metadata):
         if "already imported" in message or "episode file already imported" in message
     ]
     return bool(imported_messages) and len(imported_messages) == len(messages)
+
+
+def arr_queue_metadata_status_reasons(metadata):
+    if not metadata:
+        return []
+    reasons = [
+        str(message).strip().lower()
+        for message in metadata.get("status_reasons") or []
+        if str(message).strip()
+    ]
+    if reasons:
+        return reasons
+    return [
+        str(message).strip().lower()
+        for message in metadata.get("status_messages") or []
+        if str(message).strip()
+    ]
+
+
+def arr_queue_record_indicates_not_upgrade(metadata):
+    messages = arr_queue_metadata_status_reasons(metadata)
+    if not messages:
+        return False
+    markers = (
+        "not an upgrade for existing episode file",
+        "not an upgrade for existing episode file(s)",
+        "not an upgrade for existing movie file",
+    )
+    return any(any(marker in message for marker in markers) for message in messages)
+
+
+def arr_queue_record_terminal_import_rejection_reason(metadata):
+    if arr_queue_record_indicates_already_imported(metadata):
+        return "already_imported"
+    if arr_queue_record_indicates_not_upgrade(metadata):
+        return "not_upgrade"
+    return ""
 
 
 def arr_queue_record_indicates_permanent_corrupt_download(metadata):
@@ -6404,6 +6505,20 @@ def arr_queue_candidates_for_torrent(torrent, sonarr_queue, radarr_queue):
     return candidates
 
 
+def arr_import_rejection_block_reason(torrent, sonarr_queue, radarr_queue):
+    if not env_bool("QBT_ARR_IMPORT_REJECTION_FILTER_ENABLED", True):
+        return ""
+    for source, _queue, metadata in arr_queue_candidates_for_torrent(
+        torrent,
+        sonarr_queue,
+        radarr_queue,
+    ):
+        reason = arr_queue_record_terminal_import_rejection_reason(metadata)
+        if reason:
+            return f"arr_{source}_{reason}"
+    return ""
+
+
 def clear_manual_blacklist_action_tags(client, torrent):
     item_hash = torrent_hash(torrent)
     if not item_hash:
@@ -6552,6 +6667,92 @@ def process_metadata_timeout_torrent(client, torrent, sonarr_queue, radarr_queue
         failure_tag=METADATA_TIMEOUT_FAILED_TAG,
         reason="metadata bootstrap timeout",
     )
+
+
+def process_arr_import_rejected_torrents(client, torrents, sonarr_queue, radarr_queue):
+    if not env_bool("QBT_ARR_IMPORT_REJECTION_CLEANUP_ENABLED", True):
+        return {
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "verification_failed": 0,
+        }
+
+    timeout = env_int("QBT_ARR_IMPORT_REJECTION_ARR_TIMEOUT", env_int("QBT_ARR_QUEUE_TIMEOUT", 10))
+    verify_existing_file = env_bool("QBT_ARR_IMPORT_REJECTION_VERIFY_EXISTING_FILE", True)
+    blocklist = env_bool("QBT_ARR_IMPORT_REJECTION_BLOCKLIST", False)
+    result = {
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "verification_failed": 0,
+    }
+    for torrent in torrents or []:
+        item_hash = torrent_hash(torrent)
+        if not item_hash:
+            continue
+        for source, queue, metadata in arr_queue_candidates_for_torrent(
+            torrent,
+            sonarr_queue,
+            radarr_queue,
+        ):
+            reason = arr_queue_record_terminal_import_rejection_reason(metadata)
+            if not reason:
+                continue
+            queue_id = metadata.get("queue_id") if metadata else None
+            configs = queue.configs() if queue else []
+            if queue_id is None or not configs:
+                continue
+
+            result["attempted"] += 1
+            if verify_existing_file and not arr_import_verified_from_configs(
+                configs,
+                metadata,
+                source,
+                timeout,
+            ):
+                result["verification_failed"] += 1
+                log_warning(
+                    f"Leaving Arr import-rejected torrent in queue because the existing "
+                    f"{source} media file could not be verified: {torrent_name(torrent)}",
+                    hash=item_hash,
+                    queue_id=queue_id,
+                    reason=reason,
+                )
+                break
+
+            deleted = arr_delete_queue_record_from_configs(
+                configs,
+                metadata.get("source"),
+                queue_id,
+                blocklist=blocklist,
+                timeout=timeout,
+            )
+            if deleted:
+                result["succeeded"] += 1
+                log_info(
+                    f"Removed Arr import-rejected torrent before spending more bandwidth: "
+                    f"{torrent_name(torrent)}",
+                    hash=item_hash,
+                    queue_id=queue_id,
+                    source=source,
+                    reason=reason,
+                    blocklist=blocklist,
+                )
+            else:
+                result["failed"] += 1
+                mark_torrent_failure_tag(client, torrent, ARR_IMPORT_REJECTION_FAILED_TAG)
+                log_warning(
+                    f"Failed to remove Arr import-rejected torrent through {source}: "
+                    f"{torrent_name(torrent)}",
+                    hash=item_hash,
+                    queue_id=queue_id,
+                    reason=reason,
+                    failure_tag=ARR_IMPORT_REJECTION_FAILED_TAG,
+                )
+            break
+
+    return result
 
 
 def process_manual_blacklist_torrents(client, torrents=None, sonarr_queue=None, radarr_queue=None):
@@ -8945,6 +9146,15 @@ class SmartQueuePolicyEngine:
                 rejected_counts["manual_force_started"] += 1
                 manual_override_torrents.append(torrent)
                 continue
+            import_rejection_reason = arr_import_rejection_block_reason(
+                torrent,
+                self.sonarr_queue,
+                self.radarr_queue,
+            )
+            if import_rejection_reason:
+                rejected_counts[import_rejection_reason] += 1
+                rejected_counts["arr_import_rejected"] += 1
+                continue
             reject_reason = single_download_reject_reason(
                 torrent,
                 self.min_progress,
@@ -10132,6 +10342,37 @@ def apply_single_download(
                     succeeded=manual_blacklist_result["succeeded"],
                     failed=manual_blacklist_result["failed"],
                     no_arr_match=manual_blacklist_result["no_arr_match"],
+                )
+                break
+            import_rejection_result = process_arr_import_rejected_torrents(
+                client,
+                torrents,
+                sonarr_queue,
+                radarr_queue,
+            )
+            if import_rejection_result["attempted"]:
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="arr_import_rejection_cleanup",
+                    reason="removed Arr queue items that cannot import before queue selection",
+                    rejected_counts={
+                        "arr_import_rejection_cleanup_succeeded": import_rejection_result["succeeded"],
+                        "arr_import_rejection_cleanup_failed": import_rejection_result["failed"],
+                        "arr_import_rejection_cleanup_verification_failed": import_rejection_result["verification_failed"],
+                    },
+                    candidate_counts={
+                        "arr_import_rejection_cleanup_attempted": import_rejection_result["attempted"],
+                    },
+                    selected_torrent=None,
+                )
+                log_decision_info(
+                    "arr_import_rejection_cleanup",
+                    "Processed Arr import-rejected torrent(s) before queue selection",
+                    attempted=import_rejection_result["attempted"],
+                    succeeded=import_rejection_result["succeeded"],
+                    failed=import_rejection_result["failed"],
+                    verification_failed=import_rejection_result["verification_failed"],
                 )
                 break
             manual_override_torrents = force_started_torrents(torrents)
