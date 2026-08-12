@@ -10580,6 +10580,36 @@ def apply_single_download(
                     verification_failed=import_rejection_result["verification_failed"],
                 )
                 break
+            ryokan_cleanup_result = process_ryokan_imported_anime_torrents(
+                client,
+                torrents,
+                now,
+            )
+            if ryokan_cleanup_result["attempted"]:
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action="ryokan_imported_anime_cleanup",
+                    reason="removed completed Ryokan anime leftovers before queue selection",
+                    rejected_counts={
+                        "ryokan_imported_anime_cleanup_succeeded": ryokan_cleanup_result["succeeded"],
+                        "ryokan_imported_anime_cleanup_failed": ryokan_cleanup_result["failed"],
+                        "ryokan_imported_anime_cleanup_verification_failed": ryokan_cleanup_result["verification_failed"],
+                    },
+                    candidate_counts={
+                        "ryokan_imported_anime_cleanup_attempted": ryokan_cleanup_result["attempted"],
+                    },
+                    selected_torrent=None,
+                )
+                log_decision_info(
+                    "ryokan_imported_anime_cleanup",
+                    "Processed completed Ryokan anime leftover torrent(s) before queue selection",
+                    attempted=ryokan_cleanup_result["attempted"],
+                    succeeded=ryokan_cleanup_result["succeeded"],
+                    failed=ryokan_cleanup_result["failed"],
+                    verification_failed=ryokan_cleanup_result["verification_failed"],
+                )
+                break
             manual_override_torrents = force_started_torrents(torrents)
             if manual_override_torrents:
                 manual_override_hashes = {
