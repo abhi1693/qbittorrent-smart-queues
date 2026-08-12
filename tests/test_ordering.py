@@ -152,6 +152,34 @@ class TvOrderingTests(unittest.TestCase):
         self.assertIn("S01E02", self.guard.tv_queue_order_block_reason(torrents[1], {"tv"}, state))
         self.assertIn("S01E02", self.guard.tv_queue_order_block_reason(torrents[2], {"tv"}, state))
 
+    def test_season_pack_queue_metadata_without_episode_does_not_break_ordering(self):
+        queue = self.guard.SonarrQueueMetadata()
+        queue.by_download_id["s1"] = {
+            "series": "alpha",
+            "season": 1,
+            "episode": None,
+            "season_pack": True,
+            "queue_position": 0,
+            "source": "sonarr",
+        }
+        torrents = [
+            {
+                "hash": "s1",
+                "name": "Alpha.S01.1080p",
+                "category": "tv",
+                "progress": 0.0,
+            },
+        ]
+
+        state = self.guard.build_tv_order_state(torrents, {"tv"}, queue)
+        key = self.guard.tv_episode_order_key(torrents[0], {"tv"}, state)
+
+        self.assertEqual(1, state["orders"]["s1"]["season"])
+        self.assertEqual("S01", self.guard.tv_order_label(state["orders"]["s1"]))
+        self.assertEqual(1, key[4])
+        self.assertEqual(0, key[5])
+        self.assertEqual("alpha.s01.1080p", key[6])
+
     def test_completed_older_episode_does_not_block_later_episode(self):
         queue = self.guard.SonarrQueueMetadata()
         torrents = [

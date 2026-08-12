@@ -296,7 +296,7 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
 
         self.assertEqual([1001, 1002], merged["episode_ids"])
         self.assertTrue(merged["season_pack"])
-        self.assertIsNone(merged["episode"])
+        self.assertEqual(0, merged["episode"])
         self.assertFalse(merged.get("episode_scope_ambiguous", False))
         self.assertEqual(10, merged["queue_position"])
 

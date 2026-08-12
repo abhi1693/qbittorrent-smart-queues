@@ -5450,7 +5450,7 @@ def merge_sonarr_queue_metadata(existing, incoming):
     )
     if len(merged["episode_ids"]) > 1:
         merged["season_pack"] = True
-        merged["episode"] = None
+        merged["episode"] = 0
     else:
         merged["season_pack"] = bool(merged.get("season_pack")) or bool(incoming.get("season_pack"))
 
@@ -5968,10 +5968,11 @@ def build_tv_order_state(torrents, tv_order_categories, sonarr_queue, watch_meta
             watch_priorities[item_hash] = watch_priority
 
         series = order["series"]
+        season, episode = tv_order_sequence(order)
         rank = (
             int(order.get("queue_position", 999999)),
-            int(order["season"]),
-            int(order["episode"]),
+            season,
+            episode,
             series,
         )
         if series not in series_ranks or rank < series_ranks[series]:
@@ -6036,16 +6037,17 @@ def tv_episode_order_key(torrent, tv_order_categories, tv_order_state):
 
     series_rank = tv_order_state.get("series_ranks", {}).get(
         order["series"],
-        (999999, int(order["season"]), int(order["episode"]), order["series"]),
+        (999999, *tv_order_sequence(order), order["series"]),
     )
     watch_priority = tv_order_state.get("watch_priorities", {}).get(torrent_hash(torrent))
+    season, episode = tv_order_sequence(order)
     return (
         0,
         0 if watch_priority else 1,
         watch_priority.get("rank", (999999, 999999, 999999)) if watch_priority else (),
         series_rank,
-        int(order["season"]),
-        int(order["episode"]),
+        season,
+        episode,
         torrent_name(torrent).lower(),
     )
 
