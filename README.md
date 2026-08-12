@@ -179,7 +179,7 @@ Optional stale torrent maintenance:
 | `QBT_STALE_TORRENT_TAG_PREFIX` | `stale-stalled` | Prefix used for stale stalled torrent tags, for example `stale-stalled-20260601`. |
 | `QBT_STALE_TORRENT_REANNOUNCE_ENABLED` | `true` | Reannounce stale stalled torrents so they can find peers without occupying active work slots. |
 | `QBT_STALE_TORRENT_PARK_RUNNING_ENABLED` | `true` | Stop running stale stalled torrents after tagging/reannouncing so other downloads can run. |
-| `QBT_STALE_TORRENT_REMOVE_IMPORTED_COMPLETED` | `true` | Remove completed Sonarr leftovers when every queue warning says the episode file was already imported. |
+| `QBT_STALE_TORRENT_REMOVE_IMPORTED_COMPLETED` | `true` | Remove completed Sonarr/Radarr leftovers when Arr says the media is already imported and every remaining queue reason is a known terminal no-import-needed warning. |
 | `QBT_STALE_TORRENT_FAIL_PERMANENT_IMPORT_FAILURES` | `true` | Remove and blocklist completed Radarr downloads with permanent corrupt/sample-detection import failures. |
 | `QBT_STALE_TORRENT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls during stale cleanup. |
 | `QBT_METADATA_TIMEOUT_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr queue delete calls after metadata bootstrap timeouts. |
@@ -210,18 +210,20 @@ Stale maintenance is intentionally conservative. It does not delete incomplete
 14-day stalled torrents just because they are old; it tags, reannounces, and
 parks them so they can resume later while the selector moves on to torrents that
 can make progress. Destructive cleanup is limited to completed downloads where
-Arr confirms that the media was already imported, completed Radarr downloads
-that Arr marks with permanent corrupt media/sample-detection failures, terminal
-Sonarr/Radarr import rejections verified against an existing library file, and
-metadata bootstrap timeouts. Ryokan imported-anime cleanup is opt-in and does
-not trust completion alone: it requires strict qBittorrent completion, the
-configured anime category, the download root to be mounted, and every selected
-media source file to be missing from that root. Partially moved season batches
-therefore stay in qBittorrent until their remaining selected media files are
-imported. When a metadata timeout matches a Sonarr or Radarr queue record, Smart
-Queues asks that app to remove the torrent from the client, blocklist the
-release, and allow redownload so the app can search for another release. If no
-Arr queue record matches, it deletes the torrent directly from qBittorrent with
+Arr confirms that the media was already imported, completed Arr leftovers where
+already-imported warnings are mixed only with known terminal no-import-needed
+warnings, completed Radarr downloads that Arr marks with permanent
+corrupt media/sample-detection failures, terminal Sonarr/Radarr import
+rejections verified against an existing library file, and metadata bootstrap
+timeouts. Ryokan imported-anime cleanup is opt-in and does not trust completion
+alone: it requires strict qBittorrent completion, the configured anime category,
+the download root to be mounted, and every selected media source file to be
+missing from that root. Partially moved season batches therefore stay in
+qBittorrent until their remaining selected media files are imported. When a
+metadata timeout matches a Sonarr or Radarr queue record, Smart Queues asks that
+app to remove the torrent from the client, blocklist the release, and allow
+redownload so the app can search for another release. If no Arr queue record
+matches, it deletes the torrent directly from qBittorrent with
 `deleteFiles=true`.
 
 Import-rejection cleanup runs before normal queue selection. If Sonarr or Radarr

@@ -5173,6 +5173,21 @@ def unique_int_values(values):
     return result
 
 
+def unique_string_values(values):
+    result = []
+    seen = set()
+    for value in values or []:
+        item = str(value or "").strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
 def first_queue_record_download_id(record):
     download_ids = sorted(queue_record_download_ids(record))
     if download_ids:
@@ -5417,6 +5432,44 @@ def queue_record_episode_order(record):
     return None
 
 
+def merge_sonarr_queue_metadata(existing, incoming):
+    if not existing:
+        return dict(incoming or {})
+    if not incoming:
+        return dict(existing)
+
+    merged = dict(existing)
+    for key in ("source", "series", "series_id", "season"):
+        existing_value = merged.get(key)
+        incoming_value = incoming.get(key)
+        if existing_value not in (None, "") and incoming_value not in (None, "") and existing_value != incoming_value:
+            merged["episode_scope_ambiguous"] = True
+
+    merged["episode_ids"] = unique_int_values(
+        list(merged.get("episode_ids") or []) + list(incoming.get("episode_ids") or [])
+    )
+    if len(merged["episode_ids"]) > 1:
+        merged["season_pack"] = True
+        merged["episode"] = None
+    else:
+        merged["season_pack"] = bool(merged.get("season_pack")) or bool(incoming.get("season_pack"))
+
+    merged["status_messages"] = unique_string_values(
+        list(merged.get("status_messages") or []) + list(incoming.get("status_messages") or [])
+    )
+    merged["status_reasons"] = unique_string_values(
+        list(merged.get("status_reasons") or []) + list(incoming.get("status_reasons") or [])
+    )
+    merged["status_text"] = " ".join(
+        unique_string_values([merged.get("status_text"), incoming.get("status_text")])
+    )
+    merged["queue_position"] = min(
+        int_or_none(merged.get("queue_position")) or 0,
+        int_or_none(incoming.get("queue_position")) or 0,
+    )
+    return merged
+
+
 class SonarrQueueMetadata:
     def __init__(self):
         self.enabled = env_bool("QBT_TV_QUEUE_SONARR_ENABLED", True)
@@ -5480,11 +5533,17 @@ class SonarrQueueMetadata:
             if not metadata:
                 continue
             for download_id in queue_record_download_ids(record):
-                self.by_download_id[download_id] = metadata
+                self.by_download_id[download_id] = merge_sonarr_queue_metadata(
+                    self.by_download_id.get(download_id),
+                    metadata,
+                )
             for title in queue_record_titles(record):
                 normalized_title = normalize_tv_sort_text(title)
                 if normalized_title:
-                    self.by_title[normalized_title] = metadata
+                    self.by_title[normalized_title] = merge_sonarr_queue_metadata(
+                        self.by_title.get(normalized_title),
+                        metadata,
+                    )
             loaded += 1
         log_debug(f"Loaded {loaded} {label} queue record(s) for TV ordering")
 
@@ -6260,11 +6319,24 @@ def arr_queue_record_indicates_already_imported(metadata):
     messages = arr_queue_metadata_status_reasons(metadata)
     if not messages:
         return False
-    imported_messages = [
-        message for message in messages
-        if "already imported" in message or "episode file already imported" in message
-    ]
-    return bool(imported_messages) and len(imported_messages) == len(messages)
+    imported_seen = False
+    for message in messages:
+        if "already imported" in message or "episode file already imported" in message:
+            imported_seen = True
+            continue
+        if not arr_queue_record_already_imported_cleanup_tolerated_reason(message):
+            return False
+    return imported_seen
+
+
+def arr_queue_record_already_imported_cleanup_tolerated_reason(message):
+    text = str(message or "").strip().lower()
+    if not text:
+        return True
+    tolerated_markers = (
+        "single episode file contains all episodes in seasons",
+    )
+    return any(marker in text for marker in tolerated_markers)
 
 
 def arr_queue_metadata_status_reasons(metadata):
@@ -6341,6 +6413,8 @@ def sonarr_episode_file_path(base_url, api_key, episode_file_id, timeout):
 
 
 def sonarr_episode_import_verified(base_url, api_key, metadata, timeout):
+    if metadata.get("episode_scope_ambiguous"):
+        return False
     episode_ids = unique_int_values(metadata.get("episode_ids") or [])
     if not episode_ids:
         return False

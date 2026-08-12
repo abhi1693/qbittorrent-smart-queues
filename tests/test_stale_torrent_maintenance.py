@@ -162,6 +162,144 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertEqual(1, request_json.call_count)
         self.assertEqual([], client.deleted)
 
+    def test_completed_sonarr_already_imported_torrent_with_terminal_warning_is_removed(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "sherlock",
+            "name": "Sherlock S01 1080p NF WEB-DL DD5 1 H 264-playWEB",
+            "state": "stoppedUP",
+            "progress": 1,
+            "amount_left": 0,
+            "category": "tv",
+        }
+        sonarr = StaticQueue({
+            "queue_id": 420,
+            "source": "sonarr",
+            "series_id": 47,
+            "season": 1,
+            "episode": None,
+            "season_pack": True,
+            "episode_ids": [1001, 1002, 1003],
+            "status_reasons": [
+                "Episode file already imported at 8/11/2026 9:51:22AM",
+                "Single episode file contains all episodes in seasons. Review file name or manually import",
+            ],
+            "status_text": "warning importPending Episode file already imported Single episode file contains all episodes in seasons",
+        })
+        radarr = StaticQueue(None, configs=[])
+
+        def fake_request_json(opener, method, url, **kwargs):
+            for episode_id, episode_number in ((1001, 1), (1002, 2), (1003, 3)):
+                if method == "GET" and f"/api/v3/episode/{episode_id}" in url:
+                    return {
+                        "id": episode_id,
+                        "seriesId": 47,
+                        "seasonNumber": 1,
+                        "episodeNumber": episode_number,
+                        "episodeFileId": 5000 + episode_id,
+                        "episodeFile": {
+                            "id": 5000 + episode_id,
+                            "path": f"/tv/Sherlock/Season 01/S01E{episode_number:02d}.mkv",
+                        },
+                    }, object()
+            if method == "DELETE" and "/api/v3/queue/420?" in url:
+                return {}, object()
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json) as request_json:
+            self.guard.cleanup_arr_managed_completed_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+                delete_files=True,
+            )
+
+        self.assertEqual(4, request_json.call_count)
+        urls = [call.args[2] for call in request_json.call_args_list]
+        self.assertTrue(any("/api/v3/episode/1001" in url for url in urls))
+        self.assertTrue(any("/api/v3/episode/1002" in url for url in urls))
+        self.assertTrue(any("/api/v3/episode/1003" in url for url in urls))
+        delete_url = urls[-1]
+        self.assertIn("/api/v3/queue/420?", delete_url)
+        self.assertIn("removeFromClient=true", delete_url)
+        self.assertEqual([], client.deleted)
+
+    def test_completed_sonarr_already_imported_torrent_with_unknown_warning_is_kept(self):
+        client = FakeQbtClient()
+        torrent = {
+            "hash": "mixed-warning",
+            "name": "Mixed Warning Show S01",
+            "state": "stoppedUP",
+            "progress": 1,
+            "amount_left": 0,
+            "category": "tv",
+        }
+        sonarr = StaticQueue({
+            "queue_id": 421,
+            "source": "sonarr",
+            "series_id": 47,
+            "season": 1,
+            "episode": 1,
+            "season_pack": False,
+            "episode_ids": [1001],
+            "status_reasons": [
+                "Episode file already imported at 8/11/2026 9:51:22AM",
+                "Unexpected import warning that still needs operator review",
+            ],
+        })
+        radarr = StaticQueue(None, configs=[])
+
+        with mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
+            self.guard.cleanup_arr_managed_completed_torrents(
+                client,
+                [torrent],
+                sonarr,
+                radarr,
+                delete_files=True,
+            )
+
+        request_json.assert_not_called()
+        self.assertEqual([], client.deleted)
+
+    def test_sonarr_queue_metadata_merge_verifies_all_same_download_episode_records(self):
+        first = {
+            "queue_id": 1,
+            "source": "sonarr",
+            "series": "sherlock",
+            "series_id": 47,
+            "season": 1,
+            "episode": 1,
+            "season_pack": False,
+            "episode_ids": [1001],
+            "status_reasons": ["Episode file already imported"],
+            "status_messages": ["Sherlock S01", "Episode file already imported"],
+            "status_text": "warning importPending Episode file already imported",
+            "queue_position": 10,
+        }
+        second = {
+            "queue_id": 2,
+            "source": "sonarr",
+            "series": "sherlock",
+            "series_id": 47,
+            "season": 1,
+            "episode": 2,
+            "season_pack": False,
+            "episode_ids": [1002],
+            "status_reasons": ["Single episode file contains all episodes in seasons. Review file name or manually import"],
+            "status_messages": ["Sherlock S01", "Single episode file contains all episodes in seasons. Review file name or manually import"],
+            "status_text": "warning importPending Single episode file contains all episodes in seasons",
+            "queue_position": 11,
+        }
+
+        merged = self.guard.merge_sonarr_queue_metadata(first, second)
+
+        self.assertEqual([1001, 1002], merged["episode_ids"])
+        self.assertTrue(merged["season_pack"])
+        self.assertIsNone(merged["episode"])
+        self.assertFalse(merged.get("episode_scope_ambiguous", False))
+        self.assertEqual(10, merged["queue_position"])
+
     def test_completed_radarr_already_imported_torrent_is_removed_after_movie_file_verification(self):
         client = FakeQbtClient()
         torrent = {
