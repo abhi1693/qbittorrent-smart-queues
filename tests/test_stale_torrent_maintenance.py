@@ -7,15 +7,19 @@ from unittest import mock
 
 
 class FakeQbtClient:
-    def __init__(self):
+    def __init__(self, files_by_hash=None):
         self.deleted = []
         self.added_tags = []
         self.removed_tags = []
         self.reannounced = []
         self.stopped = []
+        self.files_by_hash = dict(files_by_hash or {})
 
     def delete_hashes(self, hashes, delete_files):
         self.deleted.append((list(hashes), delete_files))
+
+    def torrent_files(self, item_hash):
+        return list(self.files_by_hash.get(item_hash, []))
 
     def add_tags(self, hashes, tags):
         self.added_tags.append((list(hashes), list(tags)))
@@ -47,6 +51,14 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         from qbittorrent_smart_queues import guard
 
         self.guard = guard
+
+    def ryokan_cleanup_env(self, download_root):
+        return {
+            "QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED": "true",
+            "QBT_RYOKAN_IMPORTED_ANIME_DOWNLOAD_ROOT": download_root,
+            "QBT_RYOKAN_IMPORTED_ANIME_MIN_COMPLETED_SECONDS": "0",
+            "QBT_RYOKAN_IMPORTED_ANIME_DELETE_FILES": "true",
+        }
 
     def test_completed_sonarr_already_imported_torrent_is_removed_from_queue(self):
         client = FakeQbtClient()
@@ -241,6 +253,153 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertIn("removeFromClient=true", request_json.call_args.args[2])
         self.assertIn("blocklist=true", request_json.call_args.args[2])
         self.assertIn("skipRedownload=false", request_json.call_args.args[2])
+        self.assertEqual([], client.deleted)
+
+    def test_completed_ryokan_anime_torrent_is_deleted_when_selected_media_sources_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeQbtClient({
+                "animegone": [
+                    {"name": "Show S01E01.mkv", "priority": 7, "progress": 1, "size": 100},
+                ],
+            })
+            torrent = {
+                "hash": "animegone",
+                "name": "Show S01E01",
+                "state": "stoppedUP",
+                "progress": 1,
+                "amount_left": 0,
+                "category": "anime",
+            }
+
+            with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
+                result = self.guard.process_ryokan_imported_anime_torrents(
+                    client,
+                    [torrent],
+                    now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(
+            {
+                "attempted": 1,
+                "succeeded": 1,
+                "failed": 0,
+                "verification_failed": 0,
+                "skipped": 0,
+            },
+            result,
+        )
+        self.assertEqual([(["animegone"], True)], client.deleted)
+
+    def test_completed_ryokan_anime_batch_is_kept_when_any_selected_media_source_remains(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            batch_dir = os.path.join(tmpdir, "Batch")
+            os.mkdir(batch_dir)
+            with open(os.path.join(batch_dir, "S01E01.mkv"), "wb") as handle:
+                handle.write(b"media")
+
+            client = FakeQbtClient({
+                "animepartial": [
+                    {"name": "S01E01.mkv", "priority": 7, "progress": 1, "size": 100},
+                    {"name": "S01E02.mkv", "priority": 7, "progress": 1, "size": 100},
+                ],
+            })
+            torrent = {
+                "hash": "animepartial",
+                "name": "Batch",
+                "state": "stoppedUP",
+                "progress": 1,
+                "amount_left": 0,
+                "category": "anime",
+                "content_path": batch_dir,
+            }
+
+            with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
+                result = self.guard.process_ryokan_imported_anime_torrents(
+                    client,
+                    [torrent],
+                    now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(
+            {
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "verification_failed": 1,
+                "skipped": 0,
+            },
+            result,
+        )
+        self.assertEqual([], client.deleted)
+
+    def test_ryokan_cleanup_ignores_metadata_only_zero_remaining_torrent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeQbtClient({
+                "metadataonly": [
+                    {"name": "Show S01E01.mkv", "priority": 7, "progress": 0, "size": 0},
+                ],
+            })
+            torrent = {
+                "hash": "metadataonly",
+                "name": "metadataonly",
+                "state": "stoppedDL",
+                "progress": 0,
+                "amount_left": 0,
+                "category": "anime",
+            }
+
+            with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
+                result = self.guard.process_ryokan_imported_anime_torrents(
+                    client,
+                    [torrent],
+                    now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(
+            {
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "verification_failed": 0,
+                "skipped": 0,
+            },
+            result,
+        )
+        self.assertEqual([], client.deleted)
+
+    def test_ryokan_cleanup_ignores_non_anime_category(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeQbtClient({
+                "tvhash": [
+                    {"name": "Show S01E01.mkv", "priority": 7, "progress": 1, "size": 100},
+                ],
+            })
+            torrent = {
+                "hash": "tvhash",
+                "name": "Show S01E01",
+                "state": "stoppedUP",
+                "progress": 1,
+                "amount_left": 0,
+                "category": "tv",
+            }
+
+            with mock.patch.dict(os.environ, self.ryokan_cleanup_env(tmpdir), clear=False):
+                result = self.guard.process_ryokan_imported_anime_torrents(
+                    client,
+                    [torrent],
+                    now=datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(
+            {
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "verification_failed": 0,
+                "skipped": 0,
+            },
+            result,
+        )
         self.assertEqual([], client.deleted)
 
     def test_completed_sonarr_not_upgrade_torrent_is_removed_after_episode_verification(self):

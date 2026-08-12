@@ -139,6 +139,7 @@ MANUAL_BLACKLIST_TAG = "blacklist"
 MANUAL_BLACKLIST_FAILED_TAG = "blacklist-failed"
 METADATA_TIMEOUT_FAILED_TAG = "metadata-timeout-failed"
 ARR_IMPORT_REJECTION_FAILED_TAG = "arr-import-rejection-failed"
+RYOKAN_IMPORTED_ANIME_FAILED_TAG = "ryokan-import-cleanup-failed"
 
 
 @dataclass(frozen=True)
@@ -4748,6 +4749,14 @@ def torrent_category(torrent):
     return str(torrent.get("category") or "").strip()
 
 
+def torrent_save_path(torrent):
+    return str(torrent.get("save_path") or torrent.get("savePath") or "").strip()
+
+
+def torrent_content_path(torrent):
+    return str(torrent.get("content_path") or torrent.get("contentPath") or "").strip()
+
+
 def torrent_int(torrent, key):
     try:
         return max(0, int(torrent.get(key) or 0))
@@ -6855,6 +6864,201 @@ def is_completed_torrent(torrent):
     return torrent_progress(torrent) >= 1.0 or torrent_amount_left(torrent) == 0
 
 
+def is_strictly_completed_torrent(torrent):
+    return torrent_progress(torrent) >= 1.0 and torrent_amount_left(torrent) == 0
+
+
+def torrent_completed_age_seconds(torrent, now):
+    completed_on = None
+    for key in ("completion_on", "completed_on"):
+        completed_on = int_or_none(torrent.get(key))
+        if completed_on and completed_on > 0:
+            break
+    if not completed_on or completed_on <= 0:
+        return None
+    try:
+        now_timestamp = int(now.timestamp())
+    except AttributeError:
+        return None
+    return max(0, now_timestamp - completed_on)
+
+
+def path_is_under_root(root, candidate):
+    try:
+        root_path = os.path.abspath(root)
+        candidate_path = os.path.abspath(candidate)
+        return os.path.commonpath([root_path, candidate_path]) == root_path
+    except (TypeError, ValueError):
+        return False
+
+
+def download_source_path_candidates(torrent, file_item, download_root):
+    raw_path = file_path(file_item).strip()
+    if not raw_path:
+        return []
+
+    download_root = os.path.abspath(download_root)
+    normalized_path = raw_path.replace("\\", os.sep)
+    raw_candidates = []
+    if os.path.isabs(normalized_path):
+        raw_candidates.append(normalized_path)
+    else:
+        bases = [
+            download_root,
+            torrent_save_path(torrent),
+            torrent_content_path(torrent),
+        ]
+        for base in bases:
+            if base:
+                raw_candidates.append(os.path.join(base, normalized_path))
+        content_path = torrent_content_path(torrent)
+        if content_path and os.path.basename(content_path) == os.path.basename(normalized_path):
+            raw_candidates.append(content_path)
+
+    candidates = []
+    seen = set()
+    for candidate in raw_candidates:
+        candidate = os.path.abspath(candidate)
+        if candidate in seen or not path_is_under_root(download_root, candidate):
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+    return candidates
+
+
+def ryokan_selected_media_source_state(torrent, files, download_root):
+    download_root = os.path.abspath(download_root or "/downloads")
+    state = {
+        "download_root": download_root,
+        "download_root_available": os.path.isdir(download_root),
+        "selected_media_count": 0,
+        "missing_media_count": 0,
+        "existing_media_count": 0,
+        "unresolved_media_count": 0,
+    }
+    if not state["download_root_available"]:
+        return state
+
+    for file_item in files or []:
+        if file_priority(file_item) <= 0 or not is_media_file(file_item):
+            continue
+        state["selected_media_count"] += 1
+        candidates = download_source_path_candidates(torrent, file_item, download_root)
+        if not candidates:
+            state["unresolved_media_count"] += 1
+            continue
+        if any(os.path.exists(candidate) for candidate in candidates):
+            state["existing_media_count"] += 1
+        else:
+            state["missing_media_count"] += 1
+    return state
+
+
+def ryokan_imported_anime_source_verifies_moved(source_state):
+    selected_media_count = source_state.get("selected_media_count", 0)
+    return (
+        source_state.get("download_root_available")
+        and selected_media_count > 0
+        and source_state.get("unresolved_media_count", 0) == 0
+        and source_state.get("existing_media_count", 0) == 0
+        and source_state.get("missing_media_count", 0) == selected_media_count
+    )
+
+
+def process_ryokan_imported_anime_torrents(client, torrents, now=None):
+    if not env_bool("QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED", False):
+        return {
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "verification_failed": 0,
+            "skipped": 0,
+        }
+
+    categories = normalized_set(split_lines_or_csv(
+        os.environ.get("QBT_RYOKAN_IMPORTED_ANIME_CATEGORIES", "anime,priority-anime")
+    ))
+    download_root = os.environ.get("QBT_RYOKAN_IMPORTED_ANIME_DOWNLOAD_ROOT", "/downloads").strip() or "/downloads"
+    min_completed_seconds = max(0, env_int("QBT_RYOKAN_IMPORTED_ANIME_MIN_COMPLETED_SECONDS", 1800))
+    delete_files = env_bool(
+        "QBT_RYOKAN_IMPORTED_ANIME_DELETE_FILES",
+        env_bool("QBT_DELETE_FILES", True),
+    )
+    now = now or datetime.now(timezone.utc)
+    result = {
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "verification_failed": 0,
+        "skipped": 0,
+    }
+
+    for torrent in torrents or []:
+        item_hash = torrent_hash(torrent)
+        if not item_hash:
+            continue
+        if categories and torrent_category(torrent).lower() not in categories:
+            continue
+        if not is_strictly_completed_torrent(torrent):
+            continue
+        if is_force_started_torrent(torrent):
+            result["skipped"] += 1
+            continue
+        if min_completed_seconds > 0:
+            completed_age = torrent_completed_age_seconds(torrent, now)
+            if completed_age is None or completed_age < min_completed_seconds:
+                result["skipped"] += 1
+                continue
+
+        try:
+            files = client.torrent_files(item_hash)
+        except ApiError as exc:
+            result["verification_failed"] += 1
+            log_warning(
+                f"Leaving completed Ryokan anime torrent in qBittorrent because "
+                f"the file list could not be read: {torrent_name(torrent)}: {exc}",
+                hash=item_hash,
+            )
+            continue
+
+        source_state = ryokan_selected_media_source_state(torrent, files, download_root)
+        if not ryokan_imported_anime_source_verifies_moved(source_state):
+            result["verification_failed"] += 1
+            log_debug(
+                f"Leaving completed Ryokan anime torrent in qBittorrent because "
+                f"not every selected media source file has disappeared from downloads: "
+                f"{torrent_name(torrent)}",
+                hash=item_hash,
+                source_state=source_state,
+            )
+            continue
+
+        result["attempted"] += 1
+        try:
+            client.delete_hashes([item_hash], delete_files)
+            result["succeeded"] += 1
+            log_info(
+                f"Deleted completed Ryokan-imported anime torrent after source "
+                f"media files were moved out of downloads: {torrent_name(torrent)}",
+                hash=item_hash,
+                delete_files=delete_files,
+                selected_media_count=source_state["selected_media_count"],
+                download_root=source_state["download_root"],
+            )
+        except ApiError as exc:
+            result["failed"] += 1
+            mark_torrent_failure_tag(client, torrent, RYOKAN_IMPORTED_ANIME_FAILED_TAG)
+            log_warning(
+                f"Failed to delete completed Ryokan-imported anime torrent after "
+                f"source media verification: {torrent_name(torrent)}: {exc}",
+                hash=item_hash,
+                delete_files=delete_files,
+                failure_tag=RYOKAN_IMPORTED_ANIME_FAILED_TAG,
+            )
+
+    return result
+
+
 def torrent_name_is_hash(torrent):
     name = normalize_download_id(torrent_name(torrent))
     item_hash = normalize_download_id(torrent_hash(torrent))
@@ -7056,6 +7260,7 @@ def cleanup_qbt_clients(clients):
                     radarr_queue,
                     delete_files,
                 )
+            process_ryokan_imported_anime_torrents(client, torrents)
             maintain_stale_stalled_torrents(
                 client,
                 torrents,
