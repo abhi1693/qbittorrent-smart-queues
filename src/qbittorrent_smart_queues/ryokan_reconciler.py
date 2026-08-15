@@ -2,9 +2,10 @@
 
 The service is intended to run as a sidecar in Ryokan's pod so it can read the
 live SQLite database and the anime library without sharing Ryokan's RWO volume
-with another pod.  Its only mutation is an idempotent repair: an imported grab
+with another pod. Its only mutation is an idempotent repair: an imported grab
 whose source and destination receipts do not cover every qBittorrent-selected
-media file is moved back to ``pending`` for Ryokan's normal post-processor.
+media file is moved back to ``pending`` for Ryokan's normal post-processor, but
+only when Ryokan's grabbed episode count agrees with the selected media count.
 """
 
 from __future__ import annotations
@@ -76,6 +77,29 @@ def source_receipts_match(expected_candidates, imported_source_paths):
             return False
         matched.update(matches)
     return len(matched) == len(expected_candidates)
+
+
+def grab_episode_count(value):
+    try:
+        episode_numbers = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return 0
+    if not isinstance(episode_numbers, list):
+        return 0
+    normalized = []
+    for episode_number in episode_numbers:
+        if isinstance(episode_number, bool):
+            return 0
+        try:
+            episode_number = int(episode_number)
+        except (TypeError, ValueError):
+            return 0
+        if episode_number <= 0:
+            return 0
+        normalized.append(episode_number)
+    if len(normalized) != len(set(normalized)):
+        return 0
+    return len(normalized)
 
 
 def safe_library_target(media_root, folder_name, file_name):
@@ -174,6 +198,12 @@ def inspect_import(db_path, media_root, item_hash, expected_files):
             return base
         if not grab["imported_at"]:
             base["status"] = "completed_without_import"
+            return base
+
+        grabbed_episode_count = grab_episode_count(grab["episode_numbers"])
+        base["grabbed_episode_count"] = grabbed_episode_count
+        if grabbed_episode_count != len(expected_candidates):
+            base["status"] = "batch_shape_mismatch"
             return base
 
         try:

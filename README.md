@@ -235,11 +235,13 @@ timeouts. Ryokan imported-anime cleanup is opt-in and does not trust completion
 alone: it requires strict qBittorrent completion, the configured anime category,
 the download root to be mounted, every selected media source file to be missing
 from that root, an exact match against Ryokan's imported-source receipts, and one
-distinct library target with the same file size per selected media file. If Ryokan marked a
-grab imported without satisfying that contract, the reconciler atomically moves
-only that grab back to `pending` and Smart Queues requests a qBittorrent recheck
-so Ryokan's normal post-processor can import the complete set. Pending, unknown,
-or ambiguous grabs fail closed without mutation. When a
+distinct library target with the same file size per selected media file. If
+Ryokan marked a grab imported without satisfying that contract, the reconciler
+atomically moves only that grab back to `pending` and Smart Queues requests a
+qBittorrent recheck so Ryokan's normal post-processor can import the complete
+set. Pending, unknown, ambiguous, or selected-file/episode-count-mismatched grabs
+fail closed without mutation. Automatic requeue is allowed only when Ryokan's
+distinct grabbed episode count equals the qBittorrent-selected media count. When a
 metadata timeout matches a Sonarr or Radarr queue record, Smart Queues asks that
 app to remove the torrent from the client, blocklist the release, and allow
 redownload so the app can search for another release. If no Arr queue record

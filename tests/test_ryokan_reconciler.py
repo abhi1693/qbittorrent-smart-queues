@@ -199,6 +199,41 @@ class RyokanReconcilerTests(unittest.TestCase):
         self.assertFalse(result["sizes_match"])
         self.assertFalse(result["targets_match"])
 
+    def test_selected_file_count_mismatch_fails_closed_without_requeue(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path, media_root = self.create_fixture(tmpdir)
+            database = sqlite3.connect(db_path)
+            database.execute(
+                "UPDATE grabbed_torrents SET episode_numbers = '[1]' WHERE id = 11"
+            )
+            database.commit()
+            database.close()
+
+            result = ryokan_reconciler.reconcile_import(
+                db_path,
+                media_root,
+                "abc123",
+                self.expected_files(),
+            )
+
+            database = sqlite3.connect(db_path)
+            grab = database.execute(
+                "SELECT state, imported_at, imported_source_paths FROM grabbed_torrents WHERE id = 11"
+            ).fetchone()
+            history_states = database.execute(
+                "SELECT state FROM episode_grab_history ORDER BY id"
+            ).fetchall()
+            database.close()
+
+        self.assertEqual("batch_shape_mismatch", result["status"])
+        self.assertFalse(result["delete_allowed"])
+        self.assertEqual(1, result["grabbed_episode_count"])
+        self.assertEqual(2, result["expected_count"])
+        self.assertEqual("imported", grab[0])
+        self.assertIsNotNone(grab[1])
+        self.assertIsNotNone(grab[2])
+        self.assertEqual([("completed",), ("completed",)], history_states)
+
     def test_unknown_hash_fails_closed_without_database_mutation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path, media_root = self.create_fixture(tmpdir)
