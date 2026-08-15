@@ -247,9 +247,9 @@ matches, it deletes the torrent directly from qBittorrent with
 `deleteFiles=true`.
 
 Import-rejection cleanup runs before normal queue selection. If Sonarr or Radarr
-marks a queued torrent as already imported or not an upgrade for the existing
-episode/movie file, Smart Queues first verifies the existing library file through
-that Arr instance, then removes the Arr queue record with
+marks a queued torrent as already imported, not an upgrade, or not a Custom
+Format upgrade for the existing episode/movie file, Smart Queues first verifies
+the existing library file through that Arr instance, then removes the Arr queue record with
 `removeFromClient=true`, `blocklist=false`, and `skipRedownload=false` by
 default. If verification or deletion cannot be completed, the selection filter
 still rejects that torrent so Smart Queues does not assign bandwidth to a release

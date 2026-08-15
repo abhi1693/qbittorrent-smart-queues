@@ -6422,6 +6422,8 @@ def arr_queue_record_indicates_not_upgrade(metadata):
         "not an upgrade for existing episode file",
         "not an upgrade for existing episode file(s)",
         "not an upgrade for existing movie file",
+        "not a custom format upgrade for existing episode file",
+        "not a custom format upgrade for existing movie file",
     )
     return any(any(marker in message for marker in markers) for message in messages)
 

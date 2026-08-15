@@ -778,13 +778,13 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 "movie_id": 9001,
                 "year": 2026,
                 "status_reasons": [
-                    "Not an upgrade for existing movie file. Existing quality: Remux-2160p. New Quality Bluray-1080p."
+                    "Not a Custom Format upgrade for existing movie file(s). New: [x265 (HD)] (-10000) do not improve on Existing: [HD Bluray Tier 03] (1700)"
                 ],
                 "status_messages": [
                     "Not Upgrade Movie 2026",
-                    "Not an upgrade for existing movie file. Existing quality: Remux-2160p. New Quality Bluray-1080p.",
+                    "Not a Custom Format upgrade for existing movie file(s). New: [x265 (HD)] (-10000) do not improve on Existing: [HD Bluray Tier 03] (1700)",
                 ],
-                "status_text": "warning importPending Not an upgrade for existing movie file",
+                "status_text": "warning importPending Not a Custom Format upgrade for existing movie file(s)",
             },
             configs=[("radarr", "http://radarr.test", "radarr-key")],
         )
