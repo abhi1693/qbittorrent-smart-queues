@@ -9989,8 +9989,6 @@ class SmartQueuePolicyEngine:
         return SmartQueuePolicyAllocation(slot_plan=slot_plan)
 
     def act(self, observation, filters, scoring):
-        if scoring.manual_override_torrents:
-            return SmartQueuePolicyActionPlan("keep_manual_override")
         if observation.storage_constrained_mode and scoring.selection_candidates:
             return SmartQueuePolicyActionPlan("storage_recovery_batch")
         if observation.storage_constrained_mode and scoring.storage_recovery_parked_torrents:
@@ -10860,35 +10858,15 @@ def apply_single_download(
                         file_priority_lookahead,
                         tv_order_state.get("watch_priorities", {}).get(item_hash),
                     )
-                emit_decision_log(
-                    "qbt_guard_decision",
-                    **decision_base_context(run_decision_context, client, storage_state),
-                    action="keep_manual_override",
-                    reason="force-started torrent(s) are treated as manual operator action",
-                    selected_torrent=torrent_decision_summary(manual_override_torrents[0]),
-                    selected_torrents=[
-                        torrent_decision_summary(torrent)
-                        for torrent in manual_override_torrents[:5]
-                    ],
-                    rejected_counts={
-                        "manual_force_started": len(manual_override_torrents),
-                    },
-                    candidate_counts={
-                        "total": len(torrents),
-                        "eligible": len(manual_override_torrents),
-                        "manual_force_started": len(manual_override_torrents),
-                    },
-                )
                 log_decision_info(
-                    "keep_manual_override",
+                    "observe_manual_override",
                     f"Leaving {len(manual_override_torrents)} force-started torrent(s) running "
-                    "because qBittorrent force start is a manual operator action",
+                    "outside the managed worker pool while normal queue selection continues",
                     selected=", ".join(
                         torrent_name(torrent) for torrent in manual_override_torrents[:5]
                     ),
                     hashes=sorted(manual_override_hashes),
                 )
-                break
             storage_constrained_mode = storage_state_is_reserve_constrained(storage_guard, storage_state)
             if storage_constrained_mode:
                 initial_slot_plan = None
@@ -12286,7 +12264,10 @@ def apply_single_download(
                 continue
 
             if not available_candidates:
-                client.stop_all()
+                if manual_override_torrents:
+                    stop_queue_managed_torrents(client, torrents)
+                else:
+                    client.stop_all()
                 no_available_reason = "no eligible candidates"
                 if candidates:
                     no_available_reason = "all candidates cooling down or already attempted"

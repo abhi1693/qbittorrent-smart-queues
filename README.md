@@ -260,10 +260,11 @@ Arr has already decided it cannot import.
 Optional single-download selection tuning:
 
 If a torrent is force-started in qBittorrent (`forcedDL`/`forced*` state), Smart
-Queues treats that as a manual operator override. Normal queue selection stands
-down, does not start a replacement candidate, and does not stop the forced
-torrent while it remains force-started. Explicit safety stops such as quota,
-backup-internet, thermal, storage hard-stop, and shutdown hooks still apply.
+Queues treats that as a manual operator override outside the managed worker
+pool. Normal queue selection continues without stopping or counting the forced
+torrent, so a user-started download runs in addition to the configured useful
+worker limit. Explicit safety stops such as quota, backup-internet, thermal,
+storage hard-stop, and shutdown hooks still apply.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -429,9 +430,10 @@ configured static thresholds assume a higher link speed.
 
 Torrents force-started in qBittorrent (`forcedDL`/`forcedUP`) are treated as
 manual overrides. The controller excludes them from normal selection,
-stale/no-progress cooldowns, queue-managed replacement stops, and broad hard
-pause operations, leaving the human-started torrent running while stopping only
-queue-managed peers.
+stale/no-progress cooldowns, and queue-managed replacement stops. The
+human-started torrent runs outside the managed worker limit while the configured
+normal worker pool continues. Explicit quota, backup-internet, thermal, storage
+hard-stop, and shutdown safeguards retain authority over all downloads.
 
 By default, normal single-download mode now parks stalled/no-progress torrents
 instead of pausing and cooldown-tagging them. Parked torrents stay active in

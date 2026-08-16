@@ -127,7 +127,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
 
         self.assertTrue(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 65_536}))
 
-    def test_apply_single_download_leaves_force_started_torrent_running(self):
+    def test_apply_single_download_keeps_forced_torrent_and_schedules_normal_work(self):
         forced = {
             "hash": "forced",
             "name": "Human.Override.Movie.1080p",
@@ -188,18 +188,18 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             for line in stdout.getvalue().splitlines()
             if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
         ]
-        override_event = next(
+        selection_event = next(
             item for item in decision_events
-            if item.get("action") == "keep_manual_override"
+            if item.get("action") in {"try_candidate", "try_category_batch"}
         )
 
-        self.assertEqual("forced", override_event["selected_torrent"]["hash"])
-        self.assertEqual(1, override_event["rejected_counts"]["manual_force_started"])
-        self.assertEqual(1, override_event["candidate_counts"]["manual_force_started"])
-        self.assertEqual([], client.started)
+        self.assertEqual("ready", selection_event["selected_torrent"]["hash"])
+        self.assertEqual(1, selection_event["rejected_counts"]["manual_force_started"])
+        self.assertEqual(1, selection_event["candidate_counts"]["manual_force_started"])
+        self.assertEqual([["ready"]], client.started)
         self.assertEqual([], client.stopped)
         self.assertEqual(0, client.stop_all_calls)
-        self.assertEqual([], client.queue_limits)
+        self.assertEqual([(1, None)], client.queue_limits)
 
     def test_force_started_tv_torrent_still_gets_episode_file_priorities(self):
         forced = {
@@ -273,7 +273,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             ("forced-tv", [2, 3], self.guard.QBT_FILE_PRIORITY_HIGH),
             client.file_priority_calls,
         )
-        self.assertEqual([], client.started)
+        self.assertEqual([["ready"]], client.started)
         self.assertEqual([], client.stopped)
         self.assertEqual(0, client.stop_all_calls)
 
