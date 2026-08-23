@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import ssl
+import stat as stat_module
 import sys
 import threading
 import time
@@ -2839,33 +2840,100 @@ class RpiThermalCoolingManager:
         }
 
 
+def directory_allocated_bytes(path):
+    root_stat = os.stat(path, follow_symlinks=False)
+    root_device = root_stat.st_dev
+    total_bytes = max(0, getattr(root_stat, "st_blocks", 0) * 512)
+    seen_hardlinks = set()
+    pending = [os.fspath(path)]
+
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                try:
+                    entry_stat = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+
+                if entry_stat.st_dev != root_device or stat_module.S_ISLNK(entry_stat.st_mode):
+                    continue
+
+                if entry_stat.st_nlink > 1 and not stat_module.S_ISDIR(entry_stat.st_mode):
+                    identity = (entry_stat.st_dev, entry_stat.st_ino)
+                    if identity in seen_hardlinks:
+                        continue
+                    seen_hardlinks.add(identity)
+
+                total_bytes += max(0, getattr(entry_stat, "st_blocks", 0) * 512)
+                if stat_module.S_ISDIR(entry_stat.st_mode):
+                    pending.append(entry.path)
+
+    return total_bytes
+
+
 class DownloadStorageGuard:
     def __init__(self):
         self.enabled = env_bool("QBT_DOWNLOAD_STORAGE_GUARD_ENABLED", True)
         self.path = os.environ.get("QBT_DOWNLOAD_STORAGE_PATH", "/downloads").strip() or "/downloads"
         self.min_free_bytes = env_int("QBT_DOWNLOAD_STORAGE_MIN_FREE_BYTES", 30 * 1024 * 1024 * 1024)
         self.min_free_fraction = env_float("QBT_DOWNLOAD_STORAGE_MIN_FREE_FRACTION", 0.10)
+        self.capacity_bytes = max(0, env_int("QBT_DOWNLOAD_STORAGE_CAPACITY_BYTES", 0))
+        self.usage_cache_seconds = max(0, env_int("QBT_DOWNLOAD_STORAGE_USAGE_CACHE_SECONDS", 60))
         self.require_torrent_fit = env_bool("QBT_DOWNLOAD_STORAGE_REQUIRE_TORRENT_FIT", True)
         self.fail_closed = env_bool("QBT_DOWNLOAD_STORAGE_FAIL_CLOSED", True)
+        self._cached_usage_bytes = None
+        self._cached_usage_at = 0.0
+
+    def allocated_usage_bytes(self):
+        now = time.monotonic()
+        if (
+            self._cached_usage_bytes is not None
+            and now - self._cached_usage_at < self.usage_cache_seconds
+        ):
+            return self._cached_usage_bytes
+
+        usage_bytes = directory_allocated_bytes(self.path)
+        self._cached_usage_bytes = usage_bytes
+        self._cached_usage_at = now
+        return usage_bytes
+
+    def failure_state(self, reason):
+        if self.fail_closed:
+            return {"enabled": True, "stop": True, "reason": reason}
+        log_warning(
+            f"{reason}; continuing because QBT_DOWNLOAD_STORAGE_FAIL_CLOSED=false",
+        )
+        return {"enabled": True, "stop": False, "reason": reason}
 
     def snapshot(self):
         if not self.enabled:
             return {"enabled": False, "stop": False, "reason": "download storage guard disabled"}
 
         try:
-            stat = os.statvfs(self.path)
+            filesystem_stat = os.statvfs(self.path)
         except OSError as exc:
             reason = f"download storage check failed for {self.path}: {exc}"
-            if self.fail_closed:
-                return {"enabled": True, "stop": True, "reason": reason}
-            log_warning(
-                f"{reason}; continuing because QBT_DOWNLOAD_STORAGE_FAIL_CLOSED=false",
-            )
-            return {"enabled": True, "stop": False, "reason": reason}
+            return self.failure_state(reason)
 
-        block_size = stat.f_frsize or stat.f_bsize
-        total_bytes = max(0, stat.f_blocks * block_size)
-        free_bytes = max(0, stat.f_bavail * block_size)
+        block_size = filesystem_stat.f_frsize or filesystem_stat.f_bsize
+        reported_total_bytes = max(0, filesystem_stat.f_blocks * block_size)
+        reported_free_bytes = max(0, filesystem_stat.f_bavail * block_size)
+        used_bytes = None
+        capacity_source = "filesystem"
+        total_bytes = reported_total_bytes
+        free_bytes = reported_free_bytes
+
+        if self.capacity_bytes > 0:
+            try:
+                used_bytes = self.allocated_usage_bytes()
+            except OSError as exc:
+                reason = f"download storage usage scan failed for {self.path}: {exc}"
+                return self.failure_state(reason)
+            capacity_source = "configured"
+            total_bytes = self.capacity_bytes
+            free_bytes = max(0, total_bytes - used_bytes)
+
         reserve_bytes = max(
             max(0, self.min_free_bytes),
             math.floor(total_bytes * max(0.0, self.min_free_fraction)),
@@ -2885,6 +2953,10 @@ class DownloadStorageGuard:
                 "free_bytes": free_bytes,
                 "reserve_bytes": reserve_bytes,
                 "headroom_bytes": headroom_bytes,
+                "used_bytes": used_bytes,
+                "capacity_source": capacity_source,
+                "reported_total_bytes": reported_total_bytes,
+                "reported_free_bytes": reported_free_bytes,
             }
 
         return {
@@ -2896,6 +2968,10 @@ class DownloadStorageGuard:
             "free_bytes": free_bytes,
             "reserve_bytes": reserve_bytes,
             "headroom_bytes": headroom_bytes,
+            "used_bytes": used_bytes,
+            "capacity_source": capacity_source,
+            "reported_total_bytes": reported_total_bytes,
+            "reported_free_bytes": reported_free_bytes,
         }
 
     def check(self):
@@ -2904,11 +2980,18 @@ class DownloadStorageGuard:
             return state
         if state.get("total_bytes") is None:
             return state
+        details = ""
+        if state.get("capacity_source") == "configured":
+            details = (
+                f"; {human_size(state['used_bytes'])} allocated under the quota root; "
+                f"NFS reports {human_size(state['reported_free_bytes'])} free of "
+                f"{human_size(state['reported_total_bytes'])}"
+            )
         log_debug(
             f"Download storage check: {state['path']} has "
             f"{human_size(state['free_bytes'])} free of {human_size(state['total_bytes'])}; "
             f"reserve {human_size(state['reserve_bytes'])}, "
-            f"torrent headroom {human_size(state['headroom_bytes'])}"
+            f"torrent headroom {human_size(state['headroom_bytes'])}{details}"
         )
         return state
 

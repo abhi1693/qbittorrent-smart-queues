@@ -1,5 +1,9 @@
 import importlib
+import math
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 class StorageFitTests(unittest.TestCase):
@@ -29,6 +33,80 @@ class StorageFitTests(unittest.TestCase):
 
         self.assertIsNone(state["remaining_bytes"])
         self.assertEqual(0, state["selected_count"])
+
+    def test_directory_allocated_bytes_counts_hardlinks_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "source.bin")
+            alias = os.path.join(directory, "alias.bin")
+            with open(source, "wb") as file_handle:
+                file_handle.write(b"x" * 8192)
+            usage_before_link = self.guard.directory_allocated_bytes(directory)
+            os.link(source, alias)
+
+            usage_after_link = self.guard.directory_allocated_bytes(directory)
+
+        self.assertEqual(usage_before_link, usage_after_link)
+
+    def test_configured_capacity_uses_quota_root_usage_instead_of_filesystem_capacity(self):
+        capacity_bytes = 100 * 1024 * 1024
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "payload.bin"), "wb") as file_handle:
+                file_handle.write(b"x" * 8192)
+            expected_usage = self.guard.directory_allocated_bytes(directory)
+            with patch.dict(
+                os.environ,
+                {
+                    "QBT_DOWNLOAD_STORAGE_PATH": directory,
+                    "QBT_DOWNLOAD_STORAGE_CAPACITY_BYTES": str(capacity_bytes),
+                    "QBT_DOWNLOAD_STORAGE_MIN_FREE_BYTES": "0",
+                    "QBT_DOWNLOAD_STORAGE_MIN_FREE_FRACTION": "0",
+                    "QBT_DOWNLOAD_STORAGE_USAGE_CACHE_SECONDS": "0",
+                },
+            ):
+                state = self.guard.DownloadStorageGuard().snapshot()
+
+        self.assertEqual("configured", state["capacity_source"])
+        self.assertEqual(capacity_bytes, state["total_bytes"])
+        self.assertEqual(expected_usage, state["used_bytes"])
+        self.assertEqual(capacity_bytes - expected_usage, state["free_bytes"])
+
+    def test_configured_capacity_sets_fractional_reserve_from_quota(self):
+        capacity_bytes = 100 * 1024 * 1024
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "QBT_DOWNLOAD_STORAGE_PATH": directory,
+                    "QBT_DOWNLOAD_STORAGE_CAPACITY_BYTES": str(capacity_bytes),
+                    "QBT_DOWNLOAD_STORAGE_MIN_FREE_BYTES": "0",
+                    "QBT_DOWNLOAD_STORAGE_MIN_FREE_FRACTION": "0.10",
+                },
+            ):
+                state = self.guard.DownloadStorageGuard().snapshot()
+
+        self.assertEqual(math.floor(capacity_bytes * 0.10), state["reserve_bytes"])
+
+    def test_configured_capacity_fails_closed_when_usage_scan_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "QBT_DOWNLOAD_STORAGE_PATH": directory,
+                        "QBT_DOWNLOAD_STORAGE_CAPACITY_BYTES": "4000000000000",
+                        "QBT_DOWNLOAD_STORAGE_FAIL_CLOSED": "true",
+                    },
+                ),
+                patch.object(
+                    self.guard,
+                    "directory_allocated_bytes",
+                    side_effect=OSError("permission denied"),
+                ),
+            ):
+                state = self.guard.DownloadStorageGuard().snapshot()
+
+        self.assertTrue(state["stop"])
+        self.assertIn("usage scan failed", state["reason"])
 
     def test_storage_fit_blocks_incomplete_torrent_with_unknown_remaining_size(self):
         class Client:

@@ -348,6 +348,8 @@ Optional storage and thermal guards:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QBT_DOWNLOAD_STORAGE_PATH` | `/downloads` | Filesystem path checked for free download headroom. |
+| `QBT_DOWNLOAD_STORAGE_CAPACITY_BYTES` | `0` | Optional logical capacity for a quota-backed download root. When positive, recursively measure allocated bytes below `QBT_DOWNLOAD_STORAGE_PATH` instead of trusting pool-wide NFS free-space reporting. |
+| `QBT_DOWNLOAD_STORAGE_USAGE_CACHE_SECONDS` | `60` | Minimum interval between allocated-byte scans when a logical capacity is configured. |
 | `QBT_DOWNLOAD_STORAGE_MIN_FREE_BYTES` | `32212254720` | Minimum free-space reserve. |
 | `QBT_DOWNLOAD_STORAGE_PRESSURE_MIN_BLOCKED` | `10` | Minimum number of storage-blocked candidates required before storage pressure mode can activate. |
 | `QBT_DOWNLOAD_STORAGE_PRESSURE_BLOCKED_FRACTION` | `0.50` | Minimum fraction of all candidates blocked by storage headroom before storage pressure mode can activate. |
@@ -355,6 +357,12 @@ Optional storage and thermal guards:
 | `PROMETHEUS_URL` | unset | Prometheus base URL for thermal checks. |
 | `QBT_NVME_THERMAL_STOP_ENABLED` | enabled only when `PROMETHEUS_URL` is set | Enable NVMe thermal stop checks. |
 | `QBT_NVME_THERMAL_QUERY` | generic node-exporter NVMe composite-temperature query | PromQL query returning temperature samples. |
+
+NFS servers may report the backing pool's capacity even when they enforce a
+smaller per-export quota. Set `QBT_DOWNLOAD_STORAGE_CAPACITY_BYTES` to that
+quota in bytes so the guard derives logical free space from allocated blocks
+under the download root. The filesystem-reported totals remain in debug output
+for diagnosis but no longer control torrent-fit decisions.
 
 Optional Raspberry Pi thermal coordinator:
 
