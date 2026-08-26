@@ -237,6 +237,94 @@ class PolicyEngineTests(unittest.TestCase):
         ])
         self.assertEqual(1, classification.rejected_counts["deferred_parked_stalled"])
 
+    def test_parked_priority_falls_back_to_usable_normal_candidates(self):
+        priority = self.torrent("priority", state="stalledDL", tags="priority")
+        normal = self.torrent("normal")
+        health_store = FakeHealthStore(no_progress_hashes={"priority"})
+        engine = self.engine([priority, normal], health_store=health_store)
+        engine.max_parked_stalled_downloads = 1
+
+        result = engine.run()
+
+        self.assertEqual(["priority"], [
+            torrent["hash"]
+            for torrent in result.scoring.normal_parked_stalled_torrents
+        ])
+        self.assertEqual(["normal"], [
+            torrent["hash"] for torrent in result.scoring.selection_candidates
+        ])
+        self.assertEqual(1, result.rejected_counts["priority_pool_exhausted"])
+        self.assertEqual("try_candidate", result.action_plan.action)
+
+    def test_usable_priority_does_not_displace_productive_normal_download(self):
+        priority = self.torrent("priority", tags="priority")
+        productive = self.torrent(
+            "productive",
+            state="downloading",
+            dlspeed=100_000,
+        )
+
+        result = self.engine([priority, productive]).run()
+
+        self.assertEqual(["priority"], [
+            torrent["hash"] for torrent in result.scoring.selection_candidates
+        ])
+        self.assertEqual(["productive"], [
+            torrent["hash"] for torrent in result.scoring.productive_candidates
+        ])
+        self.assertEqual("keep_productive", result.action_plan.action)
+
+    def test_adaptive_worker_plan_scales_probe_slots_and_contracts_at_saturation(self):
+        productive_one = self.torrent(
+            "productive-one",
+            state="downloading",
+            dlspeed=1_000_000,
+        )
+        productive_two = self.torrent(
+            "productive-two",
+            state="downloading",
+            dlspeed=8_000_000,
+        )
+
+        discovery = self.guard.adaptive_worker_plan(
+            5,
+            20,
+            [],
+            10_000_000,
+            min_workers=1,
+            probe_slots=2,
+        )
+        underused = self.guard.adaptive_worker_plan(
+            5,
+            20,
+            [productive_one],
+            10_000_000,
+            min_workers=1,
+            probe_slots=2,
+        )
+        saturated = self.guard.adaptive_worker_plan(
+            5,
+            20,
+            [productive_one, productive_two],
+            10_000_000,
+            min_workers=1,
+            probe_slots=2,
+            target_utilization_fraction=0.80,
+        )
+        disabled = self.guard.adaptive_worker_plan(
+            5,
+            20,
+            [productive_one],
+            10_000_000,
+            enabled=False,
+        )
+
+        self.assertEqual(2, discovery.worker_limit)
+        self.assertEqual(3, underused.worker_limit)
+        self.assertEqual(2, saturated.worker_limit)
+        self.assertTrue(saturated.saturated)
+        self.assertEqual(5, disabled.worker_limit)
+
     def test_storage_pressure_sorts_fitting_candidates_by_storage_score(self):
         class StorageGuard:
             require_torrent_fit = True

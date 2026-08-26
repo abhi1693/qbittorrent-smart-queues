@@ -1102,6 +1102,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         env = {
             "QBT_SINGLE_DOWNLOAD_CATEGORIES": "tv,movies",
             "QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY": "3",
+            "QBT_SINGLE_DOWNLOAD_ADAPTIVE_WORKERS_ENABLED": "false",
             "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
             "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
             "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
@@ -1156,6 +1157,133 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual(1, try_event["candidate_counts"]["smart_queue_parked_listener_slots"])
         self.assertEqual(7, try_event["candidate_counts"]["qbt_active_download_limit"])
         self.assertEqual({"tv": 3, "movies": 3}, try_event["selected_category_counts"])
+
+    def test_adaptive_category_batch_replaces_failed_probes_and_cools_overflow(self):
+        class AdaptiveFakeQbtClient(FakeQbtClient):
+            def start_hashes(self, hashes):
+                super().start_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] not in hashes:
+                        continue
+                    if torrent["hash"].startswith("dead"):
+                        torrent["state"] = "stalledDL"
+                        torrent["dlspeed"] = 0
+                        continue
+                    torrent["state"] = "downloading"
+                    torrent["dlspeed"] = 1_000_000
+                    torrent["downloaded"] += 2 * 1024 * 1024
+                    torrent["amount_left"] = max(
+                        1,
+                        torrent["amount_left"] - (2 * 1024 * 1024),
+                    )
+
+            def stop_hashes(self, hashes):
+                super().stop_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] in hashes:
+                        torrent["state"] = "stoppedDL"
+                        torrent["dlspeed"] = 0
+
+        def torrent(item_hash, state="stoppedDL", progress=0.1, speed=0):
+            return {
+                "hash": item_hash,
+                "name": f"{item_hash}.Movie.1080p",
+                "category": "movies",
+                "state": state,
+                "dlspeed": speed,
+                "amount_left": 20 * 1024 * 1024,
+                "downloaded": 10 * 1024 * 1024,
+                "progress": progress,
+                "availability": 2.0,
+                "num_seeds": 5,
+                "num_complete": 5,
+                "tags": "",
+            }
+
+        client = AdaptiveFakeQbtClient([
+            torrent("productive", state="downloading", progress=0.5, speed=1_000_000),
+            torrent("listener", state="stalledDL", progress=0.95),
+            torrent("dead-one", progress=0.99),
+            torrent("dead-two", progress=0.98),
+            torrent("replacement", progress=0.10),
+        ])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY": "5",
+                "QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS": "5",
+                "QBT_SINGLE_DOWNLOAD_ADAPTIVE_WORKERS_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_MIN_ACTIVE_DOWNLOADS": "1",
+                "QBT_SINGLE_DOWNLOAD_PROBE_SLOTS": "2",
+                "QBT_SINGLE_DOWNLOAD_TARGET_UTILIZATION_FRACTION": "0.80",
+                "QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES": "1",
+                "QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED": "1",
+                "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "2",
+                "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "60",
+                "QBT_SINGLE_DOWNLOAD_MIN_PROGRESS_BYTES": str(1024 * 1024),
+                "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+                "QBT_SINGLE_DOWNLOAD_SELECTION_STRATEGY": "balanced",
+                "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_TORRENT_HEALTH_STATE_PATH": f"{tmpdir}/torrent-health.json",
+                "QBT_TRACKER_HEALTH_SCORING_ENABLED": "false",
+                "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+                "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+                "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+                "QBT_LOG_FORMAT": "json",
+                "QBT_DECISION_LOG_LEVEL": "info",
+            }
+            with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(
+                self.guard.time,
+                "sleep",
+            ):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.guard.apply_single_download(
+                        [client],
+                        usage_bytes=0,
+                        monthly_limit_bytes=1000,
+                        download_limit=10_000_000,
+                        limit_reason="unit test",
+                        storage_guard=FakeStorageGuard(),
+                    )
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        try_events = [
+            item for item in decision_events
+            if item.get("action") == "try_category_batch"
+            and "candidate_counts" in item
+        ]
+        keep_events = [
+            item for item in decision_events
+            if item.get("action") == "keep_category_batch"
+            and "candidate_counts" in item
+        ]
+
+        self.assertEqual(
+            2,
+            len(try_events),
+            [[item["hash"] for item in event.get("selected_torrents", [])] for event in try_events],
+        )
+        self.assertEqual(3, try_events[0]["candidate_counts"]["adaptive_worker_limit"])
+        self.assertEqual(2, try_events[1]["candidate_counts"]["adaptive_worker_limit"])
+        self.assertEqual(
+            {"productive", "dead-one", "dead-two"},
+            set(client.started[0]),
+        )
+        self.assertEqual({"productive", "replacement"}, set(client.started[1]))
+        self.assertEqual(0, keep_events[0]["candidate_counts"]["normal_category_newly_parked"])
+        self.assertEqual(2, keep_events[0]["candidate_counts"]["normal_category_stopped_no_progress"])
+        self.assertTrue(any("dead-one" in hashes for hashes in client.stopped))
+        self.assertTrue(any("dead-two" in hashes for hashes in client.stopped))
+        self.assertEqual(2, len(client.added_tags))
+        self.assertIn((4, None), client.queue_limits)
+        self.assertIn((3, None), client.queue_limits)
 
     def test_category_worker_limit_keeps_productive_and_fills_open_category_slots(self):
         torrents = [
@@ -1384,6 +1512,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             "QBT_SINGLE_DOWNLOAD_CATEGORIES": "tv,movies",
             "QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY": "3",
             "QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS": "4",
+            "QBT_SINGLE_DOWNLOAD_ADAPTIVE_WORKERS_ENABLED": "false",
             "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
             "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
             "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",

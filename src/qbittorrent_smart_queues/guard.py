@@ -203,6 +203,94 @@ def smart_queue_slot_plan(worker_slots, parked_listener_slots=0):
     )
 
 
+@dataclass(frozen=True)
+class AdaptiveWorkerPlan:
+    worker_limit: int
+    worker_ceiling: int
+    productive_workers: int
+    productive_speed_bytes_per_sec: int
+    target_utilization_bytes_per_sec: int
+    probe_slots: int
+    saturated: bool
+
+    def as_counts(self):
+        return {
+            "adaptive_worker_limit": self.worker_limit,
+            "adaptive_worker_ceiling": self.worker_ceiling,
+            "adaptive_productive_workers": self.productive_workers,
+            "adaptive_productive_speed_bytes_per_sec": self.productive_speed_bytes_per_sec,
+            "adaptive_target_utilization_bytes_per_sec": self.target_utilization_bytes_per_sec,
+            "adaptive_probe_slots": self.probe_slots,
+            "adaptive_saturated": self.saturated,
+        }
+
+
+def adaptive_worker_plan(
+    max_workers,
+    candidate_count,
+    productive_torrents,
+    capacity_bytes_per_sec,
+    *,
+    enabled=True,
+    min_workers=1,
+    probe_slots=2,
+    target_utilization_fraction=0.80,
+):
+    max_workers = max(0, int(max_workers or 0))
+    candidate_count = max(0, int(candidate_count or 0))
+    worker_ceiling = min(max_workers, candidate_count)
+    min_workers = max(1, int(min_workers or 1))
+    probe_slots = max(0, int(probe_slots or 0))
+    capacity_bytes_per_sec = max(0, int(capacity_bytes_per_sec or 0))
+    target_utilization_fraction = max(
+        0.05,
+        min(1.0, float(target_utilization_fraction or 0.80)),
+    )
+
+    productive_by_hash = {}
+    for torrent in productive_torrents or []:
+        item_hash = torrent_hash(torrent)
+        key = item_hash or id(torrent)
+        productive_by_hash[key] = torrent
+    productive_workers = min(worker_ceiling, len(productive_by_hash))
+    productive_speed_bytes_per_sec = sum(
+        max(0, torrent_download_speed(torrent))
+        for torrent in productive_by_hash.values()
+    )
+    target_utilization_bytes_per_sec = (
+        max(1, math.floor(capacity_bytes_per_sec * target_utilization_fraction))
+        if capacity_bytes_per_sec > 0
+        else 0
+    )
+    saturated = bool(
+        target_utilization_bytes_per_sec > 0
+        and productive_speed_bytes_per_sec >= target_utilization_bytes_per_sec
+    )
+
+    if worker_ceiling <= 0:
+        worker_limit = 0
+    elif not enabled:
+        worker_limit = worker_ceiling
+    elif saturated and productive_workers > 0:
+        worker_limit = productive_workers
+    else:
+        worker_limit = max(
+            min_workers,
+            productive_workers + probe_slots,
+        )
+        worker_limit = min(worker_ceiling, worker_limit)
+
+    return AdaptiveWorkerPlan(
+        worker_limit=worker_limit,
+        worker_ceiling=worker_ceiling,
+        productive_workers=productive_workers,
+        productive_speed_bytes_per_sec=productive_speed_bytes_per_sec,
+        target_utilization_bytes_per_sec=target_utilization_bytes_per_sec,
+        probe_slots=probe_slots,
+        saturated=saturated,
+    )
+
+
 def cap_aware_worker_limit(requested_workers, download_limit, min_rate_bytes_per_sec):
     requested_workers = max(1, int(requested_workers or 1))
     try:
@@ -9896,6 +9984,7 @@ class SmartQueuePolicyEngine:
         normal_parked_stalled_hashes = set()
         normal_deferred_parked_stalled_hashes = set()
         normal_parked_stalled_deferred_count = 0
+        productive_pool = []
 
         if observation.storage_constrained_mode:
             fit_bytes = storage_fit_headroom_bytes(self.storage_guard, self.storage_state)
@@ -9965,6 +10054,7 @@ class SmartQueuePolicyEngine:
             rejected_counts["deferred_storage_recovery_parked"] += storage_recovery_parked_deferred_count
             rejected_counts["excluded_slow_storage_recovery"] += len(storage_recovery_slow_excluded_hashes)
             rejected_counts["deferred_by_storage_recovery_batch"] += storage_recovery_deferred_count
+            productive_pool = selection_candidates
         else:
             if self.park_stalled_downloads_enabled:
                 for torrent in filters.candidates:
@@ -10004,26 +10094,54 @@ class SmartQueuePolicyEngine:
                     normal_parked_stalled_hashes.add(item_hash)
                 rejected_counts["parked_stalled"] += len(normal_parked_stalled_torrents)
                 rejected_counts["deferred_parked_stalled"] += normal_parked_stalled_deferred_count
-            base_selection_candidates = (
-                watch_priority_candidates
-                or priority_candidates
-                or filters.available_candidates
+            excluded_listener_hashes = (
+                normal_parked_stalled_hashes
+                | normal_deferred_parked_stalled_hashes
             )
+
+            def usable_selection_candidates(candidates):
+                return [
+                    torrent for torrent in candidates
+                    if torrent_hash(torrent) not in excluded_listener_hashes
+                ]
+
+            usable_watch_priority_candidates = usable_selection_candidates(
+                watch_priority_candidates,
+            )
+            usable_priority_candidates = usable_selection_candidates(
+                priority_candidates,
+            )
+            usable_available_candidates = usable_selection_candidates(
+                filters.available_candidates,
+            )
+            if usable_watch_priority_candidates:
+                selection_candidates = usable_watch_priority_candidates
+                rejected_counts["deferred_by_watch_activity"] += (
+                    len(usable_available_candidates)
+                    - len(usable_watch_priority_candidates)
+                )
+            elif usable_priority_candidates:
+                selection_candidates = usable_priority_candidates
+                rejected_counts["deferred_by_priority"] += (
+                    len(usable_available_candidates)
+                    - len(usable_priority_candidates)
+                )
+            else:
+                selection_candidates = usable_available_candidates
+                if watch_priority_candidates:
+                    rejected_counts["watch_priority_pool_exhausted"] += 1
+                if priority_candidates:
+                    rejected_counts["priority_pool_exhausted"] += 1
+
             selection_candidates = [
-                torrent for torrent in base_selection_candidates
+                torrent for torrent in selection_candidates
                 if torrent_hash(torrent) not in normal_parked_stalled_hashes
                 and torrent_hash(torrent) not in normal_deferred_parked_stalled_hashes
             ]
-
-        if not observation.storage_constrained_mode and watch_priority_candidates:
-            rejected_counts["deferred_by_watch_activity"] += (
-                len(filters.available_candidates) - len(watch_priority_candidates)
-            )
-        elif not observation.storage_constrained_mode and priority_candidates:
-            rejected_counts["deferred_by_priority"] += len(filters.available_candidates) - len(priority_candidates)
+            productive_pool = usable_available_candidates
 
         productive_candidates = []
-        for torrent in selection_candidates:
+        for torrent in productive_pool:
             lifecycle = torrent_lifecycle(
                 torrent,
                 self.health_store,
@@ -10589,6 +10707,25 @@ def apply_single_download(
         0,
         env_int("QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS", 0),
     )
+    adaptive_workers_enabled = env_bool(
+        "QBT_SINGLE_DOWNLOAD_ADAPTIVE_WORKERS_ENABLED",
+        True,
+    )
+    adaptive_min_active_downloads = max(
+        1,
+        env_int("QBT_SINGLE_DOWNLOAD_MIN_ACTIVE_DOWNLOADS", 1),
+    )
+    adaptive_probe_slots = max(
+        0,
+        env_int("QBT_SINGLE_DOWNLOAD_PROBE_SLOTS", 2),
+    )
+    adaptive_target_utilization_fraction = max(
+        0.05,
+        min(
+            1.0,
+            env_float("QBT_SINGLE_DOWNLOAD_TARGET_UTILIZATION_FRACTION", 0.80),
+        ),
+    )
     base_productive_rate_floor_bytes = cap_aware_productive_rate_floor(
         slow_min_rate_bytes,
         download_limit,
@@ -10951,7 +11088,7 @@ def apply_single_download(
                     hashes=sorted(manual_override_hashes),
                 )
             storage_constrained_mode = storage_state_is_reserve_constrained(storage_guard, storage_state)
-            if storage_constrained_mode:
+            if storage_constrained_mode or max_active_downloads_per_category > 0:
                 initial_slot_plan = None
             else:
                 initial_slot_plan = smart_queue_slot_plan(normal_worker_limit, 0)
@@ -11544,8 +11681,18 @@ def apply_single_download(
                 if leased_worker_candidates:
                     candidate_counts["selection_lease_active"] = len(leased_worker_candidates)
 
-                category_worker_limit = cap_aware_total_worker_limit(
-                    selection_candidates,
+                category_candidates = []
+                category_candidate_hashes = set()
+                for torrent in productive_candidates + selection_candidates:
+                    item_hash = torrent_hash(torrent)
+                    if item_hash and item_hash in category_candidate_hashes:
+                        continue
+                    category_candidates.append(torrent)
+                    if item_hash:
+                        category_candidate_hashes.add(item_hash)
+
+                category_worker_ceiling = cap_aware_total_worker_limit(
+                    category_candidates,
                     max_active_downloads_per_category,
                     normal_worker_limit,
                     download_limit,
@@ -11553,13 +11700,24 @@ def apply_single_download(
                     max_total_active_downloads=max_total_active_downloads,
                     uncapped_window_active=uncapped_window_active,
                 )
+                adaptive_plan = adaptive_worker_plan(
+                    category_worker_ceiling,
+                    len(category_candidates),
+                    productive_candidates,
+                    slow_reference_limit,
+                    enabled=adaptive_workers_enabled,
+                    min_workers=adaptive_min_active_downloads,
+                    probe_slots=adaptive_probe_slots,
+                    target_utilization_fraction=adaptive_target_utilization_fraction,
+                )
+                category_worker_limit = adaptive_plan.worker_limit
                 category_productive_rate_floor_bytes = cap_aware_productive_rate_floor(
                     slow_min_rate_bytes,
                     download_limit,
                     category_worker_limit,
                 )
                 selected_batch, selected_by_category, deferred_by_category_limit = category_worker_batch(
-                    selection_candidates,
+                    category_candidates,
                     productive_candidates + leased_worker_candidates,
                     max_active_downloads_per_category,
                     max_total_workers=category_worker_limit,
@@ -11632,6 +11790,8 @@ def apply_single_download(
                             max_total_active_downloads
                         ),
                         "normal_category_total_worker_limit": category_worker_limit,
+                        "adaptive_workers_enabled": adaptive_workers_enabled,
+                        **adaptive_plan.as_counts(),
                         "productive_rate_floor_bytes_per_sec": category_productive_rate_floor_bytes,
                         **category_slot_plan.as_counts(),
                     }
@@ -11664,6 +11824,8 @@ def apply_single_download(
                         f"Running {len(selected_hashes)} torrent(s) across "
                         f"{len(selected_by_category)} category/categories; "
                         f"up to {max_active_downloads_per_category} worker(s) per category; "
+                        f"adaptive useful workers {category_worker_limit}/"
+                        f"{category_worker_ceiling}; "
                         f"aggregate useful worker cap {total_worker_cap_description}; "
                         f"{len(normal_parked_stalled_torrents)} stalled torrent(s) parked; "
                         f"qB active download limit {category_slot_plan.qbt_active_download_limit}",
@@ -11675,7 +11837,11 @@ def apply_single_download(
                     if stall_check_seconds <= 0:
                         break
 
-                    time.sleep(stall_check_seconds)
+                    sample_seconds = min(
+                        stall_check_seconds,
+                        max(1, int(deadline - time.monotonic())),
+                    )
+                    time.sleep(sample_seconds)
                     refreshed = {
                         torrent_hash(torrent): torrent
                         for torrent in single_download_torrents(client)
@@ -11714,6 +11880,14 @@ def apply_single_download(
                     stopped_after_sample = []
                     no_progress_count = 0
                     progress_class_counts = Counter()
+                    if max_parked_stalled_downloads > 0:
+                        listener_slots_remaining = max(
+                            0,
+                            max_parked_stalled_downloads
+                            - len(normal_parked_stalled_hashes),
+                        )
+                    else:
+                        listener_slots_remaining = None
                     for selected in selected_batch:
                         selected_hash = torrent_hash(selected)
                         selected_refreshed = refreshed.get(selected_hash)
@@ -11721,7 +11895,7 @@ def apply_single_download(
                             selected,
                             selected_refreshed or selected,
                             normal_progress_min_bytes(selected, len(selected_hashes)),
-                            stall_check_seconds,
+                            sample_seconds,
                         )
                         progress_class_counts[progress_class_count_key(progress_classification.state)] += 1
                         if progress_classification.state == PROGRESS_CLASS_ACTIVELY_PROGRESSING:
@@ -11735,24 +11909,35 @@ def apply_single_download(
                                 selected,
                                 selected_refreshed,
                                 datetime.now(timezone.utc),
-                                stall_check_seconds,
+                                sample_seconds,
                             )
                             continue
 
                         no_progress_count += 1
                         no_progress_torrent = selected_refreshed or selected
-                        if park_stalled_downloads_enabled and progress_classification.park_as_listener:
+                        if selected_hash:
+                            attempted_hashes.add(selected_hash)
+                        can_park_as_listener = (
+                            park_stalled_downloads_enabled
+                            and progress_classification.park_as_listener
+                            and (
+                                listener_slots_remaining is None
+                                or listener_slots_remaining > 0
+                            )
+                        )
+                        if can_park_as_listener:
                             health_store.record_storage_recovery_no_progress(
                                 no_progress_torrent,
                                 datetime.now(timezone.utc),
                                 classification=progress_classification,
                             )
                             parked_after_sample.append(no_progress_torrent)
+                            if listener_slots_remaining is not None:
+                                listener_slots_remaining -= 1
                             continue
 
                         if selected_hash and not is_force_started_torrent(no_progress_torrent):
                             client.stop_hashes([selected_hash])
-                            attempted_hashes.add(selected_hash)
                         cooldown_reason = progress_classification.cooldown_reason
                         health_store.record_failure(
                             no_progress_torrent,
@@ -11779,6 +11964,11 @@ def apply_single_download(
                         "normal_category_no_progress": no_progress_count,
                         "normal_category_newly_parked": len(parked_after_sample),
                         "normal_category_stopped_no_progress": len(stopped_after_sample),
+                        "normal_category_listener_capacity_remaining": (
+                            listener_slots_remaining
+                            if listener_slots_remaining is not None
+                            else -1
+                        ),
                     }
                     emit_decision_log(
                         "qbt_guard_decision",
@@ -11789,8 +11979,8 @@ def apply_single_download(
                         ),
                         action="keep_category_batch",
                         reason=(
-                            "category batch remains selected; no-progress torrents "
-                            "are parked outside category worker counts when parking is enabled"
+                            "productive workers remain selected; failed probes are parked only "
+                            "within the listener cap or cooled down before replacement"
                         ),
                         selected_torrent=scored_torrent_summary(
                             refreshed.get(torrent_hash(selected_batch[0])) or selected_batch[0]
@@ -11813,13 +12003,27 @@ def apply_single_download(
                     )
                     log_decision_info(
                         "keep_category_batch",
-                        f"Keeping category batch selected after {stall_check_seconds}s; "
+                        f"Keeping productive category workers after {sample_seconds}s; "
                         f"{len(progress_events)} progressed, "
                         f"{no_progress_count} without measured progress, "
                         f"{len(parked_after_sample)} parked, "
                         f"{len(stopped_after_sample)} stopped",
                         selected=", ".join(torrent_name(torrent) for torrent in selected_batch[:5]),
                     )
+                    has_replacement_candidates = any(
+                        torrent_hash(torrent)
+                        and torrent_hash(torrent) not in selected_hash_set
+                        and torrent_hash(torrent) not in attempted_hashes
+                        for torrent in filters.available_candidates
+                    )
+                    can_retry = max_attempts <= 0 or attempt < max_attempts
+                    if (
+                        no_progress_count > 0
+                        and has_replacement_candidates
+                        and can_retry
+                        and time.monotonic() < deadline
+                    ):
+                        continue
                     if stopped_after_sample and not progress_events and not park_stalled_downloads_enabled:
                         continue
                     break

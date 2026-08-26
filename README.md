@@ -282,6 +282,10 @@ storage hard-stop, and shutdown hooks still apply.
 | `QBT_NO_PROGRESS_CLASS_SCORE_MAX_AGE_SECONDS` | `86400` | How long the last no-progress class influences candidate scoring. |
 | `QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY` | `0` | Optional normal-mode category worker limit. When set above `0`, the selector keeps or starts up to this many active download workers for each qBittorrent category, while parked stalled torrents remain active outside the per-category worker count. |
 | `QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS` | `0` | Optional aggregate normal-mode worker cap across all categories. `0` leaves the total governed by the per-category and effective-rate limits. Parked stalled listeners remain outside this worker count. |
+| `QBT_SINGLE_DOWNLOAD_ADAPTIVE_WORKERS_ENABLED` | `true` | Dynamically size the useful worker pool between the configured minimum and worker ceiling. Underused capacity adds bounded probe slots; productive workers that meet the utilization target cause the pool to contract instead of starting unnecessary torrents. |
+| `QBT_SINGLE_DOWNLOAD_MIN_ACTIVE_DOWNLOADS` | `1` | Minimum useful worker target while eligible candidates exist. The candidate count and configured worker ceilings can still lower it. |
+| `QBT_SINGLE_DOWNLOAD_PROBE_SLOTS` | `2` | Additional candidate slots opened while productive throughput remains below the target. Failed probes are replaced in the same controller run when attempt and time budgets allow. |
+| `QBT_SINGLE_DOWNLOAD_TARGET_UTILIZATION_FRACTION` | `0.80` | Fraction of the effective download capacity at which productive workers are considered sufficient and probe slots are closed. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES` | storage recovery stall samples | No-progress samples required before a non-productive running torrent is parked. qBittorrent `stalledDL`/`metaDL` torrents park immediately. |
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
@@ -443,11 +447,20 @@ human-started torrent runs outside the managed worker limit while the configured
 normal worker pool continues. Explicit quota, backup-internet, thermal, storage
 hard-stop, and shutdown safeguards retain authority over all downloads.
 
-By default, normal single-download mode now parks stalled/no-progress torrents
-instead of pausing and cooldown-tagging them. Parked torrents stay active in
-qBittorrent so they can resume immediately if a needed peer appears, while the
-controller excludes them from replacement selection and raises qBittorrent's
-active download limit enough to start replacement candidates beside them. Set
+By default, normal single-download mode adaptively sizes the useful worker pool.
+When measured productive throughput is below the configured utilization target,
+the controller adds a bounded number of probe slots; when existing productive
+workers meet the target, it contracts to those workers. Failed probes are
+replaced during the same run instead of waiting for the next scheduled pass.
+
+Stalled/no-progress torrents are parked only while listener capacity remains.
+Parked torrents stay active in qBittorrent so they can resume immediately if a
+needed peer appears, while the controller excludes them from replacement
+selection and raises qBittorrent's active download limit enough to start
+replacement candidates beside them. A failed probe that cannot fit in the
+bounded listener pool is stopped and given reason-specific cooldown/backoff;
+this prevents repeatedly retrying the same unavailable torrent while the rest
+of the queue starves. Set
 `QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY` above `0` to run a
 normal-mode batch with that many active download workers per qBittorrent
 category. `QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS` can additionally cap
@@ -461,6 +474,11 @@ Internally the selector classifies every torrent into a lifecycle state:
 `retryable`, or `stale`. Worker states consume a useful download slot;
 parked-listener states keep qBittorrent listening for peers without consuming a
 worker slot.
+Priority and active-watch pools are applied only when they contain a usable
+worker candidate. If every preferred torrent is parked, deferred, attempted, or
+cooling down, selection falls back to the normal eligible pool rather than
+reporting an empty selection pool. A productive normal download remains in the
+worker set while preferred candidates use the available probe slots.
 No-progress samples are also classified as `actively-progressing`,
 `slow-progressing`, `missing-final-piece`, `metadata-wait`,
 `no-connected-peers`, or `tracker-dead`. Listener-worthy classes stay parked and
