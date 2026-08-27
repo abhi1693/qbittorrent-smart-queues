@@ -7194,6 +7194,33 @@ def availability_probe_download_limit():
     )
 
 
+def availability_verified_tags(torrent):
+    tags = []
+    for tag in torrent_tags(torrent):
+        if tag.lower() == AVAILABILITY_VERIFIED_TAG:
+            tags.append(tag)
+            continue
+        if parse_stall_cooldown_tag_details(tag, AVAILABILITY_VERIFIED_TAG):
+            tags.append(tag)
+    return sorted(tags)
+
+
+def availability_verification_is_fresh(torrent, now=None):
+    if now is None:
+        now = datetime.now(timezone.utc)
+    recheck_seconds = max(
+        0,
+        env_int("QBT_AVAILABILITY_VERIFIED_RECHECK_SECONDS", 21_600),
+    )
+    for tag in availability_verified_tags(torrent):
+        verified_at = parse_stall_cooldown_tag(tag, AVAILABILITY_VERIFIED_TAG)
+        if verified_at is None:
+            continue
+        if max(0.0, (now - verified_at).total_seconds()) < recheck_seconds:
+            return True
+    return False
+
+
 def availability_probe_candidate(torrent, health_store=None, now=None):
     if not availability_admission_enabled():
         return False
@@ -7210,6 +7237,8 @@ def availability_probe_candidate(torrent, health_store=None, now=None):
             if health_store.active_cooldown_state(torrent, now, scope="normal"):
                 return False
         return True
+    if availability_verification_is_fresh(torrent, now):
+        return False
 
     availability = torrent_availability(torrent)
     if not (0 < availability < env_float("QBT_AVAILABILITY_MIN_COMPLETE", 1.0)):
@@ -7251,7 +7280,7 @@ def prepare_availability_probe_torrents(client, torrents):
         if (
             not item_hash
             or is_force_started_torrent(torrent)
-            or torrent_matching_tags(torrent, AVAILABILITY_VERIFIED_TAG)
+            or availability_verified_tags(torrent)
             or torrent_matching_tags(torrent, AVAILABILITY_PROBE_TAG)
             or torrent_matching_tags(torrent, AVAILABILITY_REJECTION_FAILED_TAG)
         ):
@@ -7282,9 +7311,18 @@ def clear_availability_probe(client, torrent, verified):
         return
     if verified:
         client.set_torrent_download_limit([item_hash], 0)
-    client.remove_tags([item_hash], [AVAILABILITY_PROBE_TAG])
-    if verified:
-        client.add_tags([item_hash], [AVAILABILITY_VERIFIED_TAG])
+        verified_tag = stall_cooldown_tag(
+            AVAILABILITY_VERIFIED_TAG,
+            datetime.now(timezone.utc),
+        )
+        client.add_tags([item_hash], [verified_tag])
+        obsolete_tags = availability_verified_tags(torrent)
+        client.remove_tags(
+            [item_hash],
+            sorted(set([AVAILABILITY_PROBE_TAG, *obsolete_tags]) - {verified_tag}),
+        )
+    else:
+        client.remove_tags([item_hash], [AVAILABILITY_PROBE_TAG])
 
 
 def process_availability_admission_torrent(

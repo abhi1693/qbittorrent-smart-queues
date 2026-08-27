@@ -246,6 +246,7 @@ swarm debt instead of protecting only new grabs.
 | `QBT_AVAILABILITY_PROBE_INTERVAL_SECONDS` | `10` | Delay between fresh qBittorrent availability samples. |
 | `QBT_AVAILABILITY_LEGACY_MIN_PROGRESS` | `0.95` | Progress threshold that makes an existing incomplete, below-threshold torrent eligible for probing. |
 | `QBT_AVAILABILITY_LEGACY_MIN_NO_PROGRESS_SAMPLES` | `2` | Stored no-progress observations that make another existing below-threshold torrent eligible for probing. |
+| `QBT_AVAILABILITY_VERIFIED_RECHECK_SECONDS` | `21600` | Minimum time after a complete availability sample before a still-stalled torrent can be probed again. The timestamp is persisted in its `availability-verified-*` tag. |
 | `QBT_AVAILABILITY_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr removal and blocklist calls. |
 
 Stale maintenance is intentionally conservative. It does not delete incomplete

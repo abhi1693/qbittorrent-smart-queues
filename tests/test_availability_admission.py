@@ -104,7 +104,13 @@ class AvailabilityAdmissionTests(unittest.TestCase):
         self.assertEqual(1, result["below_minimum_samples"])
         self.assertEqual([], client.deleted)
         self.assertEqual([(["abc123"], ["availability-probe"])], client.removed_tags)
-        self.assertEqual([(["abc123"], ["availability-verified"])], client.added_tags)
+        self.assertEqual(1, len(client.added_tags))
+        self.assertEqual(["abc123"], client.added_tags[0][0])
+        self.assertEqual(1, len(client.added_tags[0][1]))
+        self.assertRegex(
+            client.added_tags[0][1][0],
+            r"^availability-verified-\d{8}T\d{6}Z$",
+        )
         self.assertEqual([(["abc123"], 0)], client.download_limits)
 
     def test_stably_incomplete_availability_is_blocklisted_through_sonarr(self):
@@ -194,6 +200,25 @@ class AvailabilityAdmissionTests(unittest.TestCase):
         self.assertEqual(["abc123"], prepared)
         self.assertEqual([(["abc123"], 1_048_576)], client.download_limits)
         self.assertEqual([(["abc123"], ["availability-probe"])], client.added_tags)
+
+    def test_recent_verification_defers_reprobe_until_recheck_window_expires(self):
+        torrent = dict(
+            self.base_torrent,
+            tags="availability-verified-20260827T100000Z",
+        )
+
+        with mock.patch.dict("os.environ", self.env, clear=True):
+            fresh = self.guard.availability_probe_candidate(
+                torrent,
+                now=self.guard.datetime(2026, 8, 27, 12, 0, tzinfo=self.guard.timezone.utc),
+            )
+            expired = self.guard.availability_probe_candidate(
+                torrent,
+                now=self.guard.datetime(2026, 8, 27, 17, 0, tzinfo=self.guard.timezone.utc),
+            )
+
+        self.assertFalse(fresh)
+        self.assertTrue(expired)
 
 
 if __name__ == "__main__":
