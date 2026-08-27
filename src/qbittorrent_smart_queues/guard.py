@@ -138,6 +138,9 @@ TORRENT_LIFECYCLE_MANUAL_OVERRIDE = "manual-override"
 STOPPED_TORRENT_SCORE_PENALTY = -35.0
 MANUAL_BLACKLIST_TAG = "blacklist"
 MANUAL_BLACKLIST_FAILED_TAG = "blacklist-failed"
+AVAILABILITY_PROBE_TAG = "availability-probe"
+AVAILABILITY_VERIFIED_TAG = "availability-verified"
+AVAILABILITY_REJECTION_FAILED_TAG = "availability-rejection-failed"
 METADATA_TIMEOUT_FAILED_TAG = "metadata-timeout-failed"
 ARR_IMPORT_REJECTION_FAILED_TAG = "arr-import-rejection-failed"
 RYOKAN_IMPORTED_ANIME_FAILED_TAG = "ryokan-import-cleanup-failed"
@@ -4224,9 +4227,14 @@ def reachable_qbt_clients():
 
 def ensure_qbt_global_tags(client):
     try:
-        client.create_tags([MANUAL_BLACKLIST_TAG])
+        client.create_tags([
+            MANUAL_BLACKLIST_TAG,
+            AVAILABILITY_PROBE_TAG,
+            AVAILABILITY_VERIFIED_TAG,
+            AVAILABILITY_REJECTION_FAILED_TAG,
+        ])
     except (AttributeError, ApiError) as exc:
-        log_warning(f"Failed to ensure qBittorrent global tag {MANUAL_BLACKLIST_TAG!r}: {exc}")
+        log_warning(f"Failed to ensure qBittorrent global action tags: {exc}")
 
 
 def apply_safety_stop(clients, reason, decision_context=None):
@@ -6833,6 +6841,16 @@ def arr_import_rejection_block_reason(torrent, sonarr_queue, radarr_queue):
     return ""
 
 
+def availability_admission_block_reason(torrent):
+    if not availability_admission_enabled():
+        return ""
+    if torrent_matching_tags(torrent, AVAILABILITY_REJECTION_FAILED_TAG):
+        return "availability_rejection_failed"
+    if torrent_matching_tags(torrent, AVAILABILITY_PROBE_TAG):
+        return "availability_probe_pending"
+    return ""
+
+
 def clear_manual_blacklist_action_tags(client, torrent):
     item_hash = torrent_hash(torrent)
     if not item_hash:
@@ -7162,6 +7180,234 @@ def process_manual_blacklist_torrents(client, torrents=None, sonarr_queue=None, 
                     delete_files=True,
                 )
 
+    return result
+
+
+def availability_admission_enabled():
+    return env_bool("QBT_AVAILABILITY_ADMISSION_ENABLED", False)
+
+
+def availability_probe_download_limit():
+    return max(
+        1,
+        env_int("QBT_AVAILABILITY_PROBE_DOWNLOAD_LIMIT_BYTES_PER_SEC", 1_048_576),
+    )
+
+
+def availability_probe_candidate(torrent, health_store=None, now=None):
+    if not availability_admission_enabled():
+        return False
+    if (
+        not torrent_hash(torrent)
+        or is_force_started_torrent(torrent)
+        or torrent_progress(torrent) >= 1.0
+        or torrent_amount_left(torrent) <= 0
+        or torrent_matching_tags(torrent, AVAILABILITY_REJECTION_FAILED_TAG)
+    ):
+        return False
+    if torrent_matching_tags(torrent, AVAILABILITY_PROBE_TAG):
+        if health_store is not None and now is not None:
+            if health_store.active_cooldown_state(torrent, now, scope="normal"):
+                return False
+        return True
+
+    availability = torrent_availability(torrent)
+    if not (0 < availability < env_float("QBT_AVAILABILITY_MIN_COMPLETE", 1.0)):
+        return False
+    if is_stalled_torrent(torrent) and is_running_torrent(torrent):
+        return True
+    if torrent_progress(torrent) >= env_float("QBT_AVAILABILITY_LEGACY_MIN_PROGRESS", 0.95):
+        return True
+    return bool(
+        health_store is not None
+        and health_store.storage_recovery_no_progress_samples(torrent)
+        >= max(1, env_int("QBT_AVAILABILITY_LEGACY_MIN_NO_PROGRESS_SAMPLES", 2))
+    )
+
+
+def availability_probe_candidates(torrents, health_store=None, now=None):
+    candidates = [
+        torrent
+        for torrent in torrents or []
+        if availability_probe_candidate(torrent, health_store, now)
+    ]
+    candidates.sort(
+        key=lambda torrent: (
+            0 if torrent_matching_tags(torrent, AVAILABILITY_PROBE_TAG) else 1,
+            -torrent_progress(torrent),
+            -torrent_downloaded_bytes(torrent) if torrent_downloaded_bytes(torrent) is not None else 0,
+            torrent_name(torrent).lower(),
+        )
+    )
+    return candidates
+
+
+def prepare_availability_probe_torrents(client, torrents):
+    if not availability_admission_enabled():
+        return []
+    prepared = []
+    for torrent in torrents or []:
+        item_hash = torrent_hash(torrent)
+        if (
+            not item_hash
+            or is_force_started_torrent(torrent)
+            or torrent_matching_tags(torrent, AVAILABILITY_VERIFIED_TAG)
+            or torrent_matching_tags(torrent, AVAILABILITY_PROBE_TAG)
+            or torrent_matching_tags(torrent, AVAILABILITY_REJECTION_FAILED_TAG)
+        ):
+            continue
+        try:
+            client.set_torrent_download_limit(
+                [item_hash],
+                availability_probe_download_limit(),
+            )
+            client.add_tags([item_hash], [AVAILABILITY_PROBE_TAG])
+            prepared.append(item_hash)
+        except (AttributeError, ApiError) as exc:
+            try:
+                client.set_torrent_download_limit([item_hash], 0)
+            except (AttributeError, ApiError):
+                pass
+            log_warning(
+                f"Failed to prepare torrent availability probe for "
+                f"{torrent_name(torrent)}: {exc}",
+                hash=item_hash,
+            )
+    return prepared
+
+
+def clear_availability_probe(client, torrent, verified):
+    item_hash = torrent_hash(torrent)
+    if not item_hash:
+        return
+    if verified:
+        client.set_torrent_download_limit([item_hash], 0)
+    client.remove_tags([item_hash], [AVAILABILITY_PROBE_TAG])
+    if verified:
+        client.add_tags([item_hash], [AVAILABILITY_VERIFIED_TAG])
+
+
+def process_availability_admission_torrent(
+    client,
+    torrent,
+    sonarr_queue,
+    radarr_queue,
+    health_store=None,
+):
+    item_hash = torrent_hash(torrent)
+    result = {
+        "attempted": 1 if item_hash else 0,
+        "status": "invalid",
+        "succeeded": 0,
+        "failed": 0,
+        "no_arr_match": 0,
+        "samples": 0,
+        "below_minimum_samples": 0,
+        "max_availability": 0.0,
+        "hash": item_hash,
+    }
+    if not item_hash:
+        result["failed"] = 1
+        return result
+
+    prepare_availability_probe_torrents(client, [torrent])
+    try:
+        client.reannounce_hashes([item_hash])
+    except ApiError as exc:
+        log_warning(
+            f"Failed to reannounce torrent before availability probe: {exc}",
+            hash=item_hash,
+        )
+    client.start_hashes([item_hash])
+
+    minimum = max(0.0, env_float("QBT_AVAILABILITY_MIN_COMPLETE", 1.0))
+    sample_count = max(1, env_int("QBT_AVAILABILITY_PROBE_SAMPLES", 6))
+    required_below = min(
+        sample_count,
+        max(1, env_int("QBT_AVAILABILITY_REQUIRED_BELOW_MINIMUM_SAMPLES", 5)),
+    )
+    interval_seconds = max(
+        0.0,
+        env_float("QBT_AVAILABILITY_PROBE_INTERVAL_SECONDS", 10.0),
+    )
+    latest = torrent
+    for _ in range(sample_count):
+        if interval_seconds > 0:
+            time.sleep(interval_seconds)
+        try:
+            refreshed = client.torrent_info(item_hash)
+        except (ApiError, json.JSONDecodeError) as exc:
+            log_warning(
+                f"Failed to inspect torrent during availability probe: {exc}",
+                hash=item_hash,
+            )
+            continue
+        if refreshed is None:
+            result["status"] = "removed"
+            result["succeeded"] = 1
+            return result
+        latest = refreshed
+        availability = torrent_availability(refreshed)
+        result["samples"] += 1
+        result["max_availability"] = max(result["max_availability"], availability)
+        if availability >= minimum:
+            clear_availability_probe(client, refreshed, verified=True)
+            result["status"] = "admitted"
+            result["succeeded"] = 1
+            log_info(
+                f"Admitted torrent after availability probe: {torrent_name(refreshed)}",
+                hash=item_hash,
+                availability=round(availability, 6),
+                samples=result["samples"],
+            )
+            return result
+        if 0 < availability < minimum:
+            result["below_minimum_samples"] += 1
+
+    if result["below_minimum_samples"] >= required_below:
+        action = remove_and_blocklist_arr_torrent(
+            client,
+            latest,
+            sonarr_queue,
+            radarr_queue,
+            env_int("QBT_AVAILABILITY_ARR_TIMEOUT", env_int("QBT_ARR_QUEUE_TIMEOUT", 10)),
+            delete_files=True,
+            failure_tag=AVAILABILITY_REJECTION_FAILED_TAG,
+            reason=(
+                f"availability remained below {minimum:.3f} for "
+                f"{result['below_minimum_samples']} fresh samples"
+            ),
+        )
+        result.update({key: action.get(key, result.get(key)) for key in (
+            "succeeded", "failed", "no_arr_match"
+        )})
+        result["status"] = "rejected" if action.get("succeeded") else "rejection-failed"
+        if action.get("failed"):
+            try:
+                client.stop_hashes([item_hash])
+            except ApiError as exc:
+                log_warning(
+                    f"Failed to stop torrent after availability rejection failed: {exc}",
+                    hash=item_hash,
+                )
+        return result
+
+    try:
+        client.stop_hashes([item_hash])
+    except ApiError as exc:
+        log_warning(
+            f"Failed to stop torrent after inconclusive availability probe: {exc}",
+            hash=item_hash,
+        )
+    if health_store is not None:
+        health_store.record_failure(
+            latest,
+            datetime.now(timezone.utc),
+            "availability probe returned no complete or partial swarm telemetry",
+            cooldown_reason=STALL_COOLDOWN_REASON_TRACKER_DEAD,
+            cooldown_scope="normal",
+        )
+    result["status"] = "deferred"
     return result
 
 
@@ -9756,6 +10002,10 @@ class SmartQueuePolicyEngine:
                 rejected_counts[import_rejection_reason] += 1
                 rejected_counts["arr_import_rejected"] += 1
                 continue
+            availability_rejection_reason = availability_admission_block_reason(torrent)
+            if availability_rejection_reason:
+                rejected_counts[availability_rejection_reason] += 1
+                continue
             reject_reason = single_download_reject_reason(
                 torrent,
                 self.min_progress,
@@ -11055,6 +11305,48 @@ def apply_single_download(
                     verification_failed=ryokan_cleanup_result["verification_failed"],
                 )
                 break
+            availability_candidates = availability_probe_candidates(
+                torrents,
+                health_store,
+                now,
+            )
+            if availability_candidates:
+                availability_candidate = availability_candidates[0]
+                availability_result = process_availability_admission_torrent(
+                    client,
+                    availability_candidate,
+                    sonarr_queue,
+                    radarr_queue,
+                    health_store,
+                )
+                emit_decision_log(
+                    "qbt_guard_decision",
+                    **decision_base_context(run_decision_context, client, storage_state),
+                    action=f"availability_{availability_result['status']}",
+                    reason="validated total swarm availability before queue selection",
+                    rejected_counts={
+                        "availability_below_minimum_samples": availability_result[
+                            "below_minimum_samples"
+                        ],
+                        "availability_rejection_failed": availability_result["failed"],
+                    },
+                    candidate_counts={
+                        "availability_probe_candidates": len(availability_candidates),
+                        "availability_samples": availability_result["samples"],
+                    },
+                    selected_torrent=torrent_decision_summary(availability_candidate),
+                    availability_probe=availability_result,
+                )
+                log_decision_info(
+                    f"availability_{availability_result['status']}",
+                    "Validated torrent total swarm availability before queue selection",
+                    torrent=torrent_name(availability_candidate),
+                    hash=torrent_hash(availability_candidate),
+                    samples=availability_result["samples"],
+                    below_minimum_samples=availability_result["below_minimum_samples"],
+                    max_availability=round(availability_result["max_availability"], 6),
+                )
+                break
             manual_override_torrents = force_started_torrents(torrents)
             if manual_override_torrents:
                 manual_override_hashes = {
@@ -11482,6 +11774,7 @@ def apply_single_download(
                     log_warning(
                         f"Failed to reannounce storage recovery batch: {exc}",
                     )
+                prepare_availability_probe_torrents(client, selection_candidates)
                 client.start_hashes(selected_hashes)
                 emit_decision_log(
                     "qbt_guard_decision",
@@ -11768,6 +12061,7 @@ def apply_single_download(
                         log_warning(
                             f"Failed to reannounce selected category batch: {exc}",
                         )
+                    prepare_availability_probe_torrents(client, new_worker_torrents)
                     client.start_hashes(selected_hashes)
 
                     batch_action = "try_category_batch" if new_worker_torrents else "keep_category_batch"
@@ -12644,6 +12938,7 @@ def apply_single_download(
                 log_warning(
                     f"Failed to reannounce selected torrent: {exc}",
                 )
+            prepare_availability_probe_torrents(client, [selected])
             client.start_hashes([selected_hash])
             emit_decision_log(
                 "qbt_guard_decision",

@@ -77,7 +77,7 @@ class LoopModeTests(unittest.TestCase):
             service_logs[0]["qbt_urls"],
         )
 
-    def test_reachable_qbt_clients_ensures_blacklist_tag(self):
+    def test_reachable_qbt_clients_ensures_controller_tags(self):
         instances = []
 
         class FakeQbtClient:
@@ -102,7 +102,15 @@ class LoopModeTests(unittest.TestCase):
 
         self.assertEqual(instances, clients)
         self.assertEqual(("GET", "/api/v2/app/version", None), instances[0].requested_version)
-        self.assertEqual([["blacklist"]], instances[0].created_tags)
+        self.assertEqual(
+            [[
+                "blacklist",
+                "availability-probe",
+                "availability-verified",
+                "availability-rejection-failed",
+            ]],
+            instances[0].created_tags,
+        )
 
     def test_qbt_client_create_tags_uses_global_tags_endpoint(self):
         client = self.guard.QbtClient("http://qbittorrent.test:8080")

@@ -222,6 +222,32 @@ Arr queue record is found, the controller deletes the torrent directly from
 qBittorrent with `deleteFiles=true`. If the Arr delete call or direct qBittorrent
 delete fails, it replaces the action tag with `blacklist-failed`.
 
+Optional total-availability admission control prevents Smart Queues from
+spending the full payload on a swarm that cannot supply every selected piece.
+Before a new worker starts, the controller applies an `availability-probe` tag
+and a small per-torrent download cap. A later pass reannounces the torrent and
+collects multiple fresh qBittorrent availability samples. Any sample at or
+above `1.0` admits the torrent, removes the probe cap, and tags it
+`availability-verified`. Repeated positive samples below `1.0` remove and
+blocklist the release through Sonarr/Radarr, with `skipRedownload=false`, so Arr
+can choose a different release. Zero or unavailable telemetry is inconclusive:
+the torrent is stopped and cooled down without being deleted. Force-started
+torrents remain manual overrides. The controller also evaluates legacy stalled
+torrents near completion, so enabling the feature drains existing incomplete
+swarm debt instead of protecting only new grabs.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QBT_AVAILABILITY_ADMISSION_ENABLED` | `false` | Enable bounded total-availability probes, Arr blocklisting, and qBittorrent removal for incomplete swarms. |
+| `QBT_AVAILABILITY_MIN_COMPLETE` | `1.0` | Minimum qBittorrent total availability that proves all selected pieces exist in the observed swarm. |
+| `QBT_AVAILABILITY_PROBE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `1048576` | Per-torrent download cap while availability is unverified. |
+| `QBT_AVAILABILITY_PROBE_SAMPLES` | `6` | Maximum number of fresh availability samples collected after reannounce and start. |
+| `QBT_AVAILABILITY_REQUIRED_BELOW_MINIMUM_SAMPLES` | `5` | Positive below-threshold samples required before destructive rejection. Any complete sample admits immediately. |
+| `QBT_AVAILABILITY_PROBE_INTERVAL_SECONDS` | `10` | Delay between fresh qBittorrent availability samples. |
+| `QBT_AVAILABILITY_LEGACY_MIN_PROGRESS` | `0.95` | Progress threshold that makes an existing incomplete, below-threshold torrent eligible for probing. |
+| `QBT_AVAILABILITY_LEGACY_MIN_NO_PROGRESS_SAMPLES` | `2` | Stored no-progress observations that make another existing below-threshold torrent eligible for probing. |
+| `QBT_AVAILABILITY_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr removal and blocklist calls. |
+
 Stale maintenance is intentionally conservative. It does not delete incomplete
 14-day stalled torrents just because they are old; it tags, reannounces, and
 parks them so they can resume later while the selector moves on to torrents that
