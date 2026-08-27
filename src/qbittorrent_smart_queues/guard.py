@@ -39,6 +39,7 @@ from qbittorrent_smart_queues.providers import (
     usage_provider_registry,
 )
 from qbittorrent_smart_queues.quota import QuotaSettings, local_billing_cycle_window
+from qbittorrent_smart_queues.scheduling import RelativeSpeedPolicy, WorkerSpeedSample
 
 
 QBT_DEFAULT_URLS = []
@@ -7062,12 +7063,7 @@ def torrent_progress_classification(before, after, min_download_delta_bytes, sam
             park_as_listener=True,
         )
 
-    delta_bytes = torrent_progress_delta_bytes(before or after, after) if before else 0
-    sample_seconds = max(1, int(sample_seconds or 1))
-    observed_speed = max(
-        torrent_download_speed(after),
-        math.floor(max(0, delta_bytes) / sample_seconds),
-    )
+    observed_speed = torrent_observed_download_speed(before, after, sample_seconds)
     if observed_speed > 0 or connected_sources > 0:
         return TorrentProgressClassification(
             PROGRESS_CLASS_SLOW_PROGRESSING,
@@ -7102,12 +7098,8 @@ def storage_recovery_progress_reason(
     if min_rate_bytes_per_second <= 0:
         return torrent_progress_reason(before, after, min_download_delta_bytes)
 
-    sample_seconds = max(1, int(sample_seconds or 1))
     delta_bytes = torrent_progress_delta_bytes(before, after)
-    observed_speed = max(
-        torrent_download_speed(after),
-        math.floor(max(0, delta_bytes) / sample_seconds),
-    )
+    observed_speed = torrent_observed_download_speed(before, after, sample_seconds)
     if observed_speed < min_rate_bytes_per_second:
         return ""
 
@@ -7140,6 +7132,15 @@ def torrent_progress_delta_bytes(before, after):
         downloaded_delta = after_downloaded - before_downloaded
 
     return max(0, left_delta, downloaded_delta)
+
+
+def torrent_observed_download_speed(before, after, sample_seconds):
+    sample_seconds = max(1, int(sample_seconds or 1))
+    delta_bytes = torrent_progress_delta_bytes(before or after, after) if before else 0
+    return max(
+        torrent_download_speed(after),
+        math.floor(max(0, delta_bytes) / sample_seconds),
+    )
 
 
 def candidate_health_class(torrent, healthy_min_seeds, healthy_min_availability):
@@ -7674,17 +7675,73 @@ class TorrentHealthStore:
 
         return ""
 
+    def selection_trial_age_seconds(self, torrent, now):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return None
+        started_at = parse_utc(
+            entry.get("selected_lease_started_at") or entry.get("last_attempt_at")
+        )
+        if started_at is None:
+            return None
+        return max(0, int((now - started_at).total_seconds()))
+
+    def active_relative_speed_defer_state(self, torrent, now):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return {}
+        defer_until = parse_utc(entry.get("relative_speed_defer_until"))
+        if defer_until is None or now >= defer_until:
+            return {}
+        return {
+            "active": True,
+            "reason": str(entry.get("relative_speed_defer_reason") or "relative speed yield"),
+            "until": format_utc(defer_until),
+            "remaining_seconds": max(0, int((defer_until - now).total_seconds())),
+            "observed_bytes_per_second": max(
+                0,
+                int(entry.get("relative_speed_observed_bytes_per_second") or 0),
+            ),
+            "peer_reference_bytes_per_second": max(
+                0,
+                int(entry.get("relative_speed_peer_reference_bytes_per_second") or 0),
+            ),
+        }
+
+    def record_relative_speed_defer(self, torrent, now, assessment, defer_seconds):
+        entry = self.entry(torrent_hash(torrent))
+        if entry is None:
+            return
+        defer_seconds = max(0, int(defer_seconds or 0))
+        entry["relative_speed_yield_count"] = int(
+            entry.get("relative_speed_yield_count") or 0
+        ) + 1
+        entry["relative_speed_last_yield_at"] = format_utc(now)
+        entry["relative_speed_defer_until"] = (
+            format_utc(now + timedelta(seconds=defer_seconds))
+            if defer_seconds > 0
+            else ""
+        )
+        entry["relative_speed_defer_reason"] = assessment.reason
+        entry["relative_speed_observed_bytes_per_second"] = (
+            assessment.sample.speed_bytes_per_second
+        )
+        entry["relative_speed_peer_reference_bytes_per_second"] = (
+            assessment.peer_reference_bytes_per_second
+        )
+        entry["relative_speed_yield_threshold_bytes_per_second"] = (
+            assessment.yield_threshold_bytes_per_second
+        )
+        self.dirty = True
+        self.save()
+
     def record_productive(self, before, after, now, sample_seconds):
         entry = self.entry(torrent_hash(after) or torrent_hash(before))
         if entry is None:
             return
 
         sample_seconds = max(1, int(sample_seconds))
-        delta_bytes = torrent_progress_delta_bytes(before, after)
-        observed_speed = max(
-            torrent_download_speed(after),
-            math.floor(delta_bytes / sample_seconds),
-        )
+        observed_speed = torrent_observed_download_speed(before, after, sample_seconds)
         if observed_speed > 0:
             previous_speed = float(entry.get("ewma_speed_bytes_per_sec") or 0)
             if previous_speed <= 0:
@@ -8592,6 +8649,7 @@ class SmartQueuePolicyFilterResult:
     available_candidates: list
     metadata_bootstrap_candidates: list
     cooldown_count: int
+    relative_speed_deferred_count: int
     metadata_bootstrap_cooldown_count: int
     storage_blocked_count: int
     storage_pressure_mode: bool
@@ -8686,6 +8744,7 @@ class SmartQueuePolicyEngine:
         productive_rate_floor_bytes,
         normal_progress_min_bytes,
         metadata_bootstrap_enabled=True,
+        relative_speed_policy=None,
     ):
         self.client = client
         self.torrents = list(torrents or [])
@@ -8723,6 +8782,7 @@ class SmartQueuePolicyEngine:
         self.productive_rate_floor_bytes = max(1, int(productive_rate_floor_bytes or 1))
         self.normal_progress_min_bytes = normal_progress_min_bytes
         self.metadata_bootstrap_enabled = bool(metadata_bootstrap_enabled)
+        self.relative_speed_policy = relative_speed_policy or RelativeSpeedPolicy()
 
     def observe(self):
         self.health_store.observe_torrents(self.torrents, self.now)
@@ -8882,10 +8942,27 @@ class SmartQueuePolicyEngine:
 
         available_candidates = []
         cooldown_count = 0
+        relative_speed_deferred_count = 0
+        relative_speed_deferred_candidates = []
         for torrent in candidates:
             candidate_hash = torrent_hash(torrent)
             if candidate_hash in self.attempted_hashes:
                 rejected_counts["attempted_this_run"] += 1
+                continue
+            relative_speed_defer = {}
+            if (
+                self.relative_speed_policy.enabled
+                and not observation.storage_constrained_mode
+                and hasattr(self.health_store, "active_relative_speed_defer_state")
+            ):
+                relative_speed_defer = self.health_store.active_relative_speed_defer_state(
+                    torrent,
+                    self.now,
+                )
+            if relative_speed_defer:
+                relative_speed_deferred_candidates.append(
+                    (torrent, relative_speed_defer)
+                )
                 continue
             cooldown_state = {}
             if (
@@ -8921,6 +8998,25 @@ class SmartQueuePolicyEngine:
                 )
                 continue
             available_candidates.append(torrent)
+
+        for torrent, relative_speed_defer in relative_speed_deferred_candidates:
+            has_stopped_replacement = any(
+                torrent_hash(candidate) != torrent_hash(torrent)
+                and torrent_category(candidate) == torrent_category(torrent)
+                and is_stopped_torrent(candidate)
+                for candidate in available_candidates
+            )
+            if not has_stopped_replacement:
+                available_candidates.append(torrent)
+                continue
+            rejected_counts["relative_speed_deferred"] += 1
+            relative_speed_deferred_count += 1
+            log_info(
+                f"Skipping relatively slow torrent for "
+                f"{human_duration(relative_speed_defer.get('remaining_seconds', 0))} "
+                f"while a same-category replacement is eligible "
+                f"{torrent_name(torrent)}"
+            )
 
         metadata_bootstrap_candidates = []
         metadata_bootstrap_cooldown_count = 0
@@ -8972,6 +9068,7 @@ class SmartQueuePolicyEngine:
             available_candidates=available_candidates,
             metadata_bootstrap_candidates=metadata_bootstrap_candidates,
             cooldown_count=cooldown_count,
+            relative_speed_deferred_count=relative_speed_deferred_count,
             metadata_bootstrap_cooldown_count=metadata_bootstrap_cooldown_count,
             storage_blocked_count=storage_blocked_count,
             storage_pressure_mode=storage_pressure_mode,
@@ -9250,6 +9347,7 @@ class SmartQueuePolicyEngine:
             "watched_tv_episode_torrents": len(observation.tv_order_state.get("watch_priorities", {})),
             "productive": len(scoring.productive_candidates),
             "slow": 0,
+            "relative_speed_deferred": filters.relative_speed_deferred_count,
             "selection_strategy": self.selection_strategy_name,
             "storage_constrained": observation.storage_constrained_mode,
             "storage_pressure": filters.storage_pressure_mode,
@@ -9804,6 +9902,7 @@ def apply_single_download(
     selection_strategy_name = selection_strategy()
     preempt_productive_enabled = env_bool("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED", False)
     preempt_productive_score_margin = env_float("QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN", 25.0)
+    relative_speed_policy = RelativeSpeedPolicy.from_environment()
     file_priority_enabled = env_bool(
         "QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_ENABLED",
         env_bool("QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED", True),
@@ -10205,6 +10304,7 @@ def apply_single_download(
                     client_metadata_bootstrap_enabled
                     and bool(storage_state and storage_state.get("enabled"))
                 ),
+                relative_speed_policy=relative_speed_policy,
             ).run()
 
             observation = policy_result.observation
@@ -10944,6 +11044,7 @@ def apply_single_download(
                             break
 
                     progress_events = []
+                    productive_speed_samples = []
                     parked_after_sample = []
                     stopped_after_sample = []
                     no_progress_count = 0
@@ -10967,11 +11068,27 @@ def apply_single_download(
                         )
                         progress_class_counts[progress_class_count_key(progress_classification.state)] += 1
                         if progress_classification.state == PROGRESS_CLASS_ACTIVELY_PROGRESSING:
+                            sampled_torrent = selected_refreshed or selected
                             progress_events.append(
                                 {
-                                    "torrent": scored_torrent_summary(selected_refreshed or selected),
+                                    "torrent": scored_torrent_summary(sampled_torrent),
                                     "reason": progress_classification.reason,
                                 }
+                            )
+                            productive_speed_samples.append(
+                                WorkerSpeedSample(
+                                    worker_id=selected_hash,
+                                    group=torrent_category(sampled_torrent),
+                                    speed_bytes_per_second=torrent_observed_download_speed(
+                                        selected,
+                                        sampled_torrent,
+                                        sample_seconds,
+                                    ),
+                                    trial_age_seconds=health_store.selection_trial_age_seconds(
+                                        sampled_torrent,
+                                        datetime.now(timezone.utc),
+                                    ),
+                                )
                             )
                             health_store.record_productive(
                                 selected,
@@ -11025,6 +11142,48 @@ def apply_single_download(
                         )
                         stopped_after_sample.append(no_progress_torrent)
 
+                    can_retry = max_attempts <= 0 or attempt < max_attempts
+                    replacement_slots_by_category = Counter()
+                    if can_retry and time.monotonic() < deadline:
+                        for candidate in filters.available_candidates:
+                            candidate_hash = torrent_hash(candidate)
+                            if (
+                                not candidate_hash
+                                or candidate_hash in selected_hash_set
+                                or candidate_hash in attempted_hashes
+                            ):
+                                continue
+                            replacement_slots_by_category[torrent_category(candidate)] += 1
+
+                    relative_speed_yields = relative_speed_policy.assess(
+                        productive_speed_samples,
+                        replacement_slots_by_category,
+                    )
+                    yielded_torrents = []
+                    yielded_hashes = set()
+                    yielded_at = datetime.now(timezone.utc)
+                    for assessment in relative_speed_yields:
+                        yielded_hash = assessment.sample.worker_id
+                        yielded_torrent = refreshed.get(yielded_hash)
+                        if not yielded_torrent or is_force_started_torrent(yielded_torrent):
+                            continue
+                        client.stop_hashes([yielded_hash])
+                        attempted_hashes.add(yielded_hash)
+                        yielded_hashes.add(yielded_hash)
+                        yielded_torrents.append(yielded_torrent)
+                        health_store.record_relative_speed_defer(
+                            yielded_torrent,
+                            yielded_at,
+                            assessment,
+                            relative_speed_policy.defer_seconds,
+                        )
+                    if yielded_hashes:
+                        progress_events = [
+                            event
+                            for event in progress_events
+                            if event.get("torrent", {}).get("hash") not in yielded_hashes
+                        ]
+
                     post_sample_counts = {
                         **batch_candidate_counts,
                         **dict(progress_class_counts),
@@ -11032,6 +11191,17 @@ def apply_single_download(
                         "normal_category_no_progress": no_progress_count,
                         "normal_category_newly_parked": len(parked_after_sample),
                         "normal_category_stopped_no_progress": len(stopped_after_sample),
+                        "normal_category_relative_speed_yielded": len(yielded_torrents),
+                        "relative_speed_policy_enabled": relative_speed_policy.enabled,
+                        "relative_speed_fraction": relative_speed_policy.threshold_fraction,
+                        "relative_speed_min_peers": relative_speed_policy.minimum_peer_workers,
+                        "relative_speed_min_reference_bytes_per_sec": (
+                            relative_speed_policy.minimum_reference_bytes_per_second
+                        ),
+                        "relative_speed_min_trial_seconds": (
+                            relative_speed_policy.minimum_trial_seconds
+                        ),
+                        "relative_speed_defer_seconds": relative_speed_policy.defer_seconds,
                         "normal_category_listener_capacity_remaining": (
                             listener_slots_remaining
                             if listener_slots_remaining is not None
@@ -11045,9 +11215,15 @@ def apply_single_download(
                             winner=refreshed.get(torrent_hash(selected_batch[0])) or selected_batch[0],
                             candidate_pool=selection_candidates,
                         ),
-                        action="keep_category_batch",
+                        action=(
+                            "yield_relative_slow_workers"
+                            if yielded_torrents
+                            else "keep_category_batch"
+                        ),
                         reason=(
-                            "productive workers remain selected; failed probes are parked only "
+                            "relative speed outliers yielded to eligible same-category replacements"
+                            if yielded_torrents
+                            else "productive workers remain selected; failed probes are parked only "
                             "within the listener cap or cooled down before replacement"
                         ),
                         selected_torrent=scored_torrent_summary(
@@ -11062,6 +11238,10 @@ def apply_single_download(
                             for torrent in normal_parked_stalled_torrents + parked_after_sample
                         ],
                         progress_torrents=progress_events[:5],
+                        yielded_torrents=[
+                            scored_torrent_summary(torrent)
+                            for torrent in yielded_torrents
+                        ],
                         rejected_counts={
                             **dict(rejected_counts),
                             "no_progress_after_wait": no_progress_count,
@@ -11070,10 +11250,15 @@ def apply_single_download(
                         selected_category_counts=selected_by_category,
                     )
                     log_decision_info(
-                        "keep_category_batch",
+                        (
+                            "yield_relative_slow_workers"
+                            if yielded_torrents
+                            else "keep_category_batch"
+                        ),
                         f"Keeping productive category workers after {sample_seconds}s; "
                         f"{len(progress_events)} progressed, "
                         f"{no_progress_count} without measured progress, "
+                        f"{len(yielded_torrents)} yielded for relative speed, "
                         f"{len(parked_after_sample)} parked, "
                         f"{len(stopped_after_sample)} stopped",
                         selected=", ".join(torrent_name(torrent) for torrent in selected_batch[:5]),
@@ -11084,9 +11269,8 @@ def apply_single_download(
                         and torrent_hash(torrent) not in attempted_hashes
                         for torrent in filters.available_candidates
                     )
-                    can_retry = max_attempts <= 0 or attempt < max_attempts
                     if (
-                        no_progress_count > 0
+                        (no_progress_count > 0 or bool(yielded_torrents))
                         and has_replacement_candidates
                         and can_retry
                         and time.monotonic() < deadline

@@ -127,6 +127,145 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
 
         self.assertTrue(self.guard.is_productive_torrent({"state": "downloading", "dlspeed": 65_536}))
 
+    def test_category_batch_yields_relative_speed_outlier_and_starts_replacement(self):
+        class ProgressingClient(FakeQbtClient):
+            def __init__(self, torrents):
+                super().__init__(torrents)
+                self.list_calls = 0
+
+            def torrents_info(self, filter_name=None):
+                self.list_calls += 1
+                if self.list_calls > 1:
+                    for torrent in self.torrents:
+                        if torrent["state"] != "downloading":
+                            continue
+                        delta = torrent["dlspeed"] * 60
+                        torrent["downloaded"] += delta
+                        torrent["amount_left"] = max(1, torrent["amount_left"] - delta)
+                return super().torrents_info(filter_name)
+
+            def start_hashes(self, hashes):
+                super().start_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] in hashes and torrent["state"] == "stoppedDL":
+                        torrent["state"] = "downloading"
+                        torrent["dlspeed"] = 2_000_000
+
+            def stop_hashes(self, hashes):
+                super().stop_hashes(hashes)
+                for torrent in self.torrents:
+                    if torrent["hash"] in hashes:
+                        torrent["state"] = "stoppedDL"
+                        torrent["dlspeed"] = 0
+
+        def torrent(item_hash, speed, state="downloading"):
+            return {
+                "hash": item_hash,
+                "name": f"{item_hash}.Movie.1080p",
+                "category": "movies",
+                "state": state,
+                "dlspeed": speed,
+                "amount_left": 20 * 1024 * 1024 * 1024,
+                "downloaded": 1024 * 1024 * 1024,
+                "progress": 0.1,
+                "availability": 2.0,
+                "num_seeds": 5,
+                "num_complete": 5,
+                "tags": "",
+            }
+
+        client = ProgressingClient(
+            [
+                torrent("fast-one", 4_000_000),
+                torrent("fast-two", 5_000_000),
+                torrent("slow", 200_000),
+                torrent("replacement", 0, state="stoppedDL"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "QBT_SINGLE_DOWNLOAD_MAX_ACTIVE_DOWNLOADS_PER_CATEGORY": "3",
+                "QBT_SINGLE_DOWNLOAD_MAX_TOTAL_ACTIVE_DOWNLOADS": "3",
+                "QBT_SINGLE_DOWNLOAD_ADAPTIVE_WORKERS_ENABLED": "false",
+                "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_FRACTION": "0.25",
+                "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_PEERS": "2",
+                "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_REFERENCE_BYTES_PER_SEC": "1000000",
+                "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_TRIAL_SECONDS": "0",
+                "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_DEFER_SECONDS": "1800",
+                "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+                "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "60",
+                "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "3600",
+                "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+                "QBT_SINGLE_DOWNLOAD_TV_ORDER_CATEGORIES": "",
+                "QBT_SINGLE_DOWNLOAD_MOVIE_ORDER_CATEGORIES": "",
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_TORRENT_HEALTH_STATE_PATH": f"{tmpdir}/torrent-health.json",
+                "QBT_TRACKER_HEALTH_SCORING_ENABLED": "false",
+                "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+                "QBT_TV_WATCH_JELLYFIN_ENABLED": "false",
+                "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+                "QBT_LOG_FORMAT": "json",
+                "QBT_DECISION_LOG_LEVEL": "info",
+            }
+            with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(
+                self.guard.time,
+                "sleep",
+            ):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.guard.apply_single_download(
+                        [client],
+                        usage_bytes=0,
+                        monthly_limit_bytes=1000,
+                        download_limit=20_000_000,
+                        limit_reason="unit test",
+                        storage_guard=FakeStorageGuard(),
+                    )
+
+                client.torrents = [
+                    torrent
+                    for torrent in client.torrents
+                    if torrent["hash"] != "replacement"
+                ]
+                start_call_count = len(client.started)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.guard.apply_single_download(
+                        [client],
+                        usage_bytes=0,
+                        monthly_limit_bytes=1000,
+                        download_limit=20_000_000,
+                        limit_reason="unit test without replacement",
+                        storage_guard=FakeStorageGuard(),
+                    )
+                starts_without_replacement = client.started[start_call_count:]
+
+            with open(f"{tmpdir}/torrent-health.json", encoding="utf-8") as handle:
+                health_state = json.load(handle)
+
+        decision_events = [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{") and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        yield_event = next(
+            event for event in decision_events
+            if event.get("action") == "yield_relative_slow_workers"
+        )
+        yielded_hashes = {
+            torrent["hash"] for torrent in yield_event["yielded_torrents"]
+        }
+
+        self.assertEqual({"slow"}, yielded_hashes)
+        self.assertTrue(any("slow" in hashes for hashes in client.stopped))
+        self.assertTrue(any("replacement" in hashes for hashes in client.started))
+        self.assertTrue(any("slow" in hashes for hashes in starts_without_replacement))
+        self.assertEqual(1, yield_event["candidate_counts"]["normal_category_relative_speed_yielded"])
+        slow_health = health_state["torrents"]["slow"]
+        self.assertEqual(1, slow_health["relative_speed_yield_count"])
+        self.assertEqual(0, slow_health.get("consecutive_failures", 0))
+        self.assertEqual("", slow_health.get("cooldown_next_retry_at", ""))
+
     def test_apply_single_download_keeps_forced_torrent_and_schedules_normal_work(self):
         forced = {
             "hash": "forced",

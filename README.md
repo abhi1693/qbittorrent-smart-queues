@@ -378,6 +378,12 @@ storage hard-stop, and shutdown hooks still apply.
 | `QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC` | `65536` | Minimum active download speed treated as productive in normal selection and used as the default recovery slow-torrent floor. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED` | `false` | Allow a productive active torrent to yield when a stopped candidate has a much better unified score. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum unified-score advantage required before preempting a productive torrent. |
+| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_ENABLED` | `false` | In category-batch mode, let a productive worker yield when its observed rate is far below the median of the other productive workers and an eligible same-category replacement exists. |
+| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_FRACTION` | `0.25` | Yield threshold as a fraction of the other productive workers' median observed rate. `0.25` means slower than 25% of the peer median. Values are bounded to `0.01`–`0.95`. |
+| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_PEERS` | `2` | Minimum number of other productive workers required before making a relative-speed comparison. |
+| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_REFERENCE_BYTES_PER_SEC` | `1048576` | Minimum peer-median rate required before relative-speed yielding is allowed, preventing churn when the entire active pool is slow. |
+| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_TRIAL_SECONDS` | `300` | Minimum trial time for a newly selected worker before it can yield for relative speed. Existing workers with no recorded selection time can be assessed immediately. |
+| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_DEFER_SECONDS` | `1800` | Non-failure defer window after a relative-speed yield. The torrent becomes eligible for another trial after this window and can still run whenever no better same-category replacement is available. |
 | `QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_SECONDS` | `900` | Minimum dwell lease granted when a torrent is selected. While the lease is active, a torrent that is productive or has current/recent connected peers is not preempted or replaced by a briefly higher-scoring candidate. Set to `0` to disable. |
 | `QBT_SINGLE_DOWNLOAD_SELECTION_LEASE_PEER_GRACE_SECONDS` | lease seconds | How long recent connected peer contact keeps an active lease eligible after peers temporarily disappear. |
 | `QBT_SINGLE_DOWNLOAD_PRODUCTIVE_CAP_FRACTION` | `0.80` | Fraction of each worker's effective cap share used as the productive-speed floor. |
@@ -558,6 +564,20 @@ When measured productive throughput is below the configured utilization target,
 the controller adds a bounded number of probe slots; when existing productive
 workers meet the target, it contracts to those workers. Failed probes are
 replaced during the same run instead of waiting for the next scheduled pass.
+
+Category-batch mode can also opt into relative-speed yielding. After the normal
+progress sample, the controller compares each productive worker with the median
+observed rate of the other productive workers. A worker below the configured
+fraction yields only after its minimum trial time, only when the peer median is
+fast enough to be meaningful, and only when an eligible replacement exists in
+the same category. Multiple clear outliers can yield in one pass when enough
+replacements are available. The yield is scheduling state rather than a failed
+download: it adds no stall tag, failure count, or failure backoff. Instead, the
+torrent is deferred briefly in the health-state store and becomes eligible for
+a later probe. For the behavior illustrated by a few multi-MiB/s workers beside
+one or two KiB/s workers, enable
+`QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_ENABLED=true`; the remaining defaults are a
+conservative starting point.
 
 Stalled/no-progress torrents are parked only while listener capacity remains.
 Parked torrents stay active in qBittorrent so they can resume immediately if a
