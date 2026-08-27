@@ -42,7 +42,7 @@ class RelativeSpeedPolicyTests(unittest.TestCase):
         self.assertEqual({"slow-movie", "slow-tv"}, {item.sample.worker_id for item in decisions})
         self.assertTrue(all(item.peer_reference_bytes_per_second >= 3_000_000 for item in decisions))
 
-    def test_requires_same_group_replacement(self):
+    def test_requires_same_group_queued_alternative(self):
         policy = RelativeSpeedPolicy(enabled=True)
         samples = [
             self.sample("slow-tv", 10_000, group="tv"),
@@ -53,6 +53,21 @@ class RelativeSpeedPolicyTests(unittest.TestCase):
         decisions = policy.assess(samples, {"movies": 3})
 
         self.assertEqual([], decisions)
+
+    def test_single_fast_peer_can_identify_clear_outlier(self):
+        policy = RelativeSpeedPolicy(
+            enabled=True,
+            minimum_peer_workers=1,
+            minimum_acceptable_bytes_per_second=1_048_576,
+        )
+        samples = [
+            self.sample("slow", 180_000),
+            self.sample("fast", 8_000_000),
+        ]
+
+        decisions = policy.assess(samples, {"movies": 1})
+
+        self.assertEqual(["slow"], [item.sample.worker_id for item in decisions])
 
     def test_preserves_worker_during_minimum_trial(self):
         policy = RelativeSpeedPolicy(enabled=True, minimum_trial_seconds=300)

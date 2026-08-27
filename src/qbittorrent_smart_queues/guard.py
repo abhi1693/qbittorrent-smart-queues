@@ -11133,21 +11133,22 @@ def apply_single_download(
                         stopped_after_sample.append(no_progress_torrent)
 
                     can_retry = max_attempts <= 0 or attempt < max_attempts
-                    replacement_slots_by_category = Counter()
+                    queued_alternatives_by_category = Counter()
                     if can_retry and time.monotonic() < deadline:
-                        for candidate in filters.available_candidates:
+                        for candidate in filters.candidates:
                             candidate_hash = torrent_hash(candidate)
                             if (
                                 not candidate_hash
                                 or candidate_hash in selected_hash_set
                                 or candidate_hash in attempted_hashes
+                                or not is_stopped_torrent(candidate)
                             ):
                                 continue
-                            replacement_slots_by_category[torrent_category(candidate)] += 1
+                            queued_alternatives_by_category[torrent_category(candidate)] += 1
 
                     relative_speed_yields = relative_speed_policy.assess(
                         productive_speed_samples,
-                        replacement_slots_by_category,
+                        queued_alternatives_by_category,
                     )
                     yielded_torrents = []
                     yielded_hashes = set()
@@ -11182,6 +11183,9 @@ def apply_single_download(
                         "normal_category_newly_parked": len(parked_after_sample),
                         "normal_category_stopped_no_progress": len(stopped_after_sample),
                         "normal_category_relative_speed_yielded": len(yielded_torrents),
+                        "relative_speed_queued_alternatives": sum(
+                            queued_alternatives_by_category.values()
+                        ),
                         "relative_speed_policy_enabled": relative_speed_policy.enabled,
                         "relative_speed_fraction": relative_speed_policy.threshold_fraction,
                         "relative_speed_tolerance_fraction": (

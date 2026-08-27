@@ -33,7 +33,7 @@ class RelativeSpeedPolicy:
     threshold_fraction: float = 0.25
     threshold_tolerance_fraction: float = 0.10
     minimum_acceptable_bytes_per_second: int = 1_048_576
-    minimum_peer_workers: int = 2
+    minimum_peer_workers: int = 1
     minimum_reference_bytes_per_second: int = 1_048_576
     minimum_trial_seconds: int = 300
     defer_seconds: int = 1_800
@@ -68,7 +68,7 @@ class RelativeSpeedPolicy:
             ),
             minimum_peer_workers=max(
                 1,
-                env_int("QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_PEERS", 2),
+                env_int("QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_PEERS", 1),
             ),
             minimum_reference_bytes_per_second=max(
                 1,
@@ -87,7 +87,7 @@ class RelativeSpeedPolicy:
             ),
         )
 
-    def assess(self, samples, replacement_slots_by_group=None):
+    def assess(self, samples, queued_alternatives_by_group=None):
         samples = [
             sample
             for sample in samples or []
@@ -96,9 +96,9 @@ class RelativeSpeedPolicy:
         if not self.enabled or not samples:
             return []
 
-        replacements = {
+        alternatives = {
             str(group): max(0, int(count or 0))
-            for group, count in (replacement_slots_by_group or {}).items()
+            for group, count in (queued_alternatives_by_group or {}).items()
         }
         assessments = []
         for sample in samples:
@@ -161,8 +161,8 @@ class RelativeSpeedPolicy:
             if not assessment.should_yield:
                 continue
             group = str(assessment.sample.group)
-            if replacements.get(group, 0) <= 0:
+            if alternatives.get(group, 0) <= 0:
                 continue
-            replacements[group] -= 1
+            alternatives[group] -= 1
             selected.append(assessment)
         return selected

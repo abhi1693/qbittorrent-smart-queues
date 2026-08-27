@@ -378,11 +378,11 @@ storage hard-stop, and shutdown hooks still apply.
 | `QBT_SINGLE_DOWNLOAD_SLOW_MIN_RATE_BYTES_PER_SEC` | `65536` | Minimum active download speed treated as productive in normal selection and used as the default recovery slow-torrent floor. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_ENABLED` | `false` | Allow a productive active torrent to yield when a stopped candidate has a much better unified score. |
 | `QBT_SINGLE_DOWNLOAD_PREEMPT_PRODUCTIVE_SCORE_MARGIN` | `25.0` | Minimum unified-score advantage required before preempting a productive torrent. |
-| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_ENABLED` | `false` | In category-batch mode, let a productive worker yield when its observed rate is far below the median of the other productive workers and an eligible same-category replacement exists. |
+| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_ENABLED` | `false` | In category-batch mode, let a productive worker yield when its observed rate is far below the other productive workers and another safely queued same-category torrent is waiting. |
 | `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_FRACTION` | `0.25` | Yield threshold as a fraction of the other productive workers' median observed rate. `0.25` means slower than 25% of the peer median. Values are bounded to `0.01`–`0.95`. |
 | `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_TOLERANCE_FRACTION` | `0.10` | Leeway below the calculated relative threshold and acceptable-speed floor. `0.10` allows a 10% margin and avoids churn near either cutoff. Values are bounded to `0.0`–`0.95`; use `0` for exact cutoffs. |
 | `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_ACCEPTABLE_BYTES_PER_SEC` | `1048576` | A productive worker at or above this rate, after tolerance, is considered good enough even when its peers are much faster. With the defaults, rates down to about 0.9 MiB/s are retained. |
-| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_PEERS` | `2` | Minimum number of other productive workers required before making a relative-speed comparison. |
+| `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_PEERS` | `1` | Minimum number of other productive workers required before making a relative-speed comparison. The good-enough floor and tolerance keep a two-worker comparison from churning acceptable workers. |
 | `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_REFERENCE_BYTES_PER_SEC` | `1048576` | Minimum peer-median rate required before relative-speed yielding is allowed, preventing churn when the entire active pool is slow. |
 | `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_TRIAL_SECONDS` | `300` | Minimum trial time for a newly selected worker before it can yield for relative speed. Existing workers with no recorded selection time can be assessed immediately. |
 | `QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_DEFER_SECONDS` | `1800` | Non-failure defer window after a relative-speed yield. The torrent becomes eligible for another trial after this window; spare slots remain available for other useful work in the meantime. |
@@ -571,11 +571,13 @@ Category-batch mode can also opt into relative-speed yielding. After the normal
 progress sample, the controller compares each productive worker with the median
 observed rate of the other productive workers. A worker below the configured
 fraction yields only after its minimum trial time, only when the peer median is
-fast enough to be meaningful, and only when an eligible replacement exists in
-the same category. A configurable good-enough speed floor and tolerance prevent
+fast enough to be meaningful, and only when another queued torrent exists in
+the same category after hard safety and ordering checks. That alternative may
+still be cooling down: the yielded slot remains available until useful work is
+ready. A configurable good-enough speed floor and tolerance prevent
 workers near 1 MiB/s from churning just because their peers are much faster.
-Multiple clear outliers can yield in one pass when enough replacements are
-available. The yield is scheduling state rather than a failed download: it adds
+Multiple clear outliers can yield in one pass when enough queued alternatives
+exist. The yield is scheduling state rather than a failed download: it adds
 no stall tag, failure count, or failure backoff. Instead, the torrent is deferred
 briefly in the health-state store, leaving spare worker capacity for other useful
 candidates, and becomes eligible for a later probe. For the behavior illustrated
