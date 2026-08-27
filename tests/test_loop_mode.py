@@ -27,7 +27,11 @@ class LoopModeTests(unittest.TestCase):
 
     def test_main_always_dispatches_to_loop(self):
         with mock.patch.dict("os.environ", {}, clear=True), \
-                mock.patch.object(self.guard, "run_loop", return_value=0) as run_loop:
+                mock.patch.object(
+                    self.guard.SmartQueueApplication,
+                    "run_loop",
+                    return_value=0,
+                ) as run_loop:
             result = self.guard.main()
 
         self.assertEqual(0, result)
@@ -35,8 +39,16 @@ class LoopModeTests(unittest.TestCase):
 
     def test_main_never_dispatches_directly_to_single_pass(self):
         with mock.patch.dict("os.environ", {}, clear=True), \
-                mock.patch.object(self.guard, "run_loop", return_value=0) as run_loop, \
-                mock.patch.object(self.guard, "run_once", return_value=1) as run_once:
+                mock.patch.object(
+                    self.guard.SmartQueueApplication,
+                    "run_loop",
+                    return_value=0,
+                ) as run_loop, \
+                mock.patch.object(
+                    self.guard.SmartQueueController,
+                    "run_once",
+                    return_value=1,
+                ) as run_once:
             result = self.guard.main()
 
         self.assertEqual(0, result)
@@ -51,6 +63,8 @@ class LoopModeTests(unittest.TestCase):
 
     def test_run_loop_logs_qbt_services_once_at_startup(self):
         stdout = io.StringIO()
+        controller = mock.Mock()
+        controller.run_once.return_value = 0
         env = {
             "QBT_GUARD_POLL_SECONDS": "1",
             "QBT_GUARD_ERROR_POLL_SECONDS": "1",
@@ -59,13 +73,15 @@ class LoopModeTests(unittest.TestCase):
         }
 
         with mock.patch.dict("os.environ", env, clear=True), \
-                mock.patch.object(self.guard.threading, "Event", StopAfterFirstWait), \
                 mock.patch.object(self.guard, "install_loop_signal_handlers"), \
-                mock.patch.object(self.guard, "run_once", return_value=0), \
                 contextlib.redirect_stdout(stdout):
-            result = self.guard.run_loop()
+            result = self.guard.SmartQueueApplication(
+                controller=controller,
+                event_factory=StopAfterFirstWait,
+            ).run_loop()
 
         self.assertEqual(0, result)
+        controller.run_once.assert_called_once_with()
         records = [json.loads(line) for line in stdout.getvalue().splitlines()]
         service_logs = [
             record for record in records

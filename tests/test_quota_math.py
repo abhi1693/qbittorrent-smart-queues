@@ -175,7 +175,7 @@ class QuotaMathTests(unittest.TestCase):
             max_download_limit=1000,
         )
 
-        self.assertEqual("monthly UDM quota guardrail reached", state["stop_reason"])
+        self.assertEqual("monthly quota guardrail reached", state["stop_reason"])
 
     def test_rate_state_reports_daily_guardrail(self):
         now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
@@ -190,7 +190,7 @@ class QuotaMathTests(unittest.TestCase):
             max_download_limit=1000,
         )
 
-        self.assertEqual("daily UDM quota guardrail reached", state["stop_reason"])
+        self.assertEqual("daily quota guardrail reached", state["stop_reason"])
 
 
 if __name__ == "__main__":

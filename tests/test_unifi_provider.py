@@ -1,20 +1,20 @@
-import importlib
 import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
+from zoneinfo import ZoneInfo
+
+from qbittorrent_smart_queues.providers import unifi
+from qbittorrent_smart_queues.quota import local_billing_cycle_window
 
 
 class FakeResponse:
     headers = {}
 
 
-class UdmParsingTests(unittest.TestCase):
-    def setUp(self):
-        self.guard = importlib.import_module("qbittorrent_smart_queues.guard")
-
+class UnifiProviderTests(unittest.TestCase):
     def wan_network_rows(self):
         return [
             {
@@ -35,7 +35,7 @@ class UdmParsingTests(unittest.TestCase):
 
     def gateway_row(self, active_uplink):
         return {
-            "type": "udm",
+            "type": "gateway",
             "last_wan_status": {
                 "WAN": "offline",
                 "WAN2": "online",
@@ -60,7 +60,7 @@ class UdmParsingTests(unittest.TestCase):
         }
 
     def test_sum_download_bytes_ignores_time_non_rows_and_nonpositive_values(self):
-        client = self.guard.UdmClient()
+        client = unifi.UnifiProvider()
         rows = [
             {"time": 1234567890, "wan-rx_bytes": 100, "wan2-rx_bytes": 20},
             {"wan-rx_bytes": -100, "wan2-rx_bytes": 4.9},
@@ -78,9 +78,9 @@ class UdmParsingTests(unittest.TestCase):
             state_path = os.path.join(state_dir, "usage-corrections.json")
             with mock.patch.dict(
                 os.environ,
-                {"UDM_USAGE_CORRECTION_STATE_PATH": state_path},
+                {"UNIFI_USAGE_CORRECTION_STATE_PATH": state_path},
             ):
-                client = self.guard.UdmClient()
+                client = unifi.UnifiProvider()
                 client.usage_correction_store.update(
                     "2026-07-23",
                     {"wan-rx_bytes": 150},
@@ -91,7 +91,7 @@ class UdmParsingTests(unittest.TestCase):
                         "time": int(
                             (
                                 local_day_start
-                                + self.guard.timedelta(hours=index)
+                                + timedelta(hours=index)
                             ).timestamp()
                             * 1000
                         ),
@@ -103,7 +103,7 @@ class UdmParsingTests(unittest.TestCase):
                 total = client.sum_download_bytes(
                     rows,
                     ["wan-rx_bytes", "time"],
-                    local_timezone=self.guard.ZoneInfo("Asia/Kolkata"),
+                    local_timezone=ZoneInfo("Asia/Kolkata"),
                     apply_saved_corrections=True,
                 )
 
@@ -111,17 +111,17 @@ class UdmParsingTests(unittest.TestCase):
         self.assertEqual(150, client.usage_corrected_bytes)
 
     def test_billing_cycle_window_uses_configured_local_day(self):
-        local_timezone = self.guard.ZoneInfo("Asia/Kolkata")
+        local_timezone = ZoneInfo("Asia/Kolkata")
 
         before_start, before_end, before_days = (
-            self.guard.local_billing_cycle_window(
+            local_billing_cycle_window(
                 datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
                 local_timezone,
                 17,
             )
         )
         after_start, after_end, after_days = (
-            self.guard.local_billing_cycle_window(
+            local_billing_cycle_window(
                 datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
                 local_timezone,
                 17,
@@ -148,7 +148,7 @@ class UdmParsingTests(unittest.TestCase):
         for invalid_day in (0, 32):
             with self.subTest(invalid_day=invalid_day):
                 with self.assertRaises(ValueError):
-                    self.guard.local_billing_cycle_window(
+                    local_billing_cycle_window(
                         datetime(2026, 7, 20, tzinfo=timezone.utc),
                         timezone.utc,
                         invalid_day,
@@ -163,15 +163,15 @@ class UdmParsingTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "UDM_BILLING_CYCLE_DAY": "17",
-                    "UDM_STATS_TIMEZONE": "Asia/Kolkata",
-                    "UDM_USAGE_CORRECTION_STATE_PATH": os.path.join(
+                    "QBT_BILLING_CYCLE_DAY": "17",
+                    "UNIFI_STATS_TIMEZONE": "Asia/Kolkata",
+                    "UNIFI_USAGE_CORRECTION_STATE_PATH": os.path.join(
                         state_dir,
                         "usage-corrections.json",
                     ),
                 },
             ):
-                client = self.guard.UdmClient()
+                client = unifi.UnifiProvider()
                 client.authenticated = True
                 client.network_rows = [
                     {
@@ -205,10 +205,10 @@ class UdmParsingTests(unittest.TestCase):
                     "stats_rows",
                     side_effect=fake_stats_rows,
                 ):
-                    cycle_total, day_total = client.download_usage_snapshot(now)
+                    snapshot = client.usage_snapshot(now)
 
-        self.assertEqual(150, cycle_total)
-        self.assertEqual(50, day_total)
+        self.assertEqual(150, snapshot.cycle_usage_bytes)
+        self.assertEqual(50, snapshot.day_usage_bytes)
         self.assertEqual(17, client.billing_cycle_day)
         self.assertEqual(cycle_start, client.billing_cycle_start)
         self.assertEqual(
@@ -229,12 +229,12 @@ class UdmParsingTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "UDM_BACKUP_INTERNET_STOP_ENABLED": "true",
-                "UDM_INCLUDE_UPLOAD": "true",
-                "UDM_DOWNLOAD_ATTRS": "wan-rx_bytes,wan2-rx_bytes",
+                "QBT_BACKUP_INTERNET_STOP_ENABLED": "true",
+                "QBT_USAGE_INCLUDE_UPLOAD": "true",
+                "UNIFI_USAGE_ATTRS": "wan-rx_bytes,wan2-rx_bytes",
             },
         ):
-            client = self.guard.UdmClient()
+            client = unifi.UnifiProvider()
             client.network_rows = network_rows
 
             attrs = client.stats_attrs()
@@ -276,12 +276,12 @@ class UdmParsingTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "UDM_STATS_TIMEZONE": "Asia/Kolkata",
-                    "UDM_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC": "37500000",
-                    "UDM_USAGE_CORRECTION_STATE_PATH": state_path,
+                    "UNIFI_STATS_TIMEZONE": "Asia/Kolkata",
+                    "UNIFI_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC": "37500000",
+                    "UNIFI_USAGE_CORRECTION_STATE_PATH": state_path,
                 },
             ):
-                client = self.guard.UdmClient()
+                client = unifi.UnifiProvider()
                 client.authenticated = True
                 calls = []
 
@@ -297,10 +297,13 @@ class UdmParsingTests(unittest.TestCase):
                     return hourly_rows
 
                 with mock.patch.object(client, "stats_rows", side_effect=fake_stats_rows):
-                    month_total, day_total = client.download_usage_snapshot(now)
+                    snapshot = client.usage_snapshot(now)
 
-                self.assertEqual(expected_day_total, day_total)
-                self.assertEqual(history_total + expected_day_total, month_total)
+                self.assertEqual(expected_day_total, snapshot.day_usage_bytes)
+                self.assertEqual(
+                    history_total + expected_day_total,
+                    snapshot.cycle_usage_bytes,
+                )
                 self.assertEqual(local_month_start, calls[0][1])
                 self.assertEqual(local_day_start, calls[0][2])
                 self.assertEqual(local_day_start, calls[1][1])
@@ -341,12 +344,12 @@ class UdmParsingTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "UDM_STATS_TIMEZONE": "Asia/Kolkata",
-                    "UDM_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC": "37500000",
-                    "UDM_USAGE_CORRECTION_STATE_PATH": state_path,
+                    "UNIFI_STATS_TIMEZONE": "Asia/Kolkata",
+                    "UNIFI_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC": "37500000",
+                    "UNIFI_USAGE_CORRECTION_STATE_PATH": state_path,
                 },
             ):
-                client = self.guard.UdmClient()
+                client = unifi.UnifiProvider()
                 client.authenticated = True
                 daily_rows = [
                     {
@@ -369,21 +372,21 @@ class UdmParsingTests(unittest.TestCase):
                     "stats_rows",
                     side_effect=[daily_rows, current_rows],
                 ):
-                    month_total, day_total = client.download_usage_snapshot(
+                    snapshot = client.usage_snapshot(
                         datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
                     )
 
-                self.assertEqual(100, day_total)
+                self.assertEqual(100, snapshot.day_usage_bytes)
                 self.assertEqual(
                     earlier_history + corrected_affected_day + 100,
-                    month_total,
+                    snapshot.cycle_usage_bytes,
                 )
                 self.assertEqual(correction, client.usage_corrected_bytes)
 
     def test_usage_correction_store_merges_new_counter_corrections(self):
         with tempfile.TemporaryDirectory() as state_dir:
             state_path = os.path.join(state_dir, "usage-corrections.json")
-            store = self.guard.UdmUsageCorrectionStore(state_path)
+            store = unifi.UnifiUsageCorrectionStore(state_path)
 
             self.assertTrue(
                 store.update(
@@ -490,11 +493,11 @@ class UdmParsingTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "UDM_STATS_TIMEZONE": "Asia/Kolkata",
-                    "UDM_USAGE_CORRECTION_STATE_PATH": state_path,
+                    "UNIFI_STATS_TIMEZONE": "Asia/Kolkata",
+                    "UNIFI_USAGE_CORRECTION_STATE_PATH": state_path,
                 },
             ):
-                client = self.guard.UdmClient()
+                client = unifi.UnifiProvider()
                 client.authenticated = True
                 client.network_rows = [
                     {
@@ -524,17 +527,17 @@ class UdmParsingTests(unittest.TestCase):
                         side_effect=fake_stats_rows,
                     ),
                 ):
-                    month_total, day_total = client.download_usage_snapshot(
+                    snapshot = client.usage_snapshot(
                         datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
                     )
 
-                    self.assertEqual(current_usage, day_total)
+                    self.assertEqual(current_usage, snapshot.day_usage_bytes)
                     self.assertEqual(
                         earlier_usage
                         + affected_rx
                         + affected_tx
                         + current_usage,
-                        month_total,
+                        snapshot.cycle_usage_bytes,
                     )
                     self.assertEqual(
                         rx_correction + tx_correction,
@@ -547,14 +550,18 @@ class UdmParsingTests(unittest.TestCase):
                     )
 
                     calls.clear()
-                    repeated_month_total, repeated_day_total = (
-                        client.download_usage_snapshot(
-                            datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
-                        )
+                    repeated_snapshot = client.usage_snapshot(
+                        datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
                     )
 
-                self.assertEqual(month_total, repeated_month_total)
-                self.assertEqual(day_total, repeated_day_total)
+                self.assertEqual(
+                    snapshot.cycle_usage_bytes,
+                    repeated_snapshot.cycle_usage_bytes,
+                )
+                self.assertEqual(
+                    snapshot.day_usage_bytes,
+                    repeated_snapshot.day_usage_bytes,
+                )
                 self.assertEqual(
                     ["daily", "hourly"],
                     [call[0] for call in calls],
@@ -570,7 +577,7 @@ class UdmParsingTests(unittest.TestCase):
                 )
 
     def test_stats_rate_limits_use_unifi_provider_capabilities(self):
-        client = self.guard.UdmClient()
+        client = unifi.UnifiProvider()
         client.network_rows = [
             {
                 "purpose": "wan",
@@ -596,7 +603,7 @@ class UdmParsingTests(unittest.TestCase):
         self.assertNotIn("wan2-rx_bytes", limits)
 
     def test_stats_timezone_is_discovered_from_unifi_sysinfo(self):
-        client = self.guard.UdmClient()
+        client = unifi.UnifiProvider()
         with mock.patch.object(
             client,
             "api_rows",
@@ -608,7 +615,7 @@ class UdmParsingTests(unittest.TestCase):
         self.assertEqual("stat/sysinfo", client.stats_timezone_source)
 
     def test_stats_rows_accepts_wrapped_data_response(self):
-        client = self.guard.UdmClient()
+        client = unifi.UnifiProvider()
         start = datetime(2026, 6, 1, tzinfo=timezone.utc)
         end = datetime(2026, 6, 2, tzinfo=timezone.utc)
         calls = []
@@ -623,7 +630,7 @@ class UdmParsingTests(unittest.TestCase):
             })
             return {"data": [{"wan-rx_bytes": 10}]}, FakeResponse()
 
-        with mock.patch.object(self.guard, "request_json", side_effect=fake_request_json):
+        with mock.patch.object(unifi, "request_json", side_effect=fake_request_json):
             rows = client.stats_rows("hourly", start, end, ["wan-rx_bytes", "time"])
 
         self.assertEqual([{"wan-rx_bytes": 10}], rows)
@@ -635,12 +642,12 @@ class UdmParsingTests(unittest.TestCase):
         self.assertEqual(["wan-rx_bytes", "time"], payload["attrs"])
 
     def test_stats_rows_accepts_raw_list_response(self):
-        client = self.guard.UdmClient()
+        client = unifi.UnifiProvider()
         row_time = datetime(2026, 6, 1, tzinfo=timezone.utc)
         row_time_ms = int(row_time.timestamp() * 1000)
 
         with mock.patch.object(
-            self.guard,
+            unifi,
             "request_json",
             return_value=([{"time": row_time_ms, "wan-rx_bytes": 10}], FakeResponse()),
         ):
@@ -655,14 +662,14 @@ class UdmParsingTests(unittest.TestCase):
         self.assertEqual(row_time, client.latest_stats_at)
 
     def test_stats_rows_rejects_unexpected_shape(self):
-        client = self.guard.UdmClient()
+        client = unifi.UnifiProvider()
 
         with mock.patch.object(
-            self.guard,
+            unifi,
             "request_json",
             return_value=({"data": {"wan-rx_bytes": 10}}, FakeResponse()),
         ):
-            with self.assertRaisesRegex(self.guard.ApiError, "unexpected shape"):
+            with self.assertRaisesRegex(unifi.ApiError, "unexpected shape"):
                 client.stats_rows(
                     "daily",
                     datetime(2026, 6, 1, tzinfo=timezone.utc),
@@ -671,7 +678,7 @@ class UdmParsingTests(unittest.TestCase):
                 )
 
     def test_backup_state_uses_active_uplink_instead_of_last_wan_status(self):
-        state = self.guard.classify_udm_backup_internet_state(
+        state = unifi.classify_unifi_backup_internet_state(
             self.wan_network_rows(),
             [self.gateway_row("ppp0")],
         )
@@ -686,7 +693,7 @@ class UdmParsingTests(unittest.TestCase):
     def test_backup_state_detects_failover_only_network_as_active(self):
         network_rows = self.wan_network_rows()
         network_rows[1]["name"] = "Editable backup label"
-        state = self.guard.classify_udm_backup_internet_state(
+        state = unifi.classify_unifi_backup_internet_state(
             network_rows,
             [self.gateway_row("eth7")],
         )
@@ -700,10 +707,10 @@ class UdmParsingTests(unittest.TestCase):
 
     def test_backup_state_requires_dynamic_failover_role(self):
         with self.assertRaisesRegex(
-            self.guard.ApiError,
+            unifi.ApiError,
             "no WAN configured with failover-only role",
         ):
-            self.guard.classify_udm_backup_internet_state(
+            unifi.classify_unifi_backup_internet_state(
                 [
                     {
                         "name": "Internet 1",
@@ -723,10 +730,10 @@ class UdmParsingTests(unittest.TestCase):
 
     def test_backup_state_rejects_unmapped_active_uplink(self):
         with self.assertRaisesRegex(
-            self.guard.ApiError,
+            unifi.ApiError,
             "Could not uniquely map active UniFi uplink",
         ):
-            self.guard.classify_udm_backup_internet_state(
+            unifi.classify_unifi_backup_internet_state(
                 self.wan_network_rows(),
                 [self.gateway_row("wwan0")],
             )
@@ -743,12 +750,12 @@ class UdmParsingTests(unittest.TestCase):
             self.fail(f"Unexpected URL {url}")
 
         env = {
-            "UDM_URL": "https://unifi.test",
-            "UDM_API_KEY": "test-api-key",
+            "UNIFI_URL": "https://unifi.test",
+            "UNIFI_API_KEY": "test-api-key",
         }
         with mock.patch.dict("os.environ", env, clear=True), \
-                mock.patch.object(self.guard, "request_json", side_effect=fake_request_json):
-            state = self.guard.UdmClient().backup_internet_state()
+                mock.patch.object(unifi, "request_json", side_effect=fake_request_json):
+            state = unifi.UnifiProvider().backup_internet_state()
 
         self.assertTrue(state["backup_active"])
         self.assertEqual(

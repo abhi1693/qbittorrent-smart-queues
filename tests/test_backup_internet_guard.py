@@ -4,8 +4,15 @@ import io
 import unittest
 from unittest import mock
 
+from qbittorrent_smart_queues.providers import (
+    BackupInternetProvider,
+    NetworkUsageProvider,
+    UsageSnapshot,
+)
 
-class FakeUdmClient:
+
+class FakeUsageProvider(NetworkUsageProvider, BackupInternetProvider):
+    provider_name = "fake"
     latest_stats_at = None
 
     def __init__(self, backup_state=None, backup_error=None, usage_error=None):
@@ -14,11 +21,11 @@ class FakeUdmClient:
         self.usage_error = usage_error
         self.usage_calls = 0
 
-    def download_usage_snapshot(self, now):
+    def usage_snapshot(self, now):
         self.usage_calls += 1
         if self.usage_error:
             raise self.usage_error
-        return 0, 0
+        return UsageSnapshot(0, 0)
 
     def backup_internet_state(self):
         if self.backup_error:
@@ -58,14 +65,14 @@ class BackupInternetGuardTests(unittest.TestCase):
             "active_uplink": "eth7",
         }
 
-    def run_guard(self, udm_client, client, env_overrides=None):
+    def run_guard(self, usage_provider, client, env_overrides=None):
         env = {
             "QBT_DECISION_LOGS_ENABLED": "false",
-            "UDM_BACKUP_INTERNET_STOP_ENABLED": "true",
+            "QBT_BACKUP_INTERNET_STOP_ENABLED": "true",
         }
         env.update(env_overrides or {})
         with mock.patch.dict("os.environ", env, clear=True), \
-                mock.patch.object(self.guard, "UdmClient", return_value=udm_client), \
+                mock.patch.object(self.guard, "usage_provider_from_env", return_value=usage_provider), \
                 mock.patch.object(self.guard, "reachable_qbt_clients", return_value=[client]), \
                 mock.patch.object(
                     self.guard,
@@ -85,20 +92,20 @@ class BackupInternetGuardTests(unittest.TestCase):
                 mock.patch.object(self.guard, "apply_single_download") as apply_single_download, \
                 mock.patch.object(self.guard, "cleanup_qbt_clients"), \
                 contextlib.redirect_stdout(io.StringIO()):
-            result = self.guard.run_once()
+            result = self.guard.SmartQueueController().run_once()
         return result, thermal_state, apply_single_download
 
     def test_active_backup_internet_stops_all_torrents_before_other_guards(self):
         client = FakeQbtClient()
-        udm_client = FakeUdmClient(backup_state=self.backup_state)
+        usage_provider = FakeUsageProvider(backup_state=self.backup_state)
 
         result, thermal_state, apply_single_download = self.run_guard(
-            udm_client,
+            usage_provider,
             client,
         )
 
         self.assertEqual(0, result)
-        self.assertEqual(0, udm_client.usage_calls)
+        self.assertEqual(0, usage_provider.usage_calls)
         self.assertEqual([1], client.download_limits)
         self.assertEqual([1], client.upload_limits)
         self.assertEqual(1, client.stop_all_calls)
@@ -118,7 +125,7 @@ class BackupInternetGuardTests(unittest.TestCase):
         }
 
         result, thermal_state, apply_single_download = self.run_guard(
-            FakeUdmClient(backup_state=primary_state),
+            FakeUsageProvider(backup_state=primary_state),
             client,
         )
 
@@ -140,7 +147,7 @@ class BackupInternetGuardTests(unittest.TestCase):
         }
 
         result, thermal_state, apply_single_download = self.run_guard(
-            FakeUdmClient(
+            FakeUsageProvider(
                 backup_state=primary_state,
                 usage_error=self.guard.ApiError("quota stats unavailable"),
             ),
@@ -165,12 +172,12 @@ class BackupInternetGuardTests(unittest.TestCase):
         }
 
         result, thermal_state, apply_single_download = self.run_guard(
-            FakeUdmClient(
+            FakeUsageProvider(
                 backup_state=primary_state,
                 usage_error=self.guard.ApiError("quota stats unavailable"),
             ),
             client,
-            env_overrides={"UDM_FAIL_CLOSED": "true"},
+            env_overrides={"QBT_USAGE_FAIL_CLOSED": "true"},
         )
 
         self.assertEqual(1, result)
@@ -184,7 +191,7 @@ class BackupInternetGuardTests(unittest.TestCase):
         client = FakeQbtClient()
 
         result, thermal_state, apply_single_download = self.run_guard(
-            FakeUdmClient(backup_error=self.guard.ApiError("device status unavailable")),
+            FakeUsageProvider(backup_error=self.guard.ApiError("device status unavailable")),
             client,
         )
 

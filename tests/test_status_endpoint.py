@@ -222,7 +222,8 @@ class StatusEndpointTests(unittest.TestCase):
             source="structured",
             action="pause_all",
             reason="UniFi backup internet is active on Internet 2 via eth7",
-            udm={
+            usage_provider={
+                "provider": "unifi",
                 "available": True,
                 "stats_timezone": "Asia/Kolkata",
                 "stats_timezone_source": "stat/sysinfo",
@@ -252,19 +253,22 @@ class StatusEndpointTests(unittest.TestCase):
         metrics = self.guard.QUEUE_STATUS.prometheus_metrics()
         self.assertIn("qbt_guard_backup_internet_active 1.0", metrics)
         self.assertIn("qbt_guard_backup_internet_state_available 1.0", metrics)
-        self.assertIn("qbt_guard_udm_usage_anomaly_count 1.0", metrics)
         self.assertIn(
-            "qbt_guard_udm_usage_corrected_bytes 1906917897720.0",
+            'qbt_guard_usage_anomaly_count{provider="unifi"} 1.0',
             metrics,
         )
         self.assertIn(
-            'qbt_guard_udm_stats_timezone_info{source="stat/sysinfo",'
+            'qbt_guard_usage_corrected_bytes{provider="unifi"} 1906917897720.0',
+            metrics,
+        )
+        self.assertIn(
+            'qbt_guard_usage_timezone_info{provider="unifi",source="stat/sysinfo",'
             'timezone="Asia/Kolkata"} 1',
             metrics,
         )
         self.assertIn(
-            'qbt_guard_udm_usage_scope_info{network_groups="WAN",'
-            'scope="primary"} 1',
+            'qbt_guard_usage_scope_info{network_groups="WAN",'
+            'provider="unifi",scope="primary"} 1',
             metrics,
         )
         self.assertIn(
@@ -278,7 +282,7 @@ class StatusEndpointTests(unittest.TestCase):
             "qbt_guard_stop",
             source="structured",
             action="pause_all",
-            reason="daily UDM quota guardrail reached",
+            reason="daily quota guardrail reached",
             budget={
                 "monthly_usage_bytes": 1781085064844,
                 "monthly_guardrail_bytes": 2500000000000,
@@ -299,8 +303,8 @@ class StatusEndpointTests(unittest.TestCase):
             "qbt_guard_decision",
             source="summary",
             action="pause_all",
-            message="No active qBittorrent downloads to pause; daily UDM quota guardrail reached",
-            reason="daily UDM quota guardrail reached",
+            message="No active qBittorrent downloads to pause; daily quota guardrail reached",
+            reason="daily quota guardrail reached",
         )
         self.guard.QUEUE_STATUS.record(
             "qbt_guard_loop",

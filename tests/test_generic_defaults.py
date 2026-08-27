@@ -2,6 +2,8 @@ import importlib
 import unittest
 from unittest import mock
 
+from qbittorrent_smart_queues.providers.unifi import UnifiProvider
+
 
 class GenericDefaultsTests(unittest.TestCase):
     def setUp(self):
@@ -11,10 +13,10 @@ class GenericDefaultsTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual([], self.guard.qbt_urls())
 
-    def test_udm_login_requires_configured_url(self):
+    def test_unifi_login_requires_configured_url(self):
         with mock.patch.dict("os.environ", {}, clear=True):
-            with self.assertRaisesRegex(self.guard.ApiError, "UDM_URL"):
-                self.guard.UdmClient().login()
+            with self.assertRaisesRegex(self.guard.ApiError, "UNIFI_URL"):
+                UnifiProvider().login()
 
     def test_nvme_thermal_guard_is_disabled_without_prometheus_url(self):
         with mock.patch.dict("os.environ", {}, clear=True):

@@ -388,7 +388,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
             self.guard.apply_qbt_limits(
                 [client],
-                "daily UDM quota guardrail reached",
+                "daily quota guardrail reached",
                 True,
                 1,
                 1,
@@ -818,7 +818,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                     limit_reason="unit test",
                     storage_guard=FakeStorageGuard(),
                     decision_context={
-                        "udm": {"stats_age_seconds": 42},
+                        "usage_provider": {"stats_age_seconds": 42},
                         "thermal": {"stop": False, "max_temperature_celsius": 55.5},
                     },
                 )
@@ -841,7 +841,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual("zero", try_event["selected_torrent"]["hash"])
         self.assertEqual(1024, try_event["effective_cap"]["download_limit_bytes_per_sec"])
         self.assertEqual(0, try_event["budget"]["monthly_usage_bytes"])
-        self.assertEqual(42, try_event["udm"]["stats_age_seconds"])
+        self.assertEqual(42, try_event["usage_provider"]["stats_age_seconds"])
         self.assertEqual(4000, try_event["storage"]["headroom_bytes"])
         self.assertFalse(try_event["thermal"]["stop"])
         self.assertNotIn("client", try_event)

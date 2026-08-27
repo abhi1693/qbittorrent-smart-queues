@@ -4,12 +4,15 @@ import io
 import unittest
 from unittest import mock
 
+from qbittorrent_smart_queues.providers import NetworkUsageProvider, UsageSnapshot
 
-class FakeUdmClient:
+
+class FakeUsageProvider(NetworkUsageProvider):
+    provider_name = "fake"
     latest_stats_at = None
 
-    def download_usage_snapshot(self, now):
-        return 0, 0
+    def usage_snapshot(self, now):
+        return UsageSnapshot(0, 0)
 
 
 class FakeQbtClient:
@@ -41,7 +44,7 @@ class FullGuardThermalGatingTests(unittest.TestCase):
         }
 
         with mock.patch.dict("os.environ", env, clear=False), \
-                mock.patch.object(self.guard, "UdmClient", return_value=FakeUdmClient()), \
+                mock.patch.object(self.guard, "usage_provider_from_env", return_value=FakeUsageProvider()), \
                 mock.patch.object(self.guard, "reachable_qbt_clients", return_value=[client]), \
                 mock.patch.object(
                     self.guard,
@@ -56,7 +59,7 @@ class FullGuardThermalGatingTests(unittest.TestCase):
                 mock.patch.object(self.guard, "apply_single_download") as apply_single_download, \
                 mock.patch.object(self.guard, "cleanup_qbt_clients"), \
                 contextlib.redirect_stdout(io.StringIO()):
-            result = self.guard.run_once()
+            result = self.guard.SmartQueueController().run_once()
 
         self.assertEqual(0, result)
         self.assertEqual([1], client.download_limits)
@@ -71,7 +74,7 @@ class FullGuardThermalGatingTests(unittest.TestCase):
         }
 
         with mock.patch.dict("os.environ", env, clear=False), \
-                mock.patch.object(self.guard, "UdmClient", return_value=FakeUdmClient()), \
+                mock.patch.object(self.guard, "usage_provider_from_env", return_value=FakeUsageProvider()), \
                 mock.patch.object(self.guard, "reachable_qbt_clients", return_value=[client]), \
                 mock.patch.object(
                     self.guard,
@@ -86,7 +89,7 @@ class FullGuardThermalGatingTests(unittest.TestCase):
                 mock.patch.object(self.guard, "apply_single_download") as apply_single_download, \
                 mock.patch.object(self.guard, "cleanup_qbt_clients"), \
                 contextlib.redirect_stdout(io.StringIO()):
-            result = self.guard.run_once()
+            result = self.guard.SmartQueueController().run_once()
 
         self.assertEqual(0, result)
         apply_single_download.assert_called_once()

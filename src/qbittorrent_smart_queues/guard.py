@@ -17,8 +17,28 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from http.cookiejar import CookieJar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from qbittorrent_smart_queues.clients import QbtClient
+from qbittorrent_smart_queues.config import (
+    env_bool,
+    env_float,
+    env_int,
+    env_str,
+    first_env,
+    split_key_value_lines,
+    split_lines_or_csv,
+)
+from qbittorrent_smart_queues.errors import ApiError
+from qbittorrent_smart_queues.http import join_url, request_json, response_rows
+from qbittorrent_smart_queues.providers import (
+    BackupInternetProvider,
+    NetworkUsageProvider,
+    UsageSnapshot,
+    register_builtin_usage_providers,
+    usage_provider_registry,
+)
+from qbittorrent_smart_queues.quota import QuotaSettings, local_billing_cycle_window
 
 
 QBT_DEFAULT_URLS = []
@@ -555,7 +575,7 @@ class QueueStatusStore:
                         "selected_torrent",
                         "selected_torrents",
                         "storage",
-                        "udm",
+                        "usage_provider",
                         "winner_torrent",
                     ):
                         if key not in next_event and key in previous_event:
@@ -845,64 +865,83 @@ class QueueStatusStore:
                 ],
             )
 
-        udm = last_event.get("udm")
-        if isinstance(udm, dict):
+        usage_provider = last_event.get("usage_provider")
+        if isinstance(usage_provider, dict):
+            provider_label = usage_provider.get("provider") or "unifi"
+            lines.extend([
+                "# HELP qbt_guard_usage_provider_info Configured network usage provider.",
+                "# TYPE qbt_guard_usage_provider_info gauge",
+                prometheus_metric_line(
+                    "qbt_guard_usage_provider_info",
+                    {
+                        "available": str(bool(usage_provider.get("available"))).lower(),
+                        "provider": provider_label,
+                    },
+                    1,
+                ),
+            ])
             append_gauge_family(
                 lines,
-                "qbt_guard_udm_usage_anomaly_count",
-                "Impossible UniFi usage fields corrected in the current local day.",
-                [({}, udm.get("usage_anomaly_count"))],
+                "qbt_guard_usage_anomaly_count",
+                "Usage fields corrected by the configured provider.",
+                [({"provider": provider_label}, usage_provider.get("usage_anomaly_count"))],
             )
             append_gauge_family(
                 lines,
-                "qbt_guard_udm_usage_corrected_bytes",
-                "UniFi usage bytes removed by persisted counter corrections.",
-                [({}, udm.get("usage_corrected_bytes"))],
+                "qbt_guard_usage_corrected_bytes",
+                "Usage bytes removed by provider counter corrections.",
+                [({"provider": provider_label}, usage_provider.get("usage_corrected_bytes"))],
             )
-            if udm.get("stats_timezone"):
+            if usage_provider.get("stats_timezone"):
                 lines.extend([
-                    "# HELP qbt_guard_udm_stats_timezone_info UniFi usage reporting timezone.",
-                    "# TYPE qbt_guard_udm_stats_timezone_info gauge",
+                    "# HELP qbt_guard_usage_timezone_info Provider usage reporting timezone.",
+                    "# TYPE qbt_guard_usage_timezone_info gauge",
                     prometheus_metric_line(
-                        "qbt_guard_udm_stats_timezone_info",
+                        "qbt_guard_usage_timezone_info",
                         {
-                            "source": udm.get("stats_timezone_source") or "",
-                            "timezone": udm.get("stats_timezone") or "",
+                            "provider": provider_label,
+                            "source": usage_provider.get("stats_timezone_source") or "",
+                            "timezone": usage_provider.get("stats_timezone") or "",
                         },
                         1,
                     ),
                 ])
-            if udm.get("usage_scope"):
+            if usage_provider.get("usage_scope"):
                 lines.extend([
-                    "# HELP qbt_guard_udm_usage_scope_info UniFi WAN usage accounting scope.",
-                    "# TYPE qbt_guard_udm_usage_scope_info gauge",
+                    "# HELP qbt_guard_usage_scope_info Provider WAN usage accounting scope.",
+                    "# TYPE qbt_guard_usage_scope_info gauge",
                     prometheus_metric_line(
-                        "qbt_guard_udm_usage_scope_info",
+                        "qbt_guard_usage_scope_info",
                         {
                             "network_groups": ",".join(
-                                udm.get("usage_network_groups") or []
+                                usage_provider.get("usage_network_groups") or []
                             ),
-                            "scope": udm.get("usage_scope") or "",
+                            "provider": provider_label,
+                            "scope": usage_provider.get("usage_scope") or "",
                         },
                         1,
                     ),
                 ])
-        backup_internet = udm.get("backup_internet") if isinstance(udm, dict) else None
+        backup_internet = (
+            usage_provider.get("backup_internet")
+            if isinstance(usage_provider, dict)
+            else None
+        )
         if isinstance(backup_internet, dict) and backup_internet.get("enabled"):
             append_gauge_family(
                 lines,
                 "qbt_guard_backup_internet_active",
-                "Whether UniFi reports a configured backup internet uplink as active.",
+                "Whether the configured provider reports a backup internet uplink as active.",
                 [({}, bool_metric_value(backup_internet.get("backup_active")))],
             )
             append_gauge_family(
                 lines,
                 "qbt_guard_backup_internet_state_available",
-                "Whether the UniFi backup internet state was read successfully.",
+                "Whether backup internet state was read successfully.",
                 [({}, bool_metric_value(backup_internet.get("available")))],
             )
             lines.extend([
-                "# HELP qbt_guard_active_wan_info Latest resolved UniFi WAN uplink labels.",
+                "# HELP qbt_guard_active_wan_info Latest resolved WAN uplink labels.",
                 "# TYPE qbt_guard_active_wan_info gauge",
                 prometheus_metric_line(
                     "qbt_guard_active_wan_info",
@@ -983,68 +1022,11 @@ class QueueStatusStore:
 QUEUE_STATUS = QueueStatusStore()
 
 
-class ApiError(RuntimeError):
-    pass
-
-
-def env_bool(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def env_int(name, default):
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return int(raw)
-
-
-def env_float(name, default):
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return float(raw)
-
-
 def int_or_none(value):
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def first_env(names):
-    for name in names:
-        value = os.environ.get(name)
-        if value is not None and value.strip() != "":
-            return value
-    return None
-
-
-def split_lines_or_csv(value):
-    if not value:
-        return []
-    parts = []
-    for line in value.replace(",", "\n").splitlines():
-        item = line.strip()
-        if item:
-            parts.append(item)
-    return parts
-
-
-def split_key_value_lines(value):
-    items = {}
-    for item in split_lines_or_csv(value):
-        if "=" not in item:
-            continue
-        key, item_value = item.split("=", 1)
-        key = key.strip()
-        item_value = item_value.strip()
-        if key and item_value:
-            items[key] = item_value
-    return items
 
 
 def human_size(value):
@@ -1089,10 +1071,6 @@ def human_duration(seconds):
     return " ".join(parts)
 
 
-def join_url(base_url, path):
-    return base_url.rstrip("/") + "/" + path.lstrip("/")
-
-
 def utc_month_window(now):
     start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
     last_day = calendar.monthrange(now.year, now.month)[1]
@@ -1106,64 +1084,6 @@ def utc_day_start(now):
 
 def utc_day_end(now):
     return utc_day_start(now) + timedelta(days=1) - timedelta(seconds=1)
-
-
-def billing_cycle_day():
-    day = env_int("UDM_BILLING_CYCLE_DAY", 1)
-    if not 1 <= day <= 31:
-        raise ValueError("UDM_BILLING_CYCLE_DAY must be between 1 and 31")
-    return day
-
-
-def local_billing_cycle_window(now, local_timezone, cycle_day):
-    if not 1 <= cycle_day <= 31:
-        raise ValueError("billing cycle day must be between 1 and 31")
-
-    local_now = now.astimezone(local_timezone)
-
-    def local_anchor(year, month):
-        anchor_day = min(cycle_day, calendar.monthrange(year, month)[1])
-        return datetime(year, month, anchor_day, tzinfo=local_timezone)
-
-    current_anchor = local_anchor(local_now.year, local_now.month)
-    if local_now >= current_anchor:
-        start = current_anchor
-        if local_now.month == 12:
-            end = local_anchor(local_now.year + 1, 1)
-        else:
-            end = local_anchor(local_now.year, local_now.month + 1)
-    else:
-        end = current_anchor
-        if local_now.month == 1:
-            start = local_anchor(local_now.year - 1, 12)
-        else:
-            start = local_anchor(local_now.year, local_now.month - 1)
-
-    return (
-        start.astimezone(timezone.utc),
-        end.astimezone(timezone.utc),
-        (end.date() - start.date()).days,
-    )
-
-
-def local_calendar_starts(now, local_timezone, cycle_day=1):
-    local_now = now.astimezone(local_timezone)
-    local_day_start = datetime(
-        local_now.year,
-        local_now.month,
-        local_now.day,
-        tzinfo=local_timezone,
-    )
-    local_cycle_start, _, _ = local_billing_cycle_window(
-        now,
-        local_timezone,
-        cycle_day,
-    )
-    return (
-        local_cycle_start,
-        local_day_start.astimezone(timezone.utc),
-        local_now.date().isoformat(),
-    )
 
 
 def parse_local_clock_time(value, default):
@@ -1544,83 +1464,6 @@ def stop_status_http_server():
     log_info("Stopped qBittorrent smart queues status endpoint")
 
 
-def parse_udm_row_time(value):
-    if value is None:
-        return None
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        try:
-            value = float(raw)
-        except ValueError:
-            return parse_utc(raw)
-    try:
-        timestamp = float(value)
-    except (TypeError, ValueError):
-        return None
-    if timestamp <= 0:
-        return None
-    if timestamp > 10_000_000_000:
-        timestamp = timestamp / 1000.0
-    try:
-        return datetime.fromtimestamp(timestamp, timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
-def latest_udm_row_time(rows):
-    latest = None
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        row_time = parse_udm_row_time(row.get("time"))
-        if row_time and (latest is None or row_time > latest):
-            latest = row_time
-    return latest
-
-
-def filter_udm_rows(rows, start, end):
-    filtered = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        row_time = parse_udm_row_time(row.get("time"))
-        if row_time is None or start <= row_time < end:
-            filtered.append(row)
-    return filtered
-
-
-def udm_stats_interval_seconds(interval):
-    normalized = str(interval or "").strip().lower()
-    return {
-        "5minutes": 300,
-        "hourly": 3600,
-        "daily": 86400,
-        "monthly": 2_678_400,
-    }.get(normalized)
-
-
-def request_json(opener, method, url, headers=None, body=None, timeout=30):
-    request = urllib.request.Request(
-        url,
-        data=body,
-        method=method,
-        headers=headers or {},
-    )
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            payload = response.read()
-            if not payload:
-                return {}, response
-            return json.loads(payload.decode("utf-8")), response
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise ApiError(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise ApiError(f"{method} {url} failed: {exc}") from exc
-
-
 class RyokanImportReconcilerClient:
     def __init__(self, base_url, api_key, timeout=10):
         self.base_url = str(base_url or "").rstrip("/")
@@ -1666,18 +1509,6 @@ def ryokan_import_reconciler_from_env():
         api_key,
         env_int("QBT_RYOKAN_IMPORT_RECONCILER_TIMEOUT", 10),
     )
-
-
-def response_rows(data, label, key="data"):
-    if isinstance(data, dict):
-        rows = data.get(key, [])
-    elif isinstance(data, list):
-        rows = data
-    else:
-        raise ApiError(f"{label} response has unexpected shape: {type(data).__name__}")
-    if not isinstance(rows, list):
-        raise ApiError(f"{label} response has unexpected shape: {type(rows).__name__}")
-    return rows
 
 
 def paginated_arr_queue_records(
@@ -3087,1122 +2918,18 @@ class DownloadStorageGuard:
         return state
 
 
-def normalize_udm_wan_identifier(value):
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+register_builtin_usage_providers(debug=log_debug, warning=log_warning)
 
 
-def udm_wan_interface_aliases(interface_name, interface):
-    aliases = {
-        normalize_udm_wan_identifier(interface_name),
-    }
-    if normalize_udm_wan_identifier(interface_name) == "wan1":
-        aliases.add("wan")
-    if isinstance(interface, dict):
-        for key in ("name", "ifname", "uplink_ifname"):
-            alias = normalize_udm_wan_identifier(interface.get(key))
-            if alias:
-                aliases.add(alias)
-    return {alias for alias in aliases if alias}
+def configured_usage_provider_name():
+    return env_str("QBT_USAGE_PROVIDER", "unifi")
 
 
-def udm_wan_stats_prefix(network_group):
-    normalized = normalize_udm_wan_identifier(network_group)
-    if normalized in {"wan", "wan1"}:
-        return "wan"
-    if re.fullmatch(r"wan[2-9]\d*", normalized):
-        return normalized
-    return ""
-
-
-def udm_primary_usage_stats_attrs(network_rows, include_upload=False):
-    attrs = []
-    network_groups = []
-    for row in network_rows:
-        if (
-            not isinstance(row, dict)
-            or str(row.get("purpose") or "").strip().lower() != "wan"
-        ):
-            continue
-        load_balance_type = str(
-            row.get("wan_load_balance_type") or ""
-        ).strip().lower()
-        if load_balance_type in {"failover", "failover-only"}:
-            continue
-        network_group = str(row.get("wan_networkgroup") or "").strip()
-        stats_prefix = udm_wan_stats_prefix(network_group)
-        if not stats_prefix:
-            raise ApiError(
-                "Could not map primary UniFi WAN group "
-                f"{network_group!r} to a report field"
-            )
-        attrs.append(f"{stats_prefix}-rx_bytes")
-        if include_upload:
-            attrs.append(f"{stats_prefix}-tx_bytes")
-        network_groups.append(network_group)
-    if not attrs:
-        raise ApiError(
-            "UniFi has no primary WAN report fields after excluding failover-only roles"
-        )
-    attrs.append("time")
-    return list(dict.fromkeys(attrs)), sorted(set(network_groups))
-
-
-def classify_udm_backup_internet_state(network_rows, device_rows):
-    wan_networks = {}
-    backup_network_groups = set()
-    for row in network_rows:
-        if not isinstance(row, dict) or str(row.get("purpose") or "").strip().lower() != "wan":
-            continue
-        network_group = normalize_udm_wan_identifier(row.get("wan_networkgroup"))
-        if network_group:
-            wan_networks[network_group] = row
-        load_balance_type = str(row.get("wan_load_balance_type") or "").strip().lower()
-        if load_balance_type in {"failover", "failover-only"}:
-            identifier = normalize_udm_wan_identifier(row.get("wan_networkgroup"))
-            if identifier:
-                backup_network_groups.add(identifier)
-
-    if not backup_network_groups:
-        raise ApiError("UniFi has no WAN configured with failover-only role")
-
-    gateways = []
-    for row in device_rows:
-        if not isinstance(row, dict) or not isinstance(row.get("uplink"), dict):
-            continue
-        interface_names = [
-            key
-            for key, value in row.items()
-            if re.fullmatch(r"wan\d*", str(key).strip().lower()) and isinstance(value, dict)
-        ]
-        if interface_names:
-            gateways.append((row, interface_names))
-    if len(gateways) != 1:
-        raise ApiError(f"Expected one UniFi gateway with WAN interfaces, found {len(gateways)}")
-
-    gateway, interface_names = gateways[0]
-    uplink = gateway.get("uplink") or {}
-    active_uplink = normalize_udm_wan_identifier(uplink.get("name") or uplink.get("ifname"))
-    if uplink.get("up") is False:
-        raise ApiError("UniFi gateway reports that its active uplink is down")
-
-    interfaces = []
-    for interface_name in interface_names:
-        interface = gateway.get(interface_name) or {}
-        aliases = udm_wan_interface_aliases(interface_name, interface)
-        matching_network = None
-        for network_group, network in wan_networks.items():
-            if network_group in aliases:
-                matching_network = network
-                aliases.add(network_group)
-                break
-        interfaces.append({
-            "name": interface_name,
-            "details": interface,
-            "aliases": {alias for alias in aliases if alias},
-            "network": matching_network or {},
-        })
-
-    known_interface_identifiers = set().union(
-        *(interface["aliases"] for interface in interfaces)
-    )
-    unmatched_backup_groups = backup_network_groups - known_interface_identifiers
-    if unmatched_backup_groups:
-        raise ApiError(
-            "UniFi failover-only WAN group does not match a gateway logical "
-            "interface or uplink interface: "
-            + ", ".join(sorted(unmatched_backup_groups))
-        )
-
-    active_interfaces = []
-    if active_uplink:
-        active_interfaces = [
-            interface
-            for interface in interfaces
-            if active_uplink in interface["aliases"]
-        ]
-    if not active_interfaces:
-        active_interfaces = [
-            interface
-            for interface in interfaces
-            if interface["details"].get("is_uplink") is True
-        ]
-    if len(active_interfaces) != 1:
-        rendered_uplink = uplink.get("name") or uplink.get("ifname") or "unknown"
-        raise ApiError(
-            f"Could not uniquely map active UniFi uplink {rendered_uplink!r} "
-            f"to a WAN interface; matched {len(active_interfaces)}"
-        )
-
-    active_interface = active_interfaces[0]
-    network = active_interface["network"]
-    backup_active = bool(active_interface["aliases"] & backup_network_groups)
-    return {
-        "enabled": True,
-        "available": True,
-        "backup_active": backup_active,
-        "active_role": "backup" if backup_active else "primary",
-        "active_network": str(network.get("name") or active_interface["name"]),
-        "active_network_group": str(
-            network.get("wan_networkgroup") or active_interface["name"]
-        ),
-        "active_interface": str(active_interface["name"]),
-        "active_uplink": str(uplink.get("name") or uplink.get("ifname") or ""),
-        "role_source": "wan_load_balance_type",
-    }
-
-
-class UdmUsageCorrectionStore:
-    def __init__(self, path):
-        self.path = path
-        self.data = {"version": 1, "days": {}}
-        self.load()
-
-    def load(self):
-        if not self.path:
-            return
-        try:
-            with open(self.path, "r", encoding="utf-8") as state_file:
-                payload = json.load(state_file)
-        except FileNotFoundError:
-            return
-        except (OSError, json.JSONDecodeError) as exc:
-            log_warning(f"Failed to read UniFi usage correction state: {exc}")
-            return
-        days = payload.get("days") if isinstance(payload, dict) else None
-        if isinstance(days, dict):
-            self.data = {"version": 1, "days": days}
-
-    def save(self):
-        if not self.path:
-            return
-        directory = os.path.dirname(self.path)
-        tmp_path = f"{self.path}.tmp"
-        try:
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(tmp_path, "w", encoding="utf-8") as state_file:
-                json.dump(
-                    json_safe(self.data),
-                    state_file,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                state_file.write("\n")
-                state_file.flush()
-                os.fsync(state_file.fileno())
-            os.replace(tmp_path, self.path)
-        except OSError as exc:
-            log_warning(f"Failed to save UniFi usage correction state: {exc}")
-
-    def corrections_for(self, local_day, attrs):
-        day_state = (self.data.get("days") or {}).get(local_day) or {}
-        corrections = day_state.get("corrections") or {}
-        return {
-            attr: max(0, int(corrections.get(attr, 0) or 0))
-            for attr in attrs
-        }
-
-    def correction_bytes(self, local_day, attrs):
-        return sum(self.corrections_for(local_day, attrs).values())
-
-    def update(self, local_day, corrections, timezone_name):
-        normalized = {
-            str(attr): max(0, int(value))
-            for attr, value in corrections.items()
-            if int(value) > 0
-        }
-        if not normalized:
-            return False
-        days = self.data.setdefault("days", {})
-        existing = days.get(local_day) or {}
-        merged = dict(existing.get("corrections") or {})
-        merged.update(normalized)
-        if existing.get("corrections") == merged:
-            return False
-        days[local_day] = {
-            **existing,
-            "corrections": merged,
-            "timezone": timezone_name,
-            "updated_at": format_utc(datetime.now(timezone.utc)),
-        }
-        self.save()
-        return True
-
-
-class UdmClient:
-    def __init__(self):
-        self.base_url = os.environ.get("UDM_URL", "").strip().rstrip("/")
-        self.site = os.environ.get("UDM_SITE", "default")
-        self.api_base_path = os.environ.get("UDM_API_BASE_PATH", "/proxy/network").strip()
-        self.timeout = env_int("UDM_TIMEOUT", 30)
-        self.verify_tls = env_bool("UDM_VERIFY_TLS", False)
-        self.api_key = os.environ.get("UDM_API_KEY", "").strip()
-        self.authenticated = False
-        self.username = (
-            os.environ.get("UDM_USER")
-            or os.environ.get("UDM_USERNAME")
-            or os.environ.get("UNIFI_USER")
-            or os.environ.get("UNIFI_USERNAME")
-            or ""
-        ).strip()
-        self.password = (os.environ.get("UDM_PASSWORD") or os.environ.get("UNIFI_PASSWORD") or "").strip()
-        self.csrf_token = ""
-        self.latest_stats_at = None
-        self.network_rows = None
-        self.device_rows = None
-        self.stats_timezone_name = ""
-        self.stats_timezone_info = None
-        self.stats_timezone_source = ""
-        self.billing_cycle_day = 1
-        self.billing_cycle_start = None
-        self.billing_cycle_end = None
-        self.billing_cycle_days = 0
-        self.local_day_end = None
-        self.usage_scope = "all"
-        self.usage_network_groups = []
-        self.usage_anomalies = []
-        self.usage_corrected_bytes = 0
-        self.usage_correction_store = UdmUsageCorrectionStore(
-            os.environ.get(
-                "UDM_USAGE_CORRECTION_STATE_PATH",
-                "/state/udm-usage-corrections.json",
-            ).strip()
-        )
-        self.cookie_jar = CookieJar()
-        context = None
-        if not self.verify_tls:
-            context = ssl._create_unverified_context()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.cookie_jar),
-            urllib.request.HTTPSHandler(context=context),
-        )
-
-    def headers(self):
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-        if self.api_key:
-            headers["X-API-KEY"] = self.api_key
-        if self.csrf_token:
-            headers["X-CSRF-Token"] = self.csrf_token
-        return headers
-
-    def login(self):
-        if self.authenticated:
-            return
-        if not self.base_url:
-            raise ApiError("UDM_URL is required for UDM quota data")
-        if self.api_key:
-            log_debug("Using UDM API key authentication")
-            self.authenticated = True
-            return
-        if not self.username or not self.password:
-            raise ApiError("UDM credentials missing; set UDM_API_KEY or UDM_USER/UDM_PASSWORD")
-
-        payload = json.dumps({"username": self.username, "password": self.password}).encode("utf-8")
-        login_paths = split_lines_or_csv(os.environ.get("UDM_LOGIN_PATHS")) or [
-            "/api/auth/login",
-            "/api/login",
-        ]
-        errors = []
-        for path in login_paths:
-            url = join_url(self.base_url, path)
-            try:
-                _, response = request_json(
-                    self.opener,
-                    "POST",
-                    url,
-                    headers=self.headers(),
-                    body=payload,
-                    timeout=self.timeout,
-                )
-                self.csrf_token = response.headers.get("X-CSRF-Token", "")
-                log_debug(f"Authenticated to UDM with {path}")
-                self.authenticated = True
-                return
-            except ApiError as exc:
-                errors.append(str(exc))
-        raise ApiError("UDM login failed: " + " | ".join(errors))
-
-    def stats_attrs(self):
-        if env_bool("UDM_BACKUP_INTERNET_STOP_ENABLED", False):
-            if self.network_rows is None:
-                network_endpoint = (
-                    f"{self.api_base_path}/api/s/{self.site}/rest/networkconf"
-                )
-                self.network_rows = self.api_rows(
-                    network_endpoint,
-                    "UDM network configuration",
-                )
-            attrs, network_groups = udm_primary_usage_stats_attrs(
-                self.network_rows,
-                include_upload=env_bool("UDM_INCLUDE_UPLOAD", False),
-            )
-            self.usage_scope = "primary"
-            self.usage_network_groups = network_groups
-            return attrs
-
-        attrs = split_lines_or_csv(os.environ.get("UDM_DOWNLOAD_ATTRS")) or ["wan-rx_bytes", "wan2-rx_bytes"]
-        if env_bool("UDM_INCLUDE_UPLOAD", False):
-            attrs.extend(["wan-tx_bytes", "wan2-tx_bytes"])
-        if "time" not in attrs:
-            attrs.append("time")
-        self.usage_scope = "all"
-        self.usage_network_groups = []
-        return attrs
-
-    def stats_rows(self, interval, start, end, attrs):
-        start_ms = int(start.timestamp() * 1000)
-        end_ms = int(end.timestamp() * 1000)
-        report_type = os.environ.get("UDM_STATS_TYPE", "site").strip()
-        endpoint = f"{self.api_base_path}/api/s/{self.site}/stat/report/{interval}.{report_type}"
-        url = join_url(self.base_url, endpoint)
-
-        payload = json.dumps({"start": start_ms, "end": end_ms, "attrs": attrs}).encode("utf-8")
-        data, _ = request_json(
-            self.opener,
-            "POST",
-            url,
-            headers=self.headers(),
-            body=payload,
-            timeout=self.timeout,
-        )
-        rows = response_rows(data, "UDM stats")
-        latest_row_time = latest_udm_row_time(rows)
-        if latest_row_time and (self.latest_stats_at is None or latest_row_time > self.latest_stats_at):
-            self.latest_stats_at = latest_row_time
-        log_debug(f"UDM returned {len(rows)} {interval}.{report_type} rows")
-        return rows
-
-    def resolve_stats_timezone(self):
-        configured = os.environ.get("UDM_STATS_TIMEZONE", "").strip()
-        source = "UDM_STATS_TIMEZONE"
-        timezone_name = configured
-        if not timezone_name:
-            endpoint = f"{self.api_base_path}/api/s/{self.site}/stat/sysinfo"
-            sysinfo_rows = self.api_rows(endpoint, "UDM system information")
-            timezone_names = {
-                str(row.get("timezone") or "").strip()
-                for row in sysinfo_rows
-                if isinstance(row, dict) and str(row.get("timezone") or "").strip()
-            }
-            if len(timezone_names) != 1:
-                raise ApiError(
-                    "Could not resolve one UniFi reporting timezone from stat/sysinfo"
-                )
-            timezone_name = timezone_names.pop()
-            source = "stat/sysinfo"
-        try:
-            local_timezone = ZoneInfo(timezone_name)
-        except ZoneInfoNotFoundError as exc:
-            raise ApiError(
-                f"UniFi reporting timezone {timezone_name!r} is not available"
-            ) from exc
-        self.stats_timezone_name = timezone_name
-        self.stats_timezone_info = local_timezone
-        self.stats_timezone_source = source
-        return local_timezone
-
-    def stats_rate_limits(self, attrs):
-        download_attrs = [attr for attr in attrs if attr != "time"]
-        configured_limit = max(
-            0,
-            env_int("UDM_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC", 0),
-        )
-        if configured_limit:
-            return {
-                attr: configured_limit
-                for attr in download_attrs
-                if str(attr).strip().lower().endswith("-rx_bytes")
-            }
-
-        if self.network_rows is None:
-            network_endpoint = (
-                f"{self.api_base_path}/api/s/{self.site}/rest/networkconf"
-            )
-            self.network_rows = self.api_rows(
-                network_endpoint,
-                "UDM network configuration",
-            )
-
-        wan_capabilities = {}
-        for row in self.network_rows:
-            if (
-                not isinstance(row, dict)
-                or str(row.get("purpose") or "").strip().lower() != "wan"
-            ):
-                continue
-            network_group = normalize_udm_wan_identifier(
-                row.get("wan_networkgroup")
-            )
-            capabilities = row.get("wan_provider_capabilities")
-            if not network_group or not isinstance(capabilities, dict):
-                continue
-            download_kbps = capabilities.get("download_kilobits_per_second")
-            upload_kbps = capabilities.get("upload_kilobits_per_second")
-            try:
-                download_rate = max(
-                    0,
-                    math.floor(float(download_kbps) * 1000 / 8),
-                )
-            except (TypeError, ValueError):
-                download_rate = 0
-            try:
-                upload_rate = max(
-                    0,
-                    math.floor(float(upload_kbps) * 1000 / 8),
-                )
-            except (TypeError, ValueError):
-                upload_rate = 0
-            wan_capabilities[network_group] = {
-                "rx": download_rate,
-                "tx": upload_rate,
-            }
-
-        limits = {}
-        for attr in download_attrs:
-            match = re.fullmatch(
-                r"(wan\d*)-(rx|tx)_bytes",
-                str(attr).strip().lower(),
-            )
-            if not match:
-                continue
-            network_group = normalize_udm_wan_identifier(match.group(1))
-            direction = match.group(2)
-            rate = (wan_capabilities.get(network_group) or {}).get(direction, 0)
-            if rate > 0:
-                limits[attr] = rate
-        return limits
-
-    def sum_download_bytes(
-        self,
-        rows,
-        attrs,
-        local_timezone=None,
-        apply_saved_corrections=False,
-    ):
-        total = 0
-        download_attrs = [attr for attr in attrs if attr != "time"]
-        remaining_corrections_by_day = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            saved_corrections = {}
-            if apply_saved_corrections and local_timezone is not None:
-                row_time = parse_udm_row_time(row.get("time"))
-                if row_time is not None:
-                    local_day = row_time.astimezone(
-                        local_timezone
-                    ).date().isoformat()
-                    if local_day not in remaining_corrections_by_day:
-                        remaining_corrections_by_day[local_day] = (
-                            self.usage_correction_store.corrections_for(
-                                local_day,
-                                download_attrs,
-                            )
-                        )
-                    saved_corrections = remaining_corrections_by_day[
-                        local_day
-                    ]
-            row_total = 0
-            for attr in download_attrs:
-                value = row.get(attr)
-                if isinstance(value, (int, float)) and value > 0:
-                    attr_value = int(value)
-                    applied_correction = min(
-                        attr_value,
-                        saved_corrections.get(attr, 0),
-                    )
-                    row_total += attr_value - applied_correction
-                    if applied_correction:
-                        saved_corrections[attr] -= applied_correction
-                    self.usage_corrected_bytes += applied_correction
-            total += row_total
-        return total
-
-    def corrected_download_bytes(self, rows, attrs, interval, local_day):
-        download_attrs = [attr for attr in attrs if attr != "time"]
-        interval_seconds = udm_stats_interval_seconds(interval)
-        rate_limits = self.stats_rate_limits(attrs) if interval_seconds else {}
-        multiplier = max(
-            1.0,
-            env_float("UDM_STATS_RATE_LIMIT_MULTIPLIER", 1.25),
-        )
-        values_by_attr = {
-            attr: [
-                int(row.get(attr))
-                if (
-                    isinstance(row, dict)
-                    and isinstance(row.get(attr), (int, float))
-                    and row.get(attr) > 0
-                )
-                else 0
-                for row in rows
-            ]
-            for attr in download_attrs
-        }
-        total = 0
-        anomalies = []
-        corrections = {}
-        for attr, values in values_by_attr.items():
-            rate_limit = rate_limits.get(attr, 0)
-            bucket_limit = (
-                math.floor(rate_limit * interval_seconds * multiplier)
-                if rate_limit and interval_seconds
-                else 0
-            )
-            for index, observed in enumerate(values):
-                if not bucket_limit or observed <= bucket_limit:
-                    total += observed
-                    continue
-                previous_value = next(
-                    (
-                        value
-                        for value in reversed(values[:index])
-                        if value <= bucket_limit
-                    ),
-                    0,
-                )
-                next_value = next(
-                    (
-                        value
-                        for value in values[index + 1 :]
-                        if value <= bucket_limit
-                    ),
-                    0,
-                )
-                replacement = max(previous_value, next_value)
-                correction = max(0, observed - replacement)
-                total += replacement
-                corrections[attr] = corrections.get(attr, 0) + correction
-                row = rows[index] if index < len(rows) else {}
-                row_time = (
-                    parse_udm_row_time(row.get("time"))
-                    if isinstance(row, dict)
-                    else None
-                )
-                anomalies.append({
-                    "attribute": attr,
-                    "time": format_utc(row_time) if row_time else None,
-                    "observed_bytes": observed,
-                    "replacement_bytes": replacement,
-                    "bucket_limit_bytes": bucket_limit,
-                    "correction_bytes": correction,
-                })
-
-        existing_correction = self.usage_correction_store.correction_bytes(
-            local_day,
-            download_attrs,
-        )
-        if corrections:
-            changed = self.usage_correction_store.update(
-                local_day,
-                corrections,
-                self.stats_timezone_name,
-            )
-            if changed:
-                for anomaly in anomalies:
-                    log_warning(
-                        "Corrected impossible UniFi usage bucket",
-                        **anomaly,
-                    )
-        elif existing_correction:
-            total = self.sum_download_bytes(
-                rows,
-                attrs,
-                local_timezone=self.stats_timezone_info,
-                apply_saved_corrections=True,
-            )
-
-        self.usage_anomalies.extend(anomalies)
-        if corrections:
-            self.usage_corrected_bytes += sum(corrections.values())
-        return total
-
-    def backfill_daily_history_corrections(
-        self,
-        rows,
-        attrs,
-        interval,
-        local_timezone,
-    ):
-        if str(interval or "").strip().lower() != "daily":
-            return
-
-        download_attrs = [attr for attr in attrs if attr != "time"]
-        rate_limits = self.stats_rate_limits(attrs)
-        multiplier = max(
-            1.0,
-            env_float("UDM_STATS_RATE_LIMIT_MULTIPLIER", 1.25),
-        )
-        daily_limits = {
-            attr: math.floor(rate * 86400 * multiplier)
-            for attr, rate in rate_limits.items()
-            if rate > 0
-        }
-        suspicious_attrs_by_day = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            row_time = parse_udm_row_time(row.get("time"))
-            if row_time is None:
-                continue
-            local_date = row_time.astimezone(local_timezone).date()
-            local_day = local_date.isoformat()
-            saved_corrections = (
-                self.usage_correction_store.corrections_for(
-                    local_day,
-                    download_attrs,
-                )
-            )
-            for attr in download_attrs:
-                observed = row.get(attr)
-                daily_limit = daily_limits.get(attr, 0)
-                if (
-                    isinstance(observed, (int, float))
-                    and observed > daily_limit > 0
-                    and saved_corrections.get(attr, 0) <= 0
-                ):
-                    suspicious_attrs_by_day.setdefault(
-                        local_date,
-                        set(),
-                    ).add(attr)
-
-        for local_date, suspicious_attrs in sorted(
-            suspicious_attrs_by_day.items()
-        ):
-            local_day = local_date.isoformat()
-            day_start = datetime.combine(
-                local_date,
-                datetime_time.min,
-                tzinfo=local_timezone,
-            )
-            day_end = day_start + timedelta(days=1)
-            replay_attrs = sorted(suspicious_attrs)
-            replay_attrs.append("time")
-            hourly_rows = self.stats_rows(
-                "hourly",
-                day_start,
-                day_end,
-                replay_attrs,
-            )
-            hourly_rows = filter_udm_rows(
-                hourly_rows,
-                day_start,
-                day_end,
-            )
-            corrected_bytes_before = self.usage_corrected_bytes
-            if hourly_rows:
-                self.corrected_download_bytes(
-                    hourly_rows,
-                    replay_attrs,
-                    "hourly",
-                    local_day,
-                )
-                # The daily rollup applies and counts the persisted correction
-                # below. Do not count the replay itself as corrected usage too.
-                self.usage_corrected_bytes = corrected_bytes_before
-
-            persisted = self.usage_correction_store.corrections_for(
-                local_day,
-                suspicious_attrs,
-            )
-            unresolved = sorted(
-                attr
-                for attr in suspicious_attrs
-                if persisted.get(attr, 0) <= 0
-            )
-            if unresolved:
-                log_warning(
-                    "Could not backfill impossible UniFi daily usage fields; "
-                    "counting their raw values",
-                    local_day=local_day,
-                    attributes=unresolved,
-                    hourly_row_count=len(hourly_rows),
-                )
-
-    def download_usage_snapshot(self, now):
-        self.login()
-        self.usage_anomalies = []
-        self.usage_corrected_bytes = 0
-        local_timezone = self.resolve_stats_timezone()
-        self.billing_cycle_day = billing_cycle_day()
-        (
-            self.billing_cycle_start,
-            self.billing_cycle_end,
-            self.billing_cycle_days,
-        ) = local_billing_cycle_window(
-            now,
-            local_timezone,
-            self.billing_cycle_day,
-        )
-        month_start, today_start, local_day = local_calendar_starts(
-            now,
-            local_timezone,
-            self.billing_cycle_day,
-        )
-        local_now = now.astimezone(local_timezone)
-        self.local_day_end = (
-            datetime(
-                local_now.year,
-                local_now.month,
-                local_now.day,
-                tzinfo=local_timezone,
-            )
-            + timedelta(days=1)
-        ).astimezone(timezone.utc)
-        interval = os.environ.get("UDM_STATS_INTERVAL", "split-daily-hourly").strip()
-        attrs = self.stats_attrs()
-
-        if interval != "split-daily-hourly":
-            month_rows = self.stats_rows(interval, month_start, now, attrs)
-            day_rows = self.stats_rows(interval, today_start, now, attrs)
-            month_rows = filter_udm_rows(month_rows, month_start, now)
-            day_rows = filter_udm_rows(day_rows, today_start, now)
-            day_raw = self.sum_download_bytes(day_rows, attrs)
-            month_total = self.sum_download_bytes(
-                month_rows,
-                attrs,
-                local_timezone=local_timezone,
-                apply_saved_corrections=True,
-            )
-            day_total = self.corrected_download_bytes(
-                day_rows,
-                attrs,
-                interval,
-                local_day,
-            )
-            return max(0, month_total - day_raw + day_total), day_total
-
-        month_total = 0
-        if month_start < today_start:
-            history_interval = os.environ.get("UDM_HISTORY_STATS_INTERVAL", "daily").strip()
-            rows = self.stats_rows(history_interval, month_start, today_start, attrs)
-            rows = filter_udm_rows(rows, month_start, today_start)
-            self.backfill_daily_history_corrections(
-                rows,
-                attrs,
-                history_interval,
-                local_timezone,
-            )
-            month_total += self.sum_download_bytes(
-                rows,
-                attrs,
-                local_timezone=local_timezone,
-                apply_saved_corrections=True,
-            )
-
-        current_interval = os.environ.get("UDM_CURRENT_STATS_INTERVAL", "hourly").strip()
-        current_rows = self.stats_rows(current_interval, today_start, now, attrs)
-        current_rows = filter_udm_rows(current_rows, today_start, now)
-        if not current_rows:
-            fallback_interval = os.environ.get("UDM_CURRENT_STATS_FALLBACK_INTERVAL", "daily").strip()
-            current_rows = self.stats_rows(fallback_interval, today_start, now, attrs)
-            current_rows = filter_udm_rows(current_rows, today_start, now)
-            current_interval = fallback_interval
-        day_total = self.corrected_download_bytes(
-            current_rows,
-            attrs,
-            current_interval,
-            local_day,
-        )
-        month_total += day_total
-        return month_total, day_total
-
-    def month_to_date_download_bytes(self, now):
-        month_total, _ = self.download_usage_snapshot(now)
-        return month_total
-
-    def api_rows(self, endpoint, label):
-        self.login()
-        url = join_url(self.base_url, endpoint)
-        data, _ = request_json(
-            self.opener,
-            "GET",
-            url,
-            headers=self.headers(),
-            timeout=self.timeout,
-        )
-        return response_rows(data, label)
-
-    def backup_internet_state(self):
-        network_endpoint = (
-            f"{self.api_base_path}/api/s/{self.site}/rest/networkconf"
-        )
-        device_endpoint = (
-            f"{self.api_base_path}/api/s/{self.site}/stat/device"
-        )
-        self.network_rows = self.api_rows(
-            network_endpoint,
-            "UDM network configuration",
-        )
-        self.device_rows = self.api_rows(device_endpoint, "UDM device status")
-        return classify_udm_backup_internet_state(
-            self.network_rows,
-            self.device_rows,
-        )
-
-
-class QbtClient:
-    def __init__(self, base_url):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = env_int("QBT_TIMEOUT", 30)
-        self.request_attempts = env_int("QBT_REQUEST_ATTEMPTS", 3)
-        self.retry_delay = env_float("QBT_REQUEST_RETRY_DELAY", 2.0)
-        self.username = (os.environ.get("QBT_USER") or os.environ.get("QBT_USERNAME") or "").strip()
-        self.password = os.environ.get("QBT_PASSWORD", "")
-        self.cookie_jar = CookieJar()
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
-
-    def request(self, method, path, form=None):
-        body = None
-        headers = {}
-        if form is not None:
-            body = urllib.parse.urlencode(form).encode("utf-8")
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-        url = join_url(self.base_url, path)
-        last_error = None
-        for attempt in range(1, self.request_attempts + 1):
-            request = urllib.request.Request(url, data=body, method=method, headers=headers)
-            try:
-                with self.opener.open(request, timeout=self.timeout) as response:
-                    return response.read()
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                last_error = exc
-                if attempt < self.request_attempts:
-                    time.sleep(self.retry_delay)
-        raise ApiError(f"{method} {path} failed after {self.request_attempts} attempts: {last_error}")
-
-    def login(self):
-        if not self.username:
-            return
-        response = self.request(
-            "POST",
-            "/api/v2/auth/login",
-            {"username": self.username, "password": self.password},
-        ).decode("utf-8", errors="replace")
-        if response.strip().lower() not in {"", "ok."}:
-            raise ApiError(f"qBittorrent login failed: {response}")
-
-    def set_download_limit(self, limit_bytes_per_second):
-        self.request(
-            "POST",
-            "/api/v2/transfer/setDownloadLimit",
-            {"limit": str(max(0, int(limit_bytes_per_second)))},
-        )
-
-    def set_upload_limit(self, limit_bytes_per_second):
-        self.request(
-            "POST",
-            "/api/v2/transfer/setUploadLimit",
-            {"limit": str(max(1, int(limit_bytes_per_second)))},
-        )
-
-    def set_preferences(self, preferences):
-        self.request(
-            "POST",
-            "/api/v2/app/setPreferences",
-            {"json": json.dumps(preferences)},
-        )
-
-    def app_preferences(self):
-        payload = self.request("GET", "/api/v2/app/preferences")
-        preferences = json.loads(payload.decode("utf-8"))
-        if not isinstance(preferences, dict):
-            raise ApiError(
-                "qBittorrent preferences response has unexpected shape: "
-                f"{type(preferences).__name__}"
-            )
-        return preferences
-
-    def set_active_queue_limits(self, max_active_downloads, max_active_torrents=None):
-        max_active_downloads = max(1, int(max_active_downloads))
-        if max_active_torrents is None:
-            max_active_torrents = max_active_downloads
-        self.set_preferences(
-            {
-                "queueing_enabled": True,
-                "max_active_downloads": max_active_downloads,
-                "max_active_torrents": max(1, int(max_active_torrents)),
-            }
-        )
-
-    def stop_all(self):
-        try:
-            self.request("POST", "/api/v2/torrents/stop", {"hashes": "all"})
-        except ApiError:
-            self.request("POST", "/api/v2/torrents/pause", {"hashes": "all"})
-
-    def torrents_info(self, filter_name=None):
-        path = "/api/v2/torrents/info"
-        if filter_name:
-            path += "?" + urllib.parse.urlencode({"filter": filter_name})
-        payload = self.request("GET", path)
-        return json.loads(payload.decode("utf-8"))
-
-    def torrent_info(self, item_hash):
-        if not item_hash:
-            return None
-        path = "/api/v2/torrents/info?" + urllib.parse.urlencode({"hashes": item_hash})
-        payload = self.request("GET", path)
-        torrents = json.loads(payload.decode("utf-8"))
-        if not isinstance(torrents, list):
-            raise ApiError(
-                "qBittorrent torrent info response has unexpected shape: "
-                f"{type(torrents).__name__}"
-            )
-        for torrent in torrents:
-            if torrent_hash(torrent) == item_hash:
-                return torrent
+def usage_provider_from_env():
+    name = configured_usage_provider_name()
+    if usage_provider_registry.normalize_name(name) in {"", "none", "disabled", "off"}:
         return None
-
-    def transfer_info(self):
-        payload = self.request("GET", "/api/v2/transfer/info")
-        return json.loads(payload.decode("utf-8"))
-
-    def torrent_files(self, item_hash):
-        if not item_hash:
-            return []
-        path = "/api/v2/torrents/files?" + urllib.parse.urlencode({"hash": item_hash})
-        payload = self.request("GET", path)
-        return json.loads(payload.decode("utf-8"))
-
-    def torrent_trackers(self, item_hash):
-        if not item_hash:
-            return []
-        path = "/api/v2/torrents/trackers?" + urllib.parse.urlencode({"hash": item_hash})
-        payload = self.request("GET", path)
-        trackers = json.loads(payload.decode("utf-8"))
-        if not isinstance(trackers, list):
-            raise ApiError(f"qBittorrent trackers response has unexpected shape: {type(trackers).__name__}")
-        return trackers
-
-    def set_file_priority(self, item_hash, file_ids, priority):
-        if not item_hash or not file_ids:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/filePrio",
-            {
-                "hash": item_hash,
-                "id": "|".join(str(file_id) for file_id in file_ids),
-                "priority": str(int(priority)),
-            },
-        )
-
-    def start_hashes(self, hashes):
-        if not hashes:
-            return
-        form = {"hashes": "|".join(hashes)}
-        try:
-            self.request("POST", "/api/v2/torrents/start", form)
-        except ApiError:
-            self.request("POST", "/api/v2/torrents/resume", form)
-
-    def recheck_hashes(self, hashes):
-        if not hashes:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/recheck",
-            {"hashes": "|".join(hashes)},
-        )
-
-    def stop_hashes(self, hashes):
-        if not hashes:
-            return
-        form = {"hashes": "|".join(hashes)}
-        try:
-            self.request("POST", "/api/v2/torrents/stop", form)
-        except ApiError:
-            self.request("POST", "/api/v2/torrents/pause", form)
-
-    def set_torrent_download_limit(self, hashes, limit_bytes_per_second):
-        if not hashes:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/setDownloadLimit",
-            {
-                "hashes": "|".join(hashes),
-                "limit": str(max(0, int(limit_bytes_per_second))),
-            },
-        )
-
-    def set_torrent_upload_limit(self, hashes, limit_bytes_per_second):
-        if not hashes:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/setUploadLimit",
-            {
-                "hashes": "|".join(hashes),
-                "limit": str(max(0, int(limit_bytes_per_second))),
-            },
-        )
-
-    def top_priority(self, hashes):
-        if not hashes:
-            return
-        self.request("POST", "/api/v2/torrents/topPrio", {"hashes": "|".join(hashes)})
-
-    def delete_hashes(self, hashes, delete_files):
-        if not hashes:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/delete",
-            {
-                "hashes": "|".join(hashes),
-                "deleteFiles": str(bool(delete_files)).lower(),
-            },
-        )
-
-    def reannounce_hashes(self, hashes):
-        if not hashes:
-            return
-        self.request("POST", "/api/v2/torrents/reannounce", {"hashes": "|".join(hashes)})
-
-    def add_tags(self, hashes, tags):
-        if not hashes or not tags:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/addTags",
-            {"hashes": "|".join(hashes), "tags": ",".join(tags)},
-        )
-
-    def remove_tags(self, hashes, tags):
-        if not hashes or not tags:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/removeTags",
-            {"hashes": "|".join(hashes), "tags": ",".join(tags)},
-        )
-
-    def create_tags(self, tags):
-        if not tags:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/createTags",
-            {"tags": ",".join(tags)},
-        )
-
-    def all_tags(self):
-        payload = self.request("GET", "/api/v2/torrents/tags")
-        return json.loads(payload.decode("utf-8"))
-
-    def delete_tags(self, tags):
-        if not tags:
-            return
-        self.request(
-            "POST",
-            "/api/v2/torrents/deleteTags",
-            {"tags": ",".join(tags)},
-        )
+    return usage_provider_registry.create(name)
 
 
 def qbt_urls():
@@ -4276,7 +3003,7 @@ def apply_safety_stop(clients, reason, decision_context=None):
     return stopped_clients > 0
 
 
-def apply_fail_closed(reason="UDM quota data is unavailable", decision_context=None):
+def apply_fail_closed(reason="network usage data is unavailable", decision_context=None):
     clients = reachable_qbt_clients()
     if not clients:
         log_error("No qBittorrent clients reachable while failing closed")
@@ -4731,9 +3458,9 @@ def quota_rate_state(
     day_end=None,
 ):
     if usage_bytes >= cap_bytes:
-        return {"stop_reason": "monthly UDM quota guardrail reached"}
+        return {"stop_reason": "monthly quota guardrail reached"}
     if day_usage_bytes >= daily_cap_bytes:
-        return {"stop_reason": "daily UDM quota guardrail reached"}
+        return {"stop_reason": "daily quota guardrail reached"}
 
     day_end = day_end or utc_day_end(now)
     day_seconds_remaining = max(1, int((day_end - now).total_seconds()))
@@ -5196,80 +3923,88 @@ def thermal_decision_summary(thermal_state):
     }
 
 
-def udm_decision_summary(
-    udm_client,
+def usage_provider_decision_summary(
+    provider,
     now,
     error=None,
     backup_state=None,
     backup_error=None,
 ):
-    latest_stats_at = getattr(udm_client, "latest_stats_at", None) if udm_client else None
-    age_seconds = None
-    if latest_stats_at:
-        age_seconds = max(0, int((now - latest_stats_at).total_seconds()))
+    if provider is None:
+        return {
+            "provider": "disabled",
+            "available": error is None,
+            "error": str(error) if error else "",
+            "latest_stats_at": None,
+            "stats_age_seconds": None,
+        }
+    return provider.decision_summary(
+        now,
+        error=error,
+        backup_state=backup_state,
+        backup_error=backup_error,
+    )
+
+
+def read_usage_snapshot(provider, now):
+    """Read and validate the provider-neutral snapshot contract."""
+
+    if not isinstance(provider, NetworkUsageProvider):
+        raise ApiError("invalid network usage provider implementation")
+    snapshot = provider.usage_snapshot(now)
+    if not isinstance(snapshot, UsageSnapshot):
+        raise ApiError(
+            f"{getattr(provider, 'provider_name', 'usage')} provider returned "
+            f"an invalid snapshot: {type(snapshot).__name__}"
+        )
+    return snapshot
+
+
+def read_backup_internet_state(provider):
+    if not isinstance(provider, BackupInternetProvider):
+        raise ApiError(
+            f"{getattr(provider, 'provider_name', 'network usage')} provider "
+            "does not support backup-internet state"
+        )
+    state = provider.backup_internet_state()
+    if not isinstance(state, dict):
+        raise ApiError("network usage provider returned invalid backup-internet state")
+    return state
+
+
+def usage_provider_context(summary):
+    return {"usage_provider": summary}
+
+
+def quota_budget_summary(
+    *,
+    usage_bytes,
+    day_usage_bytes,
+    cap_bytes,
+    daily_cap_bytes,
+    billing_cycle_day_value,
+    billing_cycle_start,
+    billing_cycle_end,
+    days_in_billing_cycle,
+    uncapped_window,
+    headroom=None,
+):
     summary = {
-        "available": error is None,
-        "error": str(error) if error else "",
-        "latest_stats_at": format_utc(latest_stats_at) if latest_stats_at else None,
-        "stats_age_seconds": age_seconds,
+        "monthly_usage_bytes": usage_bytes,
+        "monthly_guardrail_bytes": cap_bytes,
+        "monthly_remaining_bytes": max(0, cap_bytes - usage_bytes),
+        "day_usage_bytes": day_usage_bytes,
+        "daily_guardrail_bytes": daily_cap_bytes,
+        "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
+        "billing_cycle_day": billing_cycle_day_value,
+        "billing_cycle_start": format_utc(billing_cycle_start),
+        "billing_cycle_end": format_utc(billing_cycle_end),
+        "days_in_billing_cycle": days_in_billing_cycle,
+        "uncapped_download_window": uncapped_window,
+        "uncapped_download_window_active": uncapped_window["active"],
     }
-    if udm_client is not None:
-        summary["stats_timezone"] = getattr(
-            udm_client,
-            "stats_timezone_name",
-            "",
-        )
-        summary["stats_timezone_source"] = getattr(
-            udm_client,
-            "stats_timezone_source",
-            "",
-        )
-        summary["billing_cycle_day"] = getattr(
-            udm_client,
-            "billing_cycle_day",
-            1,
-        )
-        billing_cycle_start = getattr(
-            udm_client,
-            "billing_cycle_start",
-            None,
-        )
-        billing_cycle_end = getattr(
-            udm_client,
-            "billing_cycle_end",
-            None,
-        )
-        summary["billing_cycle_start"] = (
-            format_utc(billing_cycle_start) if billing_cycle_start else None
-        )
-        summary["billing_cycle_end"] = (
-            format_utc(billing_cycle_end) if billing_cycle_end else None
-        )
-        summary["billing_cycle_days"] = getattr(
-            udm_client,
-            "billing_cycle_days",
-            0,
-        )
-        summary["usage_scope"] = getattr(udm_client, "usage_scope", "all")
-        summary["usage_network_groups"] = getattr(
-            udm_client,
-            "usage_network_groups",
-            [],
-        )
-        usage_anomalies = getattr(udm_client, "usage_anomalies", None) or []
-        summary["usage_anomaly_count"] = len(usage_anomalies)
-        summary["usage_corrected_bytes"] = getattr(
-            udm_client,
-            "usage_corrected_bytes",
-            0,
-        )
-        if usage_anomalies:
-            summary["usage_anomalies"] = usage_anomalies
-    if backup_state is not None:
-        summary["backup_internet"] = dict(backup_state)
-        if backup_error:
-            summary["backup_internet"]["available"] = False
-            summary["backup_internet"]["error"] = str(backup_error)
+    if headroom is not None:
+        summary["rate_headroom_fraction"] = headroom
     return summary
 
 
@@ -5639,6 +4374,7 @@ def queue_record_movie_file_path(record):
 
 def queue_record_episode_order(record):
     season = None
+    episode_number = None
     episodes = []
 
     episode = record.get("episode")
@@ -6541,7 +5277,7 @@ def cleanup_qbt_client(client):
             log_info(f"- {torrent_name(torrent)}")
         client.delete_hashes([torrent_hash(torrent) for torrent in to_delete], delete_files)
     else:
-        log_debug(f"No missing-files torrents need cleanup")
+        log_debug("No missing-files torrents need cleanup")
 
     if to_start:
         log_debug(
@@ -10885,7 +9621,7 @@ def cleanup_stall_tags(client, health_store=None):
         and tag not in active_stall_tags
     )
     if not unused_stall_tags:
-        log_debug(f"No unused quota-stall tags need cleanup")
+        log_debug("No unused quota-stall tags need cleanup")
         return
 
     try:
@@ -11794,7 +10530,7 @@ def apply_single_download(
                 for torrent in selection_candidates:
                     health_store.record_attempt(torrent, now)
                 attempt += 1
-                stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
+                stop_queue_managed_torrents(client, torrents, protected_hashes)
                 for selected in selection_candidates:
                     selected_hash = torrent_hash(selected)
                     apply_tv_episode_file_priorities(
@@ -12081,7 +10817,7 @@ def apply_single_download(
                     if new_worker_torrents:
                         attempt += 1
 
-                    stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
+                    stop_queue_managed_torrents(client, torrents, protected_hashes)
                     for selected in selected_batch:
                         selected_hash = torrent_hash(selected)
                         apply_tv_episode_file_priorities(
@@ -12447,7 +11183,7 @@ def apply_single_download(
                 if keep_lease_reason:
                     candidate_counts["selection_lease_active"] = 1
                 protected_hashes = {keep_hash} | normal_parked_stalled_hashes
-                stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
+                stop_queue_managed_torrents(client, torrents, protected_hashes)
                 apply_tv_episode_file_priorities(
                     client,
                     keep,
@@ -12675,7 +11411,7 @@ def apply_single_download(
                 keep, keep_lease_reason = leased_worker_candidates[0]
                 keep_hash = torrent_hash(keep)
                 protected_hashes = {keep_hash} | normal_parked_stalled_hashes
-                stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
+                stop_queue_managed_torrents(client, torrents, protected_hashes)
                 apply_tv_episode_file_priorities(
                     client,
                     keep,
@@ -12960,7 +11696,7 @@ def apply_single_download(
             health_store.record_attempt(selected, now)
             attempt += 1
             protected_hashes = {selected_hash} | normal_parked_stalled_hashes
-            stop_hashes = stop_queue_managed_torrents(client, torrents, protected_hashes)
+            stop_queue_managed_torrents(client, torrents, protected_hashes)
             apply_tv_episode_file_priorities(
                 client,
                 selected,
@@ -13191,343 +11927,351 @@ def apply_single_download(
             )
 
 
-def run_once():
-    now = datetime.now(timezone.utc)
-    backup_internet_stop_enabled = env_bool(
-        "UDM_BACKUP_INTERNET_STOP_ENABLED",
-        False,
-    )
-    backup_internet_fail_closed = env_bool(
-        "UDM_BACKUP_INTERNET_FAIL_CLOSED",
-        True,
-    )
-    backup_internet_state = (
-        {
-            "enabled": True,
-            "available": False,
-            "backup_active": False,
-            "active_role": "unknown",
-        }
-        if backup_internet_stop_enabled
-        else None
-    )
-    backup_internet_error = None
-    monthly_quota = env_int("UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES", 2_500_000_000_000)
-    cap_fraction = env_float("UDM_MONTHLY_CAP_FRACTION", 1.0)
-    cap_bytes = env_int(
-        "UDM_MONTHLY_DOWNLOAD_GUARDRAIL_BYTES",
-        math.floor(monthly_quota * cap_fraction),
-    )
-    configured_billing_cycle_day = billing_cycle_day()
-    (
-        billing_cycle_start,
-        billing_cycle_end,
-        days_in_billing_cycle,
-    ) = local_billing_cycle_window(
-        now,
-        timezone.utc,
-        configured_billing_cycle_day,
-    )
-    local_day_end = utc_day_start(now) + timedelta(days=1)
-    daily_cap_bytes = max(
-        1,
-        math.floor(cap_bytes / days_in_billing_cycle),
-    )
-    headroom = env_float("QBT_RATE_HEADROOM_FRACTION", 0.95)
-    max_download_limit = env_int("QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC", 10_485_760)
-    fallback_download_limit = env_int(
-        "QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC",
-        max_download_limit,
-    )
-    quota_burst_enabled = env_bool("QBT_QUOTA_BURST_ENABLED", False)
-    quota_burst_download_limit = env_int(
-        "QBT_ISP_USABLE_BURST_DOWNLOAD_LIMIT_BYTES_PER_SEC",
-        max_download_limit,
-    )
-    quota_burst_min_monthly_remaining_fraction = env_float(
-        "QBT_QUOTA_BURST_MIN_MONTHLY_REMAINING_FRACTION",
-        0.10,
-    )
-    quota_burst_min_daily_remaining_fraction = env_float(
-        "QBT_QUOTA_BURST_MIN_DAILY_REMAINING_FRACTION",
-        0.20,
-    )
-    uncapped_window = uncapped_download_window_state(now)
+class SmartQueueController:
+    """Coordinates one queue-control cycle through injectable collaborators."""
 
-    rpi_cooling_state = apply_rpi_thermal_cooling()
-    storage_guard = DownloadStorageGuard()
-    udm_client = UdmClient()
-    if backup_internet_stop_enabled:
-        try:
-            backup_internet_state = udm_client.backup_internet_state()
-            log_debug(
-                "Resolved UniFi active WAN",
-                active_network=backup_internet_state.get("active_network"),
-                active_network_group=backup_internet_state.get("active_network_group"),
-                active_interface=backup_internet_state.get("active_interface"),
-                active_uplink=backup_internet_state.get("active_uplink"),
-                active_role=backup_internet_state.get("active_role"),
-                backup_active=backup_internet_state.get("backup_active"),
-            )
-        except ApiError as exc:
-            backup_internet_error = exc
-            log_warning(f"Failed to read UniFi backup internet state: {exc}")
+    def __init__(self, *, provider_factory=None, settings_factory=None, clock=None):
+        self.provider_factory = provider_factory or usage_provider_from_env
+        self.settings_factory = settings_factory or QuotaSettings.from_env
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
-        backup_decision_context = {
-            "udm": udm_decision_summary(
-                udm_client,
-                now,
-                backup_state=backup_internet_state,
-                backup_error=backup_internet_error,
-            ),
-            "rpi_cooling": rpi_cooling_state,
-        }
-        if backup_internet_error and backup_internet_fail_closed:
-            clients = reachable_qbt_clients()
-            if not clients:
-                log_error(
-                    "No qBittorrent clients reachable while UniFi backup internet "
-                    "state is unavailable"
-                )
-                return 0
-            apply_safety_stop(
-                clients,
-                "UniFi backup internet state is unavailable",
-                backup_decision_context,
-            )
-            cleanup_qbt_clients(clients)
-            return 1
-
-        if backup_internet_state.get("backup_active"):
-            clients = reachable_qbt_clients()
-            if not clients:
-                log_error(
-                    "No qBittorrent clients reachable while UniFi backup internet is active"
-                )
-                return 0
-            apply_backup_internet_stop(
-                clients,
-                backup_internet_state,
-                backup_decision_context,
-            )
-            cleanup_qbt_clients(clients)
-            return 0
-
-    try:
-        usage_bytes, day_usage_bytes = udm_client.download_usage_snapshot(now)
-    except ApiError as exc:
-        log_warning(f"Failed to read UDM month-to-date WAN usage: {exc}")
-        fail_closed_reason = ""
-        if env_bool("UDM_FAIL_CLOSED", False):
-            fail_closed_reason = "UDM quota data is unavailable"
-        if fail_closed_reason:
-            fail_closed_context = {
-                "udm": udm_decision_summary(
-                    udm_client,
-                    now,
-                    error=exc,
-                    backup_state=backup_internet_state,
-                    backup_error=backup_internet_error,
-                ),
-                "rpi_cooling": rpi_cooling_state,
+    def run_once(self):
+        now = self.clock()
+        settings = self.settings_factory()
+        backup_internet_stop_enabled = settings.backup_internet_stop_enabled
+        backup_internet_fail_closed = settings.backup_internet_fail_closed
+        backup_internet_state = (
+            {
+                "enabled": True,
+                "available": False,
+                "backup_active": False,
+                "active_role": "unknown",
             }
-            if not apply_fail_closed(fail_closed_reason, fail_closed_context):
-                return 0
-            return 1
-        clients = reachable_qbt_clients()
-        thermal_state = full_guard_thermal_state()
-        fallback_context = {
-            "budget": {
-                "monthly_usage_bytes": 0,
-                "monthly_guardrail_bytes": monthly_quota,
-                "monthly_remaining_bytes": monthly_quota,
-                "billing_cycle_day": configured_billing_cycle_day,
-                "billing_cycle_start": format_utc(billing_cycle_start),
-                "billing_cycle_end": format_utc(billing_cycle_end),
-                "days_in_billing_cycle": days_in_billing_cycle,
-                "quota_source": "fallback",
-                "uncapped_download_window": uncapped_window,
-                "uncapped_download_window_active": uncapped_window["active"],
-            },
-            "udm": udm_decision_summary(
-                None,
-                now,
-                error=exc,
-                backup_state=backup_internet_state,
-                backup_error=backup_internet_error,
-            ),
-            "thermal": thermal_decision_summary(thermal_state),
-            "rpi_cooling": rpi_cooling_state,
-        }
-        if apply_rpi_cooling_stop(clients, rpi_cooling_state, fallback_context):
-            return 0
-        if apply_full_guard_thermal_stop(clients, thermal_state, fallback_context):
-            return 0
-        fallback_active_limit = 0 if uncapped_window["active"] else fallback_download_limit
-        fallback_reason = (
-            "UDM quota data unavailable fallback; uncapped download window active"
-            if uncapped_window["active"]
-            else "UDM quota data unavailable fallback"
+            if backup_internet_stop_enabled
+            else None
         )
-        apply_single_download(
-            clients,
-            0,
-            monthly_quota,
-            fallback_active_limit,
-            fallback_reason,
-            storage_guard,
-            decision_context=fallback_context,
+        backup_internet_error = None
+        monthly_quota = settings.monthly_quota_bytes
+        cap_bytes = settings.monthly_guardrail_bytes
+        configured_billing_cycle_day = settings.billing_cycle_day
+        (
+            billing_cycle_start,
+            billing_cycle_end,
+            days_in_billing_cycle,
+        ) = local_billing_cycle_window(
+            now,
+            timezone.utc,
+            configured_billing_cycle_day,
         )
-        cleanup_qbt_clients(clients)
-        return 0
-
-    stats_timezone_info = getattr(udm_client, "stats_timezone_info", None)
-    if stats_timezone_info is not None:
-        billing_cycle_start = udm_client.billing_cycle_start
-        billing_cycle_end = udm_client.billing_cycle_end
-        days_in_billing_cycle = udm_client.billing_cycle_days
-        local_day_end = udm_client.local_day_end
+        local_day_end = utc_day_start(now) + timedelta(days=1)
         daily_cap_bytes = max(
             1,
             math.floor(cap_bytes / days_in_billing_cycle),
         )
+        headroom = settings.rate_headroom_fraction
+        max_download_limit = settings.max_download_limit
+        fallback_download_limit = settings.fallback_download_limit
+        quota_burst_enabled = settings.burst_enabled
+        quota_burst_download_limit = settings.burst_download_limit
+        quota_burst_min_monthly_remaining_fraction = (
+            settings.burst_min_monthly_remaining_fraction
+        )
+        quota_burst_min_daily_remaining_fraction = (
+            settings.burst_min_daily_remaining_fraction
+        )
+        uncapped_window = uncapped_download_window_state(now)
 
-    usage_percent = (usage_bytes / cap_bytes) * 100 if cap_bytes else 0
-    day_usage_percent = (day_usage_bytes / daily_cap_bytes) * 100 if daily_cap_bytes else 0
-    log_debug(
-        "UDM month-to-date WAN download usage: "
-        f"{human_size(usage_bytes)} of {human_size(cap_bytes)} monthly guardrail "
-        f"({usage_percent:.2f}%)"
-    )
-    log_debug(
-        "UDM day-to-date WAN download usage: "
-        f"{human_size(day_usage_bytes)} of {human_size(daily_cap_bytes)} daily guardrail "
-        f"({day_usage_percent:.2f}%; {human_size(cap_bytes)} / "
-        f"{days_in_billing_cycle} billing-cycle days)"
-    )
+        try:
+            usage_provider = self.provider_factory()
+        except (ApiError, TypeError, ValueError) as exc:
+            log_error(f"Could not configure network usage provider: {exc}")
+            return 1
+        rpi_cooling_state = apply_rpi_thermal_cooling()
+        storage_guard = DownloadStorageGuard()
+        provider_name = getattr(
+            usage_provider,
+            "provider_name",
+            configured_usage_provider_name() if usage_provider is not None else "disabled",
+        )
+        if backup_internet_stop_enabled:
+            try:
+                if usage_provider is None:
+                    raise ApiError("network usage provider is disabled")
+                backup_internet_state = read_backup_internet_state(usage_provider)
+                log_debug(
+                    "Resolved active WAN",
+                    usage_provider=provider_name,
+                    active_network=backup_internet_state.get("active_network"),
+                    active_network_group=backup_internet_state.get("active_network_group"),
+                    active_interface=backup_internet_state.get("active_interface"),
+                    active_uplink=backup_internet_state.get("active_uplink"),
+                    active_role=backup_internet_state.get("active_role"),
+                    backup_active=backup_internet_state.get("backup_active"),
+                )
+            except ApiError as exc:
+                backup_internet_error = exc
+                log_warning(
+                    f"Failed to read {provider_name} backup internet state: {exc}"
+                )
 
-    clients = reachable_qbt_clients()
-    if not clients:
-        emit_decision_log(
-            "qbt_guard_decision",
-            action="no_reachable_clients",
-            client_count=0,
-            budget={
-                "monthly_usage_bytes": usage_bytes,
-                "monthly_guardrail_bytes": cap_bytes,
-                "monthly_remaining_bytes": max(0, cap_bytes - usage_bytes),
-                "day_usage_bytes": day_usage_bytes,
-                "daily_guardrail_bytes": daily_cap_bytes,
-                "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
-                "billing_cycle_day": configured_billing_cycle_day,
-                "billing_cycle_start": format_utc(billing_cycle_start),
-                "billing_cycle_end": format_utc(billing_cycle_end),
-                "days_in_billing_cycle": days_in_billing_cycle,
-                "uncapped_download_window": uncapped_window,
-                "uncapped_download_window_active": uncapped_window["active"],
-            },
-            udm=udm_decision_summary(
-                udm_client,
+            provider_summary = usage_provider_decision_summary(
+                usage_provider,
                 now,
                 backup_state=backup_internet_state,
                 backup_error=backup_internet_error,
-            ),
-        )
-        log_info("No qBittorrent clients reachable; leaving quota state unchanged")
-        return 0
+            )
+            backup_decision_context = {
+                **usage_provider_context(provider_summary),
+                "rpi_cooling": rpi_cooling_state,
+            }
+            if backup_internet_error and backup_internet_fail_closed:
+                clients = reachable_qbt_clients()
+                if not clients:
+                    log_error(
+                        "No qBittorrent clients reachable while backup internet "
+                        "state is unavailable"
+                    )
+                    return 0
+                apply_safety_stop(
+                    clients,
+                    f"{provider_name} backup internet state is unavailable",
+                    backup_decision_context,
+                )
+                cleanup_qbt_clients(clients)
+                return 1
 
-    base_decision_context = {
-        "budget": {
-            "monthly_usage_bytes": usage_bytes,
-            "monthly_guardrail_bytes": cap_bytes,
-            "monthly_remaining_bytes": max(0, cap_bytes - usage_bytes),
-            "day_usage_bytes": day_usage_bytes,
-            "daily_guardrail_bytes": daily_cap_bytes,
-            "daily_remaining_bytes": max(0, daily_cap_bytes - day_usage_bytes),
-            "billing_cycle_day": configured_billing_cycle_day,
-            "billing_cycle_start": format_utc(billing_cycle_start),
-            "billing_cycle_end": format_utc(billing_cycle_end),
-            "days_in_billing_cycle": days_in_billing_cycle,
-            "rate_headroom_fraction": headroom,
-            "uncapped_download_window": uncapped_window,
-            "uncapped_download_window_active": uncapped_window["active"],
-        },
-        "udm": udm_decision_summary(
-            udm_client,
+            if backup_internet_state.get("backup_active"):
+                clients = reachable_qbt_clients()
+                if not clients:
+                    log_error(
+                        "No qBittorrent clients reachable while backup internet is active"
+                    )
+                    return 0
+                apply_backup_internet_stop(
+                    clients,
+                    backup_internet_state,
+                    backup_decision_context,
+                )
+                cleanup_qbt_clients(clients)
+                return 0
+
+        try:
+            if usage_provider is None:
+                raise ApiError("network usage provider is disabled")
+            usage_snapshot = read_usage_snapshot(usage_provider, now)
+        except ApiError as exc:
+            if usage_provider is None:
+                log_info("Network usage provider disabled; using fallback download limit")
+            else:
+                log_warning(
+                    f"Failed to read {provider_name} billing-cycle WAN usage: {exc}"
+                )
+            fail_closed_reason = (
+                f"{provider_name} quota data is unavailable"
+                if settings.usage_fail_closed
+                else ""
+            )
+            provider_summary = usage_provider_decision_summary(
+                usage_provider,
+                now,
+                error=exc,
+                backup_state=backup_internet_state,
+                backup_error=backup_internet_error,
+            )
+            if fail_closed_reason:
+                fail_closed_context = {
+                    **usage_provider_context(provider_summary),
+                    "rpi_cooling": rpi_cooling_state,
+                }
+                if not apply_fail_closed(fail_closed_reason, fail_closed_context):
+                    return 0
+                return 1
+            clients = reachable_qbt_clients()
+            thermal_state = full_guard_thermal_state()
+            fallback_budget = quota_budget_summary(
+                usage_bytes=0,
+                day_usage_bytes=0,
+                cap_bytes=monthly_quota,
+                daily_cap_bytes=daily_cap_bytes,
+                billing_cycle_day_value=configured_billing_cycle_day,
+                billing_cycle_start=billing_cycle_start,
+                billing_cycle_end=billing_cycle_end,
+                days_in_billing_cycle=days_in_billing_cycle,
+                uncapped_window=uncapped_window,
+            )
+            fallback_budget["quota_source"] = "fallback"
+            fallback_context = {
+                "budget": fallback_budget,
+                **usage_provider_context(provider_summary),
+                "thermal": thermal_decision_summary(thermal_state),
+                "rpi_cooling": rpi_cooling_state,
+            }
+            if apply_rpi_cooling_stop(clients, rpi_cooling_state, fallback_context):
+                return 0
+            if apply_full_guard_thermal_stop(clients, thermal_state, fallback_context):
+                return 0
+            fallback_active_limit = 0 if uncapped_window["active"] else fallback_download_limit
+            fallback_reason = (
+                "network usage data unavailable fallback; uncapped download window active"
+                if uncapped_window["active"]
+                else "network usage data unavailable fallback"
+            )
+            apply_single_download(
+                clients,
+                0,
+                monthly_quota,
+                fallback_active_limit,
+                fallback_reason,
+                storage_guard,
+                decision_context=fallback_context,
+            )
+            cleanup_qbt_clients(clients)
+            return 0
+
+        usage_bytes = usage_snapshot.cycle_usage_bytes
+        day_usage_bytes = usage_snapshot.day_usage_bytes
+        if usage_snapshot.billing_cycle_days > 0:
+            billing_cycle_start = usage_snapshot.billing_cycle_start or billing_cycle_start
+            billing_cycle_end = usage_snapshot.billing_cycle_end or billing_cycle_end
+            days_in_billing_cycle = usage_snapshot.billing_cycle_days
+            local_day_end = usage_snapshot.local_day_end or local_day_end
+            daily_cap_bytes = max(
+                1,
+                math.floor(cap_bytes / days_in_billing_cycle),
+            )
+
+        usage_percent = (usage_bytes / cap_bytes) * 100 if cap_bytes else 0
+        day_usage_percent = (day_usage_bytes / daily_cap_bytes) * 100 if daily_cap_bytes else 0
+        log_debug(
+            f"{provider_name} billing-cycle WAN usage: "
+            f"{human_size(usage_bytes)} of {human_size(cap_bytes)} monthly guardrail "
+            f"({usage_percent:.2f}%)"
+        )
+        log_debug(
+            f"{provider_name} day-to-date WAN usage: "
+            f"{human_size(day_usage_bytes)} of {human_size(daily_cap_bytes)} daily guardrail "
+            f"({day_usage_percent:.2f}%; {human_size(cap_bytes)} / "
+            f"{days_in_billing_cycle} billing-cycle days)"
+        )
+
+        clients = reachable_qbt_clients()
+        if not clients:
+            provider_summary = usage_provider_decision_summary(
+                usage_provider,
+                now,
+                backup_state=backup_internet_state,
+                backup_error=backup_internet_error,
+            )
+            emit_decision_log(
+                "qbt_guard_decision",
+                action="no_reachable_clients",
+                client_count=0,
+                budget=quota_budget_summary(
+                    usage_bytes=usage_bytes,
+                    day_usage_bytes=day_usage_bytes,
+                    cap_bytes=cap_bytes,
+                    daily_cap_bytes=daily_cap_bytes,
+                    billing_cycle_day_value=configured_billing_cycle_day,
+                    billing_cycle_start=billing_cycle_start,
+                    billing_cycle_end=billing_cycle_end,
+                    days_in_billing_cycle=days_in_billing_cycle,
+                    uncapped_window=uncapped_window,
+                ),
+                **usage_provider_context(provider_summary),
+            )
+            log_info("No qBittorrent clients reachable; leaving quota state unchanged")
+            return 0
+
+        provider_summary = usage_provider_decision_summary(
+            usage_provider,
             now,
             backup_state=backup_internet_state,
             backup_error=backup_internet_error,
-        ),
-        "rpi_cooling": rpi_cooling_state,
-    }
+        )
+        base_decision_context = {
+            "budget": quota_budget_summary(
+                usage_bytes=usage_bytes,
+                day_usage_bytes=day_usage_bytes,
+                cap_bytes=cap_bytes,
+                daily_cap_bytes=daily_cap_bytes,
+                billing_cycle_day_value=configured_billing_cycle_day,
+                billing_cycle_start=billing_cycle_start,
+                billing_cycle_end=billing_cycle_end,
+                days_in_billing_cycle=days_in_billing_cycle,
+                uncapped_window=uncapped_window,
+                headroom=headroom,
+            ),
+            **usage_provider_context(provider_summary),
+            "rpi_cooling": rpi_cooling_state,
+        }
 
-    thermal_state = full_guard_thermal_state()
-    base_decision_context["thermal"] = thermal_decision_summary(thermal_state)
+        thermal_state = full_guard_thermal_state()
+        base_decision_context["thermal"] = thermal_decision_summary(thermal_state)
 
-    if apply_rpi_cooling_stop(clients, rpi_cooling_state, base_decision_context):
-        return 0
+        if apply_rpi_cooling_stop(clients, rpi_cooling_state, base_decision_context):
+            return 0
 
-    if apply_full_guard_thermal_stop(clients, thermal_state, base_decision_context):
-        return 0
+        if apply_full_guard_thermal_stop(clients, thermal_state, base_decision_context):
+            return 0
 
-    quota_state = quota_rate_state(
-        now,
-        usage_bytes,
-        day_usage_bytes,
-        cap_bytes,
-        daily_cap_bytes,
-        headroom,
-        max_download_limit,
-        quota_burst_enabled,
-        quota_burst_download_limit,
-        quota_burst_min_monthly_remaining_fraction,
-        quota_burst_min_daily_remaining_fraction,
-        uncapped_window["active"],
-        billing_cycle_end,
-        local_day_end,
-    )
-    base_decision_context["budget"].update({
-        "monthly_limit_bytes_per_sec": quota_state.get("monthly_limit"),
-        "daily_limit_bytes_per_sec": quota_state.get("daily_limit"),
-        "smart_download_limit_bytes_per_sec": quota_state.get("smart_download_limit"),
-        "max_download_limit_bytes_per_sec": max_download_limit,
-        "isp_usable_download_limit_bytes_per_sec": max_download_limit,
-        "quota_burst_active": quota_state.get("burst_active", False),
-        "quota_burst_limit_bytes_per_sec": quota_state.get("burst_limit", 0),
-        "isp_usable_burst_download_limit_bytes_per_sec": quota_state.get("burst_limit", 0),
-        "configured_isp_usable_burst_download_limit_bytes_per_sec": quota_burst_download_limit,
-        "quota_burst_min_monthly_remaining_fraction": quota_burst_min_monthly_remaining_fraction,
-        "quota_burst_min_daily_remaining_fraction": quota_burst_min_daily_remaining_fraction,
-        "uncapped_download_window_active": quota_state.get("uncapped_downloads_active", False),
-    })
-    if quota_state["stop_reason"]:
-        apply_stop_limits(
+        quota_state = quota_rate_state(
+            now,
+            usage_bytes,
+            day_usage_bytes,
+            cap_bytes,
+            daily_cap_bytes,
+            headroom,
+            max_download_limit,
+            quota_burst_enabled,
+            quota_burst_download_limit,
+            quota_burst_min_monthly_remaining_fraction,
+            quota_burst_min_daily_remaining_fraction,
+            uncapped_window["active"],
+            billing_cycle_end,
+            local_day_end,
+        )
+        base_decision_context["budget"].update({
+            "monthly_limit_bytes_per_sec": quota_state.get("monthly_limit"),
+            "daily_limit_bytes_per_sec": quota_state.get("daily_limit"),
+            "smart_download_limit_bytes_per_sec": quota_state.get("smart_download_limit"),
+            "max_download_limit_bytes_per_sec": max_download_limit,
+            "isp_usable_download_limit_bytes_per_sec": max_download_limit,
+            "quota_burst_active": quota_state.get("burst_active", False),
+            "quota_burst_limit_bytes_per_sec": quota_state.get("burst_limit", 0),
+            "isp_usable_burst_download_limit_bytes_per_sec": quota_state.get("burst_limit", 0),
+            "configured_isp_usable_burst_download_limit_bytes_per_sec": quota_burst_download_limit,
+            "quota_burst_min_monthly_remaining_fraction": quota_burst_min_monthly_remaining_fraction,
+            "quota_burst_min_daily_remaining_fraction": quota_burst_min_daily_remaining_fraction,
+            "uncapped_download_window_active": quota_state.get("uncapped_downloads_active", False),
+        })
+        if quota_state["stop_reason"]:
+            apply_stop_limits(
+                clients,
+                quota_state["stop_reason"],
+                pause_torrents=True,
+                decision_context=base_decision_context,
+            )
+            cleanup_qbt_clients(clients)
+            return 0
+
+        smart_download_limit = quota_state["smart_download_limit"]
+
+        apply_single_download(
             clients,
-            quota_state["stop_reason"],
-            pause_torrents=True,
+            usage_bytes,
+            cap_bytes,
+            smart_download_limit,
+            (
+                "monthly and daily quota guard; uncapped download window active"
+                if uncapped_window["active"]
+                else "monthly and daily quota guard"
+            ),
+            storage_guard,
             decision_context=base_decision_context,
         )
         cleanup_qbt_clients(clients)
+
         return 0
-
-    smart_download_limit = quota_state["smart_download_limit"]
-
-    apply_single_download(
-        clients,
-        usage_bytes,
-        cap_bytes,
-        smart_download_limit,
-        (
-            "monthly and daily quota guard; uncapped download window active"
-            if uncapped_window["active"]
-            else "monthly and daily quota guard"
-        ),
-        storage_guard,
-        decision_context=base_decision_context,
-    )
-    cleanup_qbt_clients(clients)
-
-    return 0
 
 
 def install_loop_signal_handlers(stop_event):
@@ -13548,70 +12292,86 @@ def loop_sleep_seconds(result, elapsed_seconds, poll_seconds, error_poll_seconds
     return float(target)
 
 
-def run_loop():
-    poll_seconds = max(1, env_int("QBT_GUARD_POLL_SECONDS", 60))
-    error_poll_seconds = max(1, env_int("QBT_GUARD_ERROR_POLL_SECONDS", poll_seconds))
-    stop_event = threading.Event()
-    install_loop_signal_handlers(stop_event)
-    log_info(
-        "Starting continuous qBittorrent guard loop: "
-        f"poll={poll_seconds}s, error_poll={error_poll_seconds}s"
-    )
-    log_info("Configured qBittorrent service endpoint(s)", qbt_urls=qbt_urls())
-    try:
-        start_status_http_server()
-    except OSError as exc:
-        log_warning(f"Failed to start qBittorrent smart queues status endpoint: {exc}")
+class SmartQueueApplication:
+    """Owns process lifecycle while delegating policy to a controller."""
 
-    while not stop_event.is_set():
-        started = time.monotonic()
-        result = 0
+    def __init__(self, *, controller=None, event_factory=None, monotonic=None):
+        self.controller = controller or SmartQueueController()
+        self.event_factory = event_factory or threading.Event
+        self.monotonic = monotonic or time.monotonic
+
+    def run_loop(self):
+        poll_seconds = max(1, env_int("QBT_GUARD_POLL_SECONDS", 60))
+        error_poll_seconds = max(
+            1,
+            env_int("QBT_GUARD_ERROR_POLL_SECONDS", poll_seconds),
+        )
+        stop_event = self.event_factory()
+        install_loop_signal_handlers(stop_event)
+        log_info(
+            "Starting continuous qBittorrent guard loop: "
+            f"poll={poll_seconds}s, error_poll={error_poll_seconds}s"
+        )
+        log_info("Configured qBittorrent service endpoint(s)", qbt_urls=qbt_urls())
         try:
-            result = int(run_once() or 0)
-        except Exception as exc:
-            result = 1
-            log_error(f"Unhandled qBittorrent guard loop error: {exc}")
+            start_status_http_server()
+        except OSError as exc:
+            log_warning(
+                f"Failed to start qBittorrent smart queues status endpoint: {exc}"
+            )
 
-        if result and env_bool("QBT_GUARD_LOOP_EXIT_ON_ERROR", False):
-            stop_status_http_server()
-            return result
-        if stop_event.is_set():
-            break
+        while not stop_event.is_set():
+            started = self.monotonic()
+            result = 0
+            try:
+                result = int(self.controller.run_once() or 0)
+            except Exception as exc:
+                result = 1
+                log_error(f"Unhandled qBittorrent guard loop error: {exc}")
 
-        elapsed_seconds = time.monotonic() - started
-        sleep_seconds = loop_sleep_seconds(
-            result,
-            elapsed_seconds,
-            poll_seconds,
-            error_poll_seconds,
-        )
-        emit_decision_log(
-            "qbt_guard_loop",
-            action="sleep",
-            result=result,
-            elapsed_seconds=round(elapsed_seconds, 3),
-            sleep_seconds=round(sleep_seconds, 3),
-        )
-        if sleep_seconds > 0 and stop_event.wait(sleep_seconds):
-            break
+            if result and env_bool("QBT_GUARD_LOOP_EXIT_ON_ERROR", False):
+                stop_status_http_server()
+                return result
+            if stop_event.is_set():
+                break
 
-    result = 0
-    if env_bool("QBT_STOP_DOWNLOADS_ON_SHUTDOWN", False):
-        result = stop_all_downloads_for_shutdown()
+            elapsed_seconds = self.monotonic() - started
+            sleep_seconds = loop_sleep_seconds(
+                result,
+                elapsed_seconds,
+                poll_seconds,
+                error_poll_seconds,
+            )
+            emit_decision_log(
+                "qbt_guard_loop",
+                action="sleep",
+                result=result,
+                elapsed_seconds=round(elapsed_seconds, 3),
+                sleep_seconds=round(sleep_seconds, 3),
+            )
+            if sleep_seconds > 0 and stop_event.wait(sleep_seconds):
+                break
 
-    log_info("Continuous qBittorrent guard loop stopped")
-    stop_status_http_server()
-    return result
+        result = 0
+        if env_bool("QBT_STOP_DOWNLOADS_ON_SHUTDOWN", False):
+            result = stop_all_downloads_for_shutdown()
+
+        log_info("Continuous qBittorrent guard loop stopped")
+        stop_status_http_server()
+        return result
+
+    def run(self, argv=None):
+        args = list(argv or [])
+        if args == ["--stop-all-downloads"]:
+            return stop_all_downloads_for_shutdown("smart queues lifecycle hook")
+        if args:
+            log_error(f"Unknown argument(s): {' '.join(args)}")
+            return 2
+        return self.run_loop()
 
 
 def main(argv=None):
-    args = list(argv or [])
-    if args == ["--stop-all-downloads"]:
-        return stop_all_downloads_for_shutdown("smart queues lifecycle hook")
-    if args:
-        log_error(f"Unknown argument(s): {' '.join(args)}")
-        return 2
-    return run_loop()
+    return SmartQueueApplication().run(argv)
 
 
 if __name__ == "__main__":

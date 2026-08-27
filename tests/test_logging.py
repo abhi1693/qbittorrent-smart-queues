@@ -243,7 +243,7 @@ class LoggingTests(unittest.TestCase):
         with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
             self.guard.apply_qbt_limits(
                 [client],
-                "daily UDM quota guardrail reached",
+                "daily quota guardrail reached",
                 True,
                 1,
                 1,
@@ -258,7 +258,7 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual("INFO", record["level"])
         self.assertEqual("qbt_guard_decision", record["event"])
         self.assertEqual("pause_all", record["action"])
-        self.assertEqual("daily UDM quota guardrail reached", record["reason"])
+        self.assertEqual("daily quota guardrail reached", record["reason"])
         self.assertTrue(record["skipped_no_active_downloads"])
         self.assertEqual(0, record["active_download_count"])
         self.assertEqual(1, record["torrent_count"])

@@ -72,13 +72,88 @@ Required for normal operation:
 | `QBT_URLS` | Comma-separated or newline-separated qBittorrent Web API base URLs. |
 | `QBT_USER`, `QBT_PASSWORD` | qBittorrent credentials. `QBT_USERNAME` is also accepted. |
 
-Quota control from UniFi Network / UDM is optional. When quota data is
-unavailable and `UDM_FAIL_CLOSED=false`, the controller uses
+Quota control from UniFi Network is optional. When quota data is
+unavailable and `QBT_USAGE_FAIL_CLOSED=false`, the controller uses
 `QBT_FALLBACK_AGGREGATE_DOWNLOAD_LIMIT_BYTES_PER_SEC`.
 
+`QBT_USAGE_PROVIDER` selects the network API adapter. It defaults to `unifi`;
+set it to `none` to run only with the fallback download limit. Providers return
+the same typed billing-cycle/day snapshot, so another router brand can be added
+by implementing the provider contract and registering its factory without
+changing queue policy.
+
+### Architecture and provider extension
+
+The runtime has three explicit class boundaries:
+
+- `SmartQueueApplication` owns process lifecycle, polling, and shutdown.
+- `SmartQueueController` coordinates one policy cycle using injected factories.
+- `NetworkUsageProvider` is the abstract base for vendor adapters;
+  `BackupInternetProvider` is an optional second capability.
+
+The built-in `UnifiProvider` lives entirely in `providers/unifi.py`. A new
+first-party brand belongs in its own module and is wired only into
+`register_builtin_usage_providers`; queue policy does not import concrete
+providers. The minimum implementation is:
+
+```python
+from qbittorrent_smart_queues.providers import (
+    NetworkUsageProvider,
+    UsageSnapshot,
+    register_usage_provider,
+)
+
+
+class ExampleProvider(NetworkUsageProvider):
+    provider_name = "example"
+
+    def usage_snapshot(self, now):
+        return UsageSnapshot(
+            cycle_usage_bytes=read_cycle_usage(),
+            day_usage_bytes=read_day_usage(),
+        )
+
+
+register_usage_provider(ExampleProvider.provider_name, ExampleProvider)
+```
+
+Subclass `BackupInternetProvider` as well only when the brand can resolve the
+active WAN role. Provider factories are validated at creation time, including
+their inheritance and canonical provider identity.
+
+### Migrating to 0.2
+
+Version 0.2 is an intentional clean break. Update deployment configuration
+before changing the image; the removed `UDM_*` names are not read at runtime.
+
+| 0.1 variable | 0.2 variable |
+| --- | --- |
+| `UDM_URL` | `UNIFI_URL` |
+| `UDM_API_KEY` | `UNIFI_API_KEY` |
+| `UDM_USER`, `UDM_PASSWORD` | `UNIFI_USER`, `UNIFI_PASSWORD` |
+| `UDM_SITE` | `UNIFI_SITE` |
+| `UDM_API_BASE_PATH` | `UNIFI_API_BASE_PATH` |
+| `UDM_VERIFY_TLS` | `UNIFI_VERIFY_TLS` |
+| `UDM_BILLING_CYCLE_DAY` | `QBT_BILLING_CYCLE_DAY` |
+| `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `QBT_MONTHLY_QUOTA_BYTES` |
+| `UDM_MONTHLY_DOWNLOAD_GUARDRAIL_BYTES` | `QBT_MONTHLY_GUARDRAIL_BYTES` |
+| `UDM_MONTHLY_CAP_FRACTION` | `QBT_MONTHLY_CAP_FRACTION` |
+| `UDM_STATS_INTERVAL` | `UNIFI_STATS_INTERVAL` |
+| `UDM_HISTORY_STATS_INTERVAL` | `UNIFI_HISTORY_STATS_INTERVAL` |
+| `UDM_CURRENT_STATS_INTERVAL` | `UNIFI_CURRENT_STATS_INTERVAL` |
+| `UDM_DOWNLOAD_ATTRS` | `UNIFI_USAGE_ATTRS` |
+| `UDM_INCLUDE_UPLOAD` | `QBT_USAGE_INCLUDE_UPLOAD` |
+| `UDM_FAIL_CLOSED` | `QBT_USAGE_FAIL_CLOSED` |
+| `UDM_BACKUP_INTERNET_STOP_ENABLED` | `QBT_BACKUP_INTERNET_STOP_ENABLED` |
+| `UDM_BACKUP_INTERNET_FAIL_CLOSED` | `QBT_BACKUP_INTERNET_FAIL_CLOSED` |
+
+Set `QBT_USAGE_PROVIDER=unifi` explicitly when quota enforcement is expected.
+The status field is now `usage_provider`, and provider metrics use the
+`qbt_guard_usage_*` prefix.
+
 Billing-cycle and day boundaries follow UniFi's reporting timezone, discovered
-from `stat/sysinfo` unless `UDM_STATS_TIMEZONE` overrides it.
-`UDM_BILLING_CYCLE_DAY` selects the local calendar day when each monthly quota
+from `stat/sysinfo` unless `UNIFI_STATS_TIMEZONE` overrides it.
+`QBT_BILLING_CYCLE_DAY` selects the local calendar day when each monthly quota
 cycle starts; for example, `17` covers the 17th through the 16th inclusive. In
 the default `split-daily-hourly` mode, completed local days use UniFi daily
 reports and the open local day uses hourly reports, with explicit timestamp
@@ -94,10 +169,9 @@ hourly report once and merges the new field correction into the existing state.
 If the hourly data is unavailable or inconclusive, it keeps the raw daily value
 so quota enforcement remains conservative.
 
-Set `UDM_INCLUDE_UPLOAD=true` to make the monthly and daily guardrails count
-download plus upload usage. The legacy quota variable names retain
-`DOWNLOAD` for compatibility, but their byte budgets apply to the combined
-total when upload counting is enabled.
+Set `QBT_USAGE_INCLUDE_UPLOAD=true` to make the monthly and daily guardrails count
+download plus upload usage. Quota byte budgets apply to the combined total when
+upload counting is enabled.
 
 The optional backup-internet guard stops every torrent before queue selection
 when UniFi has failed over to a backup WAN. It reads configured WAN roles from
@@ -126,20 +200,25 @@ after router/VPN/protocol overhead.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `UDM_URL` | unset | UniFi Network / UDM base URL, for example `https://unifi.example`. |
-| `UDM_API_KEY` | unset | API key authentication. |
-| `UDM_USER`, `UDM_PASSWORD` | unset | Login authentication fallback. |
-| `UDM_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
-| `UDM_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
-| `UDM_BILLING_CYCLE_DAY` | `1` | Local calendar day from `1` to `31` when the monthly quota cycle starts. Days beyond a shorter month's end are clamped to that month's final day. |
-| `UDM_INCLUDE_UPLOAD` | `false` | Include WAN upload bytes in the monthly and daily quota guardrails. |
-| `UDM_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
-| `UDM_STATS_TIMEZONE` | unset | Optional IANA timezone override for UniFi usage periods. When unset, the controller discovers the timezone from UniFi `stat/sysinfo`. |
-| `UDM_STATS_RATE_LIMIT_MULTIPLIER` | `1.25` | Safety allowance above UniFi's WAN provider capability before an hourly field is classified as an impossible counter discontinuity. |
-| `UDM_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC` | `0` | Optional per-WAN-field byte/s ceiling when UniFi has no provider capability. `0` leaves fields without a discovered capability unbounded. |
-| `UDM_USAGE_CORRECTION_STATE_PATH` | `/state/udm-usage-corrections.json` | Persistent per-local-day corrections for impossible UniFi report buckets. |
-| `UDM_BACKUP_INTERNET_STOP_ENABLED` | `false` | Stop all torrents while UniFi reports a configured failover-only WAN as the gateway's active uplink. |
-| `UDM_BACKUP_INTERNET_FAIL_CLOSED` | `true` | Stop all torrents when the backup-internet guard is enabled but its UniFi role or active-uplink state cannot be read or mapped safely. |
+| `QBT_USAGE_PROVIDER` | `unifi` | Network usage adapter. Supported values are `unifi` and `none`. |
+| `UNIFI_URL` | unset | UniFi Network base URL, for example `https://unifi.example`. |
+| `UNIFI_API_KEY` | unset | API key authentication. |
+| `UNIFI_USER`, `UNIFI_PASSWORD` | unset | Login authentication fallback. |
+| `UNIFI_SITE` | `default` | UniFi Network site name. |
+| `UNIFI_API_BASE_PATH` | `/proxy/network` | UniFi Network API path behind the console. |
+| `UNIFI_VERIFY_TLS` | `true` | Verify the UniFi controller TLS certificate. Disable only for a controller with a deliberately trusted self-signed endpoint. |
+| `UNIFI_USAGE_ATTRS` | `wan-rx_bytes,wan2-rx_bytes` | UniFi report fields used when backup-internet role filtering is disabled. |
+| `QBT_MONTHLY_QUOTA_BYTES` | `2500000000000` | Monthly WAN download budget. |
+| `QBT_MONTHLY_CAP_FRACTION` | `1.0` | Fraction of the monthly budget to expose to the guardrail. |
+| `QBT_BILLING_CYCLE_DAY` | `1` | Local calendar day from `1` to `31` when the monthly quota cycle starts. Days beyond a shorter month's end are clamped to that month's final day. |
+| `QBT_USAGE_INCLUDE_UPLOAD` | `false` | Include WAN upload bytes in the monthly and daily quota guardrails. |
+| `QBT_USAGE_FAIL_CLOSED` | `false` | Pause downloads if quota data cannot be read. |
+| `UNIFI_STATS_TIMEZONE` | unset | Optional IANA timezone override for UniFi usage periods. When unset, the controller discovers the timezone from UniFi `stat/sysinfo`. |
+| `UNIFI_STATS_RATE_LIMIT_MULTIPLIER` | `1.25` | Safety allowance above UniFi's WAN provider capability before an hourly field is classified as an impossible counter discontinuity. |
+| `UNIFI_STATS_MAX_DOWNLOAD_RATE_BYTES_PER_SEC` | `0` | Optional per-WAN-field byte/s ceiling when UniFi has no provider capability. `0` leaves fields without a discovered capability unbounded. |
+| `UNIFI_USAGE_CORRECTION_STATE_PATH` | `/state/unifi-usage-corrections.json` | Persistent per-local-day corrections for impossible UniFi report buckets. |
+| `QBT_BACKUP_INTERNET_STOP_ENABLED` | `false` | Stop all torrents while UniFi reports a configured failover-only WAN as the gateway's active uplink. |
+| `QBT_BACKUP_INTERNET_FAIL_CLOSED` | `true` | Stop all torrents when the backup-internet guard is enabled but its UniFi role or active-uplink state cannot be read or mapped safely. |
 | `QBT_ISP_USABLE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `10485760` | Hard ISP usable download cap in bytes/s. This caps smoothed quota rates, burst mode, and single-download mode. Example: `10485760` = `10 MiB/s`. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_ENABLED` | `false` | Set qBittorrent's download limit to `0` during the configured local-time window, which qBittorrent treats as unlimited. Monthly/daily quota stop guardrails, thermal checks, storage checks, and queue selection still apply. |
 | `QBT_UNCAPPED_DOWNLOAD_WINDOW_TIMEZONE` | `Asia/Kolkata` | IANA timezone used for the uncapped window. |
