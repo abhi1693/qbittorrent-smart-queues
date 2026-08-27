@@ -488,6 +488,10 @@ Optional Raspberry Pi thermal coordinator:
 | --- | --- | --- |
 | `QBT_RPI_COOLING_ENABLED` | `false` | Enable Raspberry Pi thermal mitigation. |
 | `QBT_RPI_COOLING_NODES` | `k8s-rpi1,k8s-rpi2,k8s-rpi3` | Nodes monitored for thermal mitigation. |
+| `QBT_RPI_COOLING_K8S_TIMEOUT` | `5` | Timeout in seconds for each Kubernetes API request. |
+| `QBT_RPI_COOLING_K8S_RETRIES` | `2` | Retries after transient Kubernetes transport or retryable HTTP failures. |
+| `QBT_RPI_COOLING_K8S_RETRY_DELAY_SECONDS` | `0.5` | Delay between Kubernetes API retries. |
+| `QBT_RPI_COOLING_TEMPERATURE_SAMPLE_GRACE_SECONDS` | `180` | Grace period for Prometheus to resume temperature samples after a node becomes Ready. |
 | `QBT_RPI_COOLING_CPU_THROTTLE_CELSIUS` | `70` | CPU threshold that applies qBittorrent throttle limits. |
 | `QBT_RPI_COOLING_NVME_THROTTLE_CELSIUS` | `65` | NVMe threshold that applies qBittorrent throttle limits. |
 | `QBT_RPI_COOLING_CPU_PAUSE_CELSIUS` | `74` | CPU threshold that pauses qBittorrent torrents. |
@@ -514,7 +518,10 @@ requires every configured node to be Kubernetes `Ready`, and starts with
 service-preserving mitigations: qBittorrent throttle, qBittorrent pause, and
 optional CronJob suspension. A persisted state file keeps the same mitigation
 active until all temperatures remain below the resume thresholds for the hold
-window. Clean shutdown is disabled by default and is intended as last-resort
+window. Transient Kubernetes API failures are retried, and a node that has just
+become Ready receives a bounded grace period for its Prometheus temperature
+samples to reappear. Missing samples outside that recovery window still fail
+closed. Clean shutdown is disabled by default and is intended as last-resort
 protection; if enabled and power URLs are configured, the lock advances from
 shutdown to cooling to booting and the controller powers the node back on after
 the cooldown window. The coordinator does not cordon or drain nodes before

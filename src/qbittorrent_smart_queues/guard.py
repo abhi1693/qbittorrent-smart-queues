@@ -1637,6 +1637,8 @@ class NvmeThermalGuard:
 
 
 class KubernetesNodeClient:
+    TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
+
     def __init__(self):
         api_host = os.environ.get("KUBERNETES_SERVICE_HOST", "").strip()
         api_port = os.environ.get("KUBERNETES_SERVICE_PORT", "443").strip() or "443"
@@ -1644,7 +1646,13 @@ class KubernetesNodeClient:
         self.token_path = os.environ.get("KUBERNETES_TOKEN_PATH", KUBERNETES_TOKEN_PATH)
         self.ca_path = os.environ.get("KUBERNETES_CA_PATH", KUBERNETES_CA_PATH)
         self.timeout = env_int("QBT_RPI_COOLING_K8S_TIMEOUT", 5)
+        self.retries = max(0, min(10, env_int("QBT_RPI_COOLING_K8S_RETRIES", 2)))
+        self.retry_delay_seconds = max(
+            0.0,
+            min(30.0, env_float("QBT_RPI_COOLING_K8S_RETRY_DELAY_SECONDS", 0.5)),
+        )
         self.opener = urllib.request.build_opener()
+        self.ready_transition_times = {}
 
     def read_token(self):
         with open(self.token_path, "r", encoding="utf-8") as token_file:
@@ -1669,27 +1677,58 @@ class KubernetesNodeClient:
         request.add_header("Authorization", f"Bearer {self.read_token()}")
         request.add_header("Accept", "application/json")
         context = ssl.create_default_context(cafile=self.ca_path)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout, context=context) as response:
-                payload = response.read()
-                if not payload:
-                    return {}
-                return json.loads(payload.decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise ApiError(f"{description} failed with HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise ApiError(f"{description} failed: {exc}") from exc
+        attempt_limit = self.retries + 1
+        for attempt in range(1, attempt_limit + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout, context=context) as response:
+                    payload = response.read()
+                    if not payload:
+                        return {}
+                    return json.loads(payload.decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code not in self.TRANSIENT_HTTP_STATUS_CODES or attempt >= attempt_limit:
+                    raise ApiError(f"{description} failed with HTTP {exc.code}: {detail}") from exc
+                self.wait_before_retry(description, attempt, attempt_limit, f"HTTP {exc.code}")
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                if attempt >= attempt_limit:
+                    raise ApiError(f"{description} failed after {attempt_limit} attempt(s): {exc}") from exc
+                self.wait_before_retry(description, attempt, attempt_limit, str(exc))
+
+        raise ApiError(f"{description} failed after {attempt_limit} attempt(s)")
+
+    def wait_before_retry(self, description, attempt, attempt_limit, reason):
+        log_warning(
+            "Retrying transient Kubernetes API failure",
+            description=description,
+            attempt=attempt,
+            attempt_limit=attempt_limit,
+            reason=reason,
+        )
+        if self.retry_delay_seconds > 0:
+            time.sleep(self.retry_delay_seconds)
 
     def node_ready(self, node_name):
         node = self.fetch_node(node_name)
         for condition in node.get("status", {}).get("conditions", []):
             if condition.get("type") == "Ready":
-                return condition.get("status") == "True"
+                ready = condition.get("status") == "True"
+                self.ready_transition_times[node_name] = (
+                    parse_utc(condition.get("lastTransitionTime")) if ready else None
+                )
+                return ready
+        self.ready_transition_times[node_name] = None
         return False
 
     def ready_map(self, node_names):
         return {node_name: self.node_ready(node_name) for node_name in node_names}
+
+    def became_ready_within(self, node_name, now, grace_seconds):
+        transitioned_at = self.ready_transition_times.get(node_name)
+        if transitioned_at is None or grace_seconds <= 0:
+            return False
+        elapsed = (now - transitioned_at).total_seconds()
+        return 0 <= elapsed <= grace_seconds
 
     def list_pods(self, namespace, label_selector=""):
         quoted_namespace = urllib.parse.quote(namespace, safe="")
@@ -2192,6 +2231,10 @@ class RpiThermalCoolingManager:
         self.cooldown_seconds = env_int("QBT_RPI_COOLING_COOLDOWN_SECONDS", 1200)
         self.require_all_ready = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_NODES_READY", True)
         self.require_all_temperatures = env_bool("QBT_RPI_COOLING_REQUIRE_ALL_TEMPERATURES", True)
+        self.temperature_sample_grace_seconds = max(
+            0,
+            env_int("QBT_RPI_COOLING_TEMPERATURE_SAMPLE_GRACE_SECONDS", 180),
+        )
         self.shutdown_urls = split_key_value_lines(os.environ.get("QBT_RPI_COOLING_SHUTDOWN_URLS"))
         self.shutdown_url_template = os.environ.get(
             "QBT_RPI_COOLING_SHUTDOWN_URL_TEMPLATE",
@@ -2267,7 +2310,7 @@ class RpiThermalCoolingManager:
             raise ApiError(f"Prometheus returned no RPi {label} temperature samples")
         return readings
 
-    def temperature_snapshot(self):
+    def temperature_snapshot(self, ready=None, now=None):
         cpu = self.prometheus_temperature_readings(self.cpu_query, "CPU")
         nvme = self.prometheus_temperature_readings(self.nvme_query, "NVMe")
         if self.require_all_temperatures:
@@ -2276,8 +2319,28 @@ class RpiThermalCoolingManager:
                 for node_name in self.nodes
                 if node_name not in cpu or node_name not in nvme
             ]
-            if missing:
-                raise ApiError(f"missing RPi temperature samples for {', '.join(missing)}")
+            now = now or datetime.now(timezone.utc)
+            recently_ready = [
+                node_name
+                for node_name in missing
+                if (ready or {}).get(node_name) is True
+                and self.kubernetes.became_ready_within(
+                    node_name,
+                    now,
+                    self.temperature_sample_grace_seconds,
+                )
+            ]
+            required_missing = [node_name for node_name in missing if node_name not in recently_ready]
+            if required_missing:
+                raise ApiError(
+                    f"missing RPi temperature samples for {', '.join(required_missing)}"
+                )
+            if recently_ready:
+                log_warning(
+                    "Temporarily accepting missing RPi temperature samples after node recovery",
+                    nodes=recently_ready,
+                    grace_seconds=self.temperature_sample_grace_seconds,
+                )
         return {
             node_name: {
                 "cpu": cpu.get(node_name),
@@ -2400,7 +2463,7 @@ class RpiThermalCoolingManager:
         if phase not in {THERMAL_ACTION_THROTTLE, THERMAL_ACTION_PAUSE}:
             return None
 
-        temperatures = self.temperature_snapshot()
+        temperatures = self.temperature_snapshot(ready=ready, now=now)
         action, candidate = self.thermal_action_candidate(temperatures)
         shutdown_candidate = self.hot_candidate(temperatures)
 
@@ -2537,15 +2600,6 @@ class RpiThermalCoolingManager:
         started_at = parse_utc(active.get("started_at")) or now
         elapsed_seconds = max(0, int((now - started_at).total_seconds()))
 
-        if phase in {"draining", "drain_aborted"}:
-            log_warning(
-                "Clearing legacy RPi cooling drain state; drain is disabled",
-                node=node_name,
-                phase=phase,
-            )
-            self.state.clear()
-            return True
-
         thermal_reconcile = self.thermal_state_reconciled(active, now, ready)
         if thermal_reconcile is not None:
             return thermal_reconcile
@@ -2659,7 +2713,7 @@ class RpiThermalCoolingManager:
             log_debug("RPi cooling skipped because not all nodes are Ready", ready=ready)
             return {"enabled": True, "action": "skipped", "reason": "not all nodes are Ready", "ready": ready}
 
-        temperatures = self.temperature_snapshot()
+        temperatures = self.temperature_snapshot(ready=ready, now=now)
         action, candidate = self.thermal_action_candidate(temperatures)
         if not candidate:
             return {

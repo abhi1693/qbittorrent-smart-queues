@@ -5,6 +5,8 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 
@@ -85,6 +87,125 @@ class RpiCoolingTests(unittest.TestCase):
             env.update(extra_env)
         with mock.patch.dict("os.environ", env, clear=True):
             return self.guard.RpiThermalCoolingManager()
+
+    def test_kubernetes_client_retries_a_transient_transport_failure(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "KUBERNETES_SERVICE_HOST": "kubernetes.test",
+                "KUBERNETES_SERVICE_PORT": "443",
+                "QBT_RPI_COOLING_K8S_RETRIES": "2",
+                "QBT_RPI_COOLING_K8S_RETRY_DELAY_SECONDS": "0",
+            },
+            clear=True,
+        ):
+            client = self.guard.KubernetesNodeClient()
+        client.read_token = mock.Mock(return_value="token")
+        response = mock.MagicMock()
+        response.read.return_value = b'{"status": "ok"}'
+        response.__enter__.return_value = response
+
+        with (
+            mock.patch.object(self.guard.ssl, "create_default_context", return_value=object()),
+            mock.patch.object(
+                self.guard.urllib.request,
+                "urlopen",
+                side_effect=[urllib.error.URLError("temporary route failure"), response],
+            ) as urlopen,
+        ):
+            result = client.fetch_path("/api", "Kubernetes API")
+
+        self.assertEqual({"status": "ok"}, result)
+        self.assertEqual(2, urlopen.call_count)
+
+    def test_kubernetes_client_fails_closed_after_retry_budget(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "KUBERNETES_SERVICE_HOST": "kubernetes.test",
+                "KUBERNETES_SERVICE_PORT": "443",
+                "QBT_RPI_COOLING_K8S_RETRIES": "2",
+                "QBT_RPI_COOLING_K8S_RETRY_DELAY_SECONDS": "0",
+            },
+            clear=True,
+        ):
+            client = self.guard.KubernetesNodeClient()
+        client.read_token = mock.Mock(return_value="token")
+
+        with (
+            mock.patch.object(self.guard.ssl, "create_default_context", return_value=object()),
+            mock.patch.object(
+                self.guard.urllib.request,
+                "urlopen",
+                side_effect=urllib.error.URLError("route unavailable"),
+            ) as urlopen,
+        ):
+            with self.assertRaisesRegex(self.guard.ApiError, "failed after 3 attempt"):
+                client.fetch_path("/api", "Kubernetes API")
+
+        self.assertEqual(3, urlopen.call_count)
+
+    def test_recently_ready_node_gets_temperature_scrape_grace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_TEMPERATURE_SAMPLE_GRACE_SECONDS": "180",
+                },
+            )
+            now = datetime.now(timezone.utc)
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.kubernetes.ready_transition_times = {
+                "k8s-rpi1": now - timedelta(seconds=30),
+            }
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi2": 60.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(
+                return_value={"enabled": True, "changed": [], "errors": []}
+            )
+
+            result = manager.reconcile()
+
+            self.assertEqual("clear", result["action"])
+            self.assertEqual({"cpu": None, "nvme": None}, result["temperatures"]["k8s-rpi1"])
+
+    def test_stale_missing_temperature_sample_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "rpi-cooling.json")
+            manager = self.manager(
+                state_path,
+                {
+                    "QBT_RPI_COOLING_SHUTDOWN_ENABLED": "false",
+                    "QBT_RPI_COOLING_TEMPERATURE_SAMPLE_GRACE_SECONDS": "180",
+                },
+            )
+            now = datetime.now(timezone.utc)
+            manager.kubernetes.ready_map = mock.Mock(
+                return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
+            )
+            manager.kubernetes.ready_transition_times = {
+                "k8s-rpi1": now - timedelta(seconds=181),
+            }
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi2": 60.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+
+            with self.assertRaisesRegex(
+                self.guard.ApiError,
+                "missing RPi temperature samples for k8s-rpi1",
+            ):
+                manager.reconcile()
 
     def test_hot_node_throttles_qbittorrent_without_shutdown_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -761,16 +882,15 @@ class RpiCoolingTests(unittest.TestCase):
                 state = json.load(state_file)
             self.assertEqual("shutdown_requested", state["phase"])
 
-    def test_legacy_drain_state_is_cleared_without_shutdown(self):
+    def test_unknown_cooling_state_is_cleared_without_action(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = os.path.join(tmpdir, "rpi-cooling.json")
             with open(state_path, "w", encoding="utf-8") as state_file:
                 json.dump(
                     {
                         "node": "k8s-rpi2",
-                        "phase": "draining",
+                        "phase": "retired",
                         "started_at": "2026-06-01T00:00:00Z",
-                        "drain_started_at": "2026-06-01T00:00:00Z",
                         "reason": "CPU temperature 80.0C reached threshold 75.0C",
                         "temperature_kind": "CPU",
                         "temperature_celsius": 80.0,
@@ -782,11 +902,20 @@ class RpiCoolingTests(unittest.TestCase):
             manager.kubernetes.ready_map = mock.Mock(
                 return_value={"k8s-rpi1": True, "k8s-rpi2": True, "k8s-rpi3": True}
             )
+            manager.prometheus_temperature_readings = mock.Mock(
+                side_effect=[
+                    {"k8s-rpi1": 60.0, "k8s-rpi2": 60.0, "k8s-rpi3": 59.0},
+                    {"k8s-rpi1": 50.0, "k8s-rpi2": 55.0, "k8s-rpi3": 50.0},
+                ]
+            )
+            manager.batch_work.reconcile = mock.Mock(
+                return_value={"enabled": True, "changed": [], "errors": []}
+            )
 
             with mock.patch.object(self.guard, "request_json") as request_json:
                 result = manager.reconcile()
 
-            self.assertEqual("active", result["action"])
+            self.assertEqual("clear", result["action"])
             request_json.assert_not_called()
             self.assertFalse(os.path.exists(state_path))
 
