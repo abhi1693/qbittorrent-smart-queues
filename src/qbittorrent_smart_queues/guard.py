@@ -9000,21 +9000,11 @@ class SmartQueuePolicyEngine:
             available_candidates.append(torrent)
 
         for torrent, relative_speed_defer in relative_speed_deferred_candidates:
-            has_stopped_replacement = any(
-                torrent_hash(candidate) != torrent_hash(torrent)
-                and torrent_category(candidate) == torrent_category(torrent)
-                and is_stopped_torrent(candidate)
-                for candidate in available_candidates
-            )
-            if not has_stopped_replacement:
-                available_candidates.append(torrent)
-                continue
             rejected_counts["relative_speed_deferred"] += 1
             relative_speed_deferred_count += 1
             log_info(
                 f"Skipping relatively slow torrent for "
                 f"{human_duration(relative_speed_defer.get('remaining_seconds', 0))} "
-                f"while a same-category replacement is eligible "
                 f"{torrent_name(torrent)}"
             )
 
@@ -11194,6 +11184,12 @@ def apply_single_download(
                         "normal_category_relative_speed_yielded": len(yielded_torrents),
                         "relative_speed_policy_enabled": relative_speed_policy.enabled,
                         "relative_speed_fraction": relative_speed_policy.threshold_fraction,
+                        "relative_speed_tolerance_fraction": (
+                            relative_speed_policy.threshold_tolerance_fraction
+                        ),
+                        "relative_speed_min_acceptable_bytes_per_sec": (
+                            relative_speed_policy.minimum_acceptable_bytes_per_second
+                        ),
                         "relative_speed_min_peers": relative_speed_policy.minimum_peer_workers,
                         "relative_speed_min_reference_bytes_per_sec": (
                             relative_speed_policy.minimum_reference_bytes_per_second

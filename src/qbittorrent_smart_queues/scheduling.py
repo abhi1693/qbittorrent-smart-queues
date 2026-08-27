@@ -31,6 +31,8 @@ class RelativeSpeedPolicy:
 
     enabled: bool = False
     threshold_fraction: float = 0.25
+    threshold_tolerance_fraction: float = 0.10
+    minimum_acceptable_bytes_per_second: int = 1_048_576
     minimum_peer_workers: int = 2
     minimum_reference_bytes_per_second: int = 1_048_576
     minimum_trial_seconds: int = 300
@@ -45,6 +47,23 @@ class RelativeSpeedPolicy:
                 min(
                     0.95,
                     env_float("QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_FRACTION", 0.25),
+                ),
+            ),
+            threshold_tolerance_fraction=max(
+                0.0,
+                min(
+                    0.95,
+                    env_float(
+                        "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_TOLERANCE_FRACTION",
+                        0.10,
+                    ),
+                ),
+            ),
+            minimum_acceptable_bytes_per_second=max(
+                1,
+                env_int(
+                    "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_ACCEPTABLE_BYTES_PER_SEC",
+                    1_048_576,
                 ),
             ),
             minimum_peer_workers=max(
@@ -92,7 +111,21 @@ class RelativeSpeedPolicy:
                 continue
 
             reference = max(0, int(median(peer_speeds)))
-            threshold = max(1, int(reference * self.threshold_fraction))
+            threshold = max(
+                1,
+                int(
+                    reference
+                    * self.threshold_fraction
+                    * (1.0 - self.threshold_tolerance_fraction)
+                ),
+            )
+            acceptable_floor = max(
+                1,
+                int(
+                    self.minimum_acceptable_bytes_per_second
+                    * (1.0 - self.threshold_tolerance_fraction)
+                ),
+            )
             trial_complete = (
                 sample.trial_age_seconds is None
                 or sample.trial_age_seconds >= self.minimum_trial_seconds
@@ -100,6 +133,7 @@ class RelativeSpeedPolicy:
             underperforming = (
                 reference >= self.minimum_reference_bytes_per_second
                 and sample.speed_bytes_per_second < threshold
+                and sample.speed_bytes_per_second < acceptable_floor
             )
             reason = (
                 f"observed {sample.speed_bytes_per_second} B/s versus peer median "

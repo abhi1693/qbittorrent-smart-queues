@@ -259,7 +259,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertEqual({"slow"}, yielded_hashes)
         self.assertTrue(any("slow" in hashes for hashes in client.stopped))
         self.assertTrue(any("replacement" in hashes for hashes in client.started))
-        self.assertTrue(any("slow" in hashes for hashes in starts_without_replacement))
+        self.assertFalse(any("slow" in hashes for hashes in starts_without_replacement))
         self.assertEqual(1, yield_event["candidate_counts"]["normal_category_relative_speed_yielded"])
         slow_health = health_state["torrents"]["slow"]
         self.assertEqual(1, slow_health["relative_speed_yield_count"])

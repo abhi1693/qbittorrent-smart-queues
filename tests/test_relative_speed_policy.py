@@ -78,12 +78,64 @@ class RelativeSpeedPolicyTests(unittest.TestCase):
 
         self.assertEqual([], decisions)
 
+    def test_keeps_worker_within_threshold_tolerance(self):
+        policy = RelativeSpeedPolicy(
+            enabled=True,
+            threshold_fraction=0.25,
+            threshold_tolerance_fraction=0.10,
+        )
+        samples = [
+            self.sample("near-cutoff", 998_400),
+            self.sample("fast-one", 4_194_304),
+            self.sample("fast-two", 4_194_304),
+        ]
+
+        decisions = policy.assess(samples, {"movies": 1})
+
+        self.assertEqual([], decisions)
+
+    def test_keeps_good_enough_worker_even_when_peers_are_much_faster(self):
+        policy = RelativeSpeedPolicy(
+            enabled=True,
+            threshold_fraction=0.25,
+            threshold_tolerance_fraction=0.10,
+            minimum_acceptable_bytes_per_second=1_048_576,
+        )
+        samples = [
+            self.sample("good-enough", 998_400),
+            self.sample("fast-one", 8_000_000),
+            self.sample("fast-two", 9_000_000),
+        ]
+
+        decisions = policy.assess(samples, {"movies": 1})
+
+        self.assertEqual([], decisions)
+
+    def test_yields_worker_below_threshold_tolerance(self):
+        policy = RelativeSpeedPolicy(
+            enabled=True,
+            threshold_fraction=0.25,
+            threshold_tolerance_fraction=0.10,
+        )
+        samples = [
+            self.sample("slow", 900_000),
+            self.sample("fast-one", 4_194_304),
+            self.sample("fast-two", 4_194_304),
+        ]
+
+        decisions = policy.assess(samples, {"movies": 1})
+
+        self.assertEqual(["slow"], [item.sample.worker_id for item in decisions])
+        self.assertEqual(943_718, decisions[0].yield_threshold_bytes_per_second)
+
     def test_environment_values_are_bounded(self):
         with mock.patch.dict(
             "os.environ",
             {
                 "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_ENABLED": "true",
                 "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_FRACTION": "2",
+                "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_TOLERANCE_FRACTION": "2",
+                "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_ACCEPTABLE_BYTES_PER_SEC": "0",
                 "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_PEERS": "0",
                 "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_REFERENCE_BYTES_PER_SEC": "0",
                 "QBT_SINGLE_DOWNLOAD_RELATIVE_SPEED_MIN_TRIAL_SECONDS": "-1",
@@ -94,6 +146,8 @@ class RelativeSpeedPolicyTests(unittest.TestCase):
 
         self.assertTrue(policy.enabled)
         self.assertEqual(0.95, policy.threshold_fraction)
+        self.assertEqual(0.95, policy.threshold_tolerance_fraction)
+        self.assertEqual(1, policy.minimum_acceptable_bytes_per_second)
         self.assertEqual(1, policy.minimum_peer_workers)
         self.assertEqual(1, policy.minimum_reference_bytes_per_second)
         self.assertEqual(0, policy.minimum_trial_seconds)
