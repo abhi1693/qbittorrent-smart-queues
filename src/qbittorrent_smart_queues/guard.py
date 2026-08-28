@@ -4118,6 +4118,16 @@ def media_file_sort_group(value):
     return 0
 
 
+def excludes_secondary_media(torrent):
+    categories = normalized_set(split_lines_or_csv(
+        os.environ.get(
+            "QBT_SINGLE_DOWNLOAD_SECONDARY_MEDIA_EXCLUDE_CATEGORIES",
+            "anime,priority-anime",
+        )
+    ))
+    return torrent_category(torrent).lower() in categories
+
+
 def normalize_download_id(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
 
@@ -5235,13 +5245,35 @@ def apply_tv_episode_file_priorities(
         )
         return
 
+    excluded_ids = []
+    if excludes_secondary_media(torrent):
+        excluded_ids = [
+            file_index(file_item, fallback)
+            for fallback, file_item in enumerate(files)
+            if file_priority(file_item) > 0
+            and media_file_sort_group(file_path(file_item)) > 0
+        ]
+        if excluded_ids:
+            client.set_file_priority(item_hash, excluded_ids, 0)
+            log_info(
+                f"Excluded {len(excluded_ids)} secondary files from Ryokan-managed "
+                f"torrent: {torrent_name(torrent)}",
+                hash=item_hash,
+                excluded_file_count=len(excluded_ids),
+            )
+
     media_files = []
     for fallback, file_item in enumerate(files):
-        if not is_media_file(file_item) or file_priority(file_item) <= 0:
+        file_id = file_index(file_item, fallback)
+        if (
+            not is_media_file(file_item)
+            or file_priority(file_item) <= 0
+            or file_id in excluded_ids
+        ):
             continue
         media_files.append((
             media_file_sort_group(file_path(file_item)),
-            file_index(file_item, fallback),
+            file_id,
             natural_media_file_sort_key(file_path(file_item)),
             file_item,
         ))

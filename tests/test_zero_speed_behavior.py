@@ -501,9 +501,74 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             ("forced-anime", [2, 3], self.guard.QBT_FILE_PRIORITY_HIGH),
             client.file_priority_calls,
         )
+        self.assertIn(
+            ("forced-anime", [500], 0),
+            client.file_priority_calls,
+        )
         self.assertEqual([], client.started)
         self.assertEqual([], client.stopped)
         self.assertEqual(0, client.stop_all_calls)
+
+    def test_anime_file_priorities_exclude_nested_extras_before_episode_ordering(self):
+        torrent = {
+            "hash": "naruto",
+            "name": "Naruto.v4.480p.DVD.Dual-Audio.FLAC2.0.Hi10P.x264-JySzE",
+            "category": "anime",
+        }
+        root = torrent["name"]
+        files = {
+            "naruto": [
+                {
+                    "index": 0,
+                    "name": f"{root}/Extras/Canon Cut/Naruto.135-220.Canon.Cut.mkv",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+                {
+                    "index": 1,
+                    "name": f"{root}/Naruto.002.mkv",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+                {
+                    "index": 222,
+                    "name": f"{root}/Naruto.001.mkv",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+                {
+                    "index": 223,
+                    "name": f"{root}/Extras/NCED/NCED.01.mkv",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+                {
+                    "index": 224,
+                    "name": f"{root}/Extras/booklet.pdf",
+                    "priority": 1,
+                    "progress": 0.0,
+                },
+            ]
+        }
+        client = FakeQbtClient([torrent], files=files)
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.guard.apply_tv_episode_file_priorities(
+                client,
+                torrent,
+                {"anime"},
+                True,
+                1,
+            )
+
+        self.assertEqual(
+            [
+                ("naruto", [0, 223, 224], 0),
+                ("naruto", [1], self.guard.QBT_FILE_PRIORITY_HIGH),
+                ("naruto", [222], self.guard.QBT_FILE_PRIORITY_MAXIMUM),
+            ],
+            client.file_priority_calls,
+        )
 
     def test_pause_all_leaves_force_started_torrent_running(self):
         forced = {

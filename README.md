@@ -253,14 +253,17 @@ For multi-file torrents, Smart Queues can also manage qBittorrent file
 priorities without parsing filenames. The first incomplete selected media file
 in natural filename order is raised to maximum priority, the next configured
 lookahead files are raised to high priority, and later selected media files are
-returned to normal priority. Secondary media paths such as extras, samples, and
-trailers are sorted behind primary media files.
+returned to normal priority. In Ryokan-managed anime categories, secondary
+paths such as extras, samples, and trailers are unselected so they cannot block
+or contaminate a numbered-episode batch import. Other categories sort those
+paths behind primary media files.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_ENABLED` | `QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED` or `true` | Manage selected media-file priorities inside eligible multi-file torrents. |
 | `QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_CATEGORIES` | `QBT_SINGLE_DOWNLOAD_CATEGORIES` or `tv,movies,anime,priority-tv,priority-movies,priority-anime` | qBittorrent categories whose selected media files should be reprioritized. |
 | `QBT_SINGLE_DOWNLOAD_FILE_PRIORITY_LOOKAHEAD_FILES` | `QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_LOOKAHEAD_EPISODES` or `2` | Number of incomplete selected media files after the first one to raise to high priority. |
+| `QBT_SINGLE_DOWNLOAD_SECONDARY_MEDIA_EXCLUDE_CATEGORIES` | `anime,priority-anime` | qBittorrent categories where files beneath extras, samples, trailers, and similar secondary-media paths are unselected before episode ordering. |
 
 Optional stale torrent maintenance:
 
