@@ -6048,10 +6048,26 @@ def availability_probe_download_limit():
     )
 
 
-def availability_probe_max_attempts_per_run():
-    return max(
+def availability_probe_max_attempts_per_run(queue_idle=False):
+    normal_limit = max(
         1,
         env_int("QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN", 2),
+    )
+    if not queue_idle:
+        return normal_limit
+    return max(
+        normal_limit,
+        env_int("QBT_AVAILABILITY_IDLE_MAX_ATTEMPTS_PER_RUN", normal_limit),
+    )
+
+
+def availability_probe_max_run_seconds(normal_run_seconds, queue_idle=False):
+    normal_run_seconds = max(1, int(normal_run_seconds))
+    if not queue_idle:
+        return normal_run_seconds
+    return max(
+        normal_run_seconds,
+        env_int("QBT_AVAILABILITY_IDLE_MAX_RUN_SECONDS", normal_run_seconds),
     )
 
 
@@ -10160,7 +10176,8 @@ def apply_single_download(
                 )
         attempted_hashes = set()
         attempt = 0
-        deadline = time.monotonic() + max_run_seconds
+        run_started = time.monotonic()
+        deadline = run_started + max_run_seconds
         active_queue_limit = None
         metadata_bootstrap_attempts = 0
         availability_attempts = 0
@@ -10354,7 +10371,22 @@ def apply_single_download(
                     if not cooldown_state:
                         metadata_bootstrap_preempts_availability = True
                         break
-            availability_attempt_limit = availability_probe_max_attempts_per_run()
+            queue_idle = not any(
+                is_productive_download(torrent)
+                for torrent in torrents
+            )
+            availability_attempt_limit = availability_probe_max_attempts_per_run(
+                queue_idle=queue_idle,
+            )
+            availability_run_budget_seconds = availability_probe_max_run_seconds(
+                max_run_seconds,
+                queue_idle=queue_idle,
+            )
+            if availability_candidates and queue_idle:
+                deadline = max(
+                    deadline,
+                    run_started + availability_run_budget_seconds,
+                )
             availability_attempts_remaining = max(
                 0,
                 availability_attempt_limit - availability_attempts,
@@ -10392,6 +10424,8 @@ def apply_single_download(
                             "availability_probe_candidates": len(availability_candidates),
                             "availability_probe_attempt": availability_attempts,
                             "availability_probe_attempt_limit": availability_attempt_limit,
+                            "availability_idle_fast_scan": queue_idle,
+                            "availability_run_budget_seconds": availability_run_budget_seconds,
                             "availability_samples": availability_result["samples"],
                         },
                         selected_torrent=torrent_decision_summary(availability_candidate),

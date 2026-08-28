@@ -334,6 +334,8 @@ swarm debt instead of protecting only new grabs.
 | `QBT_AVAILABILITY_REQUIRED_BELOW_MINIMUM_SAMPLES` | `5` | Positive below-threshold samples required before destructive rejection. Any complete sample admits immediately. |
 | `QBT_AVAILABILITY_PROBE_INTERVAL_SECONDS` | `10` | Delay between fresh qBittorrent availability samples. |
 | `QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN` | `2` | Maximum availability-admission torrents checked in one controller run. Attempts remain sequential and bounded by the normal run-time budget. |
+| `QBT_AVAILABILITY_IDLE_MAX_ATTEMPTS_PER_RUN` | `QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN` | Higher availability-probe limit used only when no torrent is downloading productively. This lets an idle queue rotate through a dead-swarm backlog without changing normal active-download behavior. |
+| `QBT_AVAILABILITY_IDLE_MAX_RUN_SECONDS` | `QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS` | Extended controller-run budget used only while the queue is idle and availability candidates remain. It never shortens the normal run budget. |
 | `QBT_AVAILABILITY_PROBE_TRACKER_DEAD_RETRY_SECONDS` | `1800` | Retry interval for an admission-pending torrent whose last probe returned no swarm telemetry. This overrides a longer generic tracker-dead cooldown only for `availability-probe` torrents. |
 | `QBT_AVAILABILITY_LEGACY_MIN_PROGRESS` | `0.95` | Progress threshold that makes an existing incomplete, below-threshold torrent eligible for probing. |
 | `QBT_AVAILABILITY_LEGACY_MIN_NO_PROGRESS_SAMPLES` | `2` | Stored no-progress observations that make another existing below-threshold torrent eligible for probing. |
@@ -478,6 +480,13 @@ Availability admission is bounded across the whole controller run. After the
 configured probe batch is processed, the same run refreshes qBittorrent state
 and continues into ordinary queue selection instead of exiting and letting an
 old probe backlog monopolize every pass.
+
+When no torrent is making productive download progress, the optional idle
+availability limits can widen that bounded batch and its run-time budget. The
+controller then checks more distinct candidates before performing end-of-pass
+maintenance, which avoids stretching a large dead-swarm backlog across hours.
+As soon as a productive torrent exists, the normal attempt and run-time limits
+apply again.
 
 For new magnets, configure qBittorrent to add torrents in the started state with
 the stop condition set to `MetadataReceived`. qBittorrent then performs this

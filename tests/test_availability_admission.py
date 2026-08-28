@@ -339,6 +339,33 @@ class AvailabilityAdmissionTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(2, self.guard.availability_probe_max_attempts_per_run())
 
+    def test_idle_probe_attempt_limit_can_exceed_normal_limit(self):
+        env = {
+            "QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN": "2",
+            "QBT_AVAILABILITY_IDLE_MAX_ATTEMPTS_PER_RUN": "10",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            self.assertEqual(
+                2,
+                self.guard.availability_probe_max_attempts_per_run(queue_idle=False),
+            )
+            self.assertEqual(
+                10,
+                self.guard.availability_probe_max_attempts_per_run(queue_idle=True),
+            )
+
+    def test_idle_probe_run_budget_never_shortens_normal_budget(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"QBT_AVAILABILITY_IDLE_MAX_RUN_SECONDS": "30"},
+            clear=True,
+        ):
+            self.assertEqual(
+                180,
+                self.guard.availability_probe_max_run_seconds(180, queue_idle=True),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
