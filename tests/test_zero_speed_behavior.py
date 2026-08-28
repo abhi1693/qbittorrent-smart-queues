@@ -948,6 +948,83 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertTrue(client.queue_limits)
         self.assertTrue(all(limit == 1 for limit, _ in client.queue_limits))
 
+    def test_availability_probe_batch_continues_to_normal_queue_selection(self):
+        client = FakeQbtClient([
+            {
+                "hash": "probe",
+                "name": "Old.Tracker.Dead.Probe.1080p",
+                "category": "movies",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 1_000,
+                "downloaded": 100,
+                "progress": 0.5,
+                "availability": 0,
+                "has_metadata": True,
+                "tags": "availability-probe",
+            },
+            {
+                "hash": "ready",
+                "name": "Ready.Movie.1080p",
+                "category": "movies",
+                "state": "stoppedDL",
+                "dlspeed": 0,
+                "amount_left": 1_000,
+                "downloaded": 100,
+                "progress": 0.5,
+                "availability": 2.0,
+                "has_metadata": True,
+                "tags": "availability-verified-20990101T000000Z",
+            },
+        ])
+        env = {
+            "QBT_AVAILABILITY_ADMISSION_ENABLED": "true",
+            "QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_SINGLE_DOWNLOAD_STALL_CHECK_SECONDS": "0",
+            "QBT_SINGLE_DOWNLOAD_MAX_RUN_SECONDS": "60",
+            "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
+            "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
+            "QBT_TV_QUEUE_SONARR_ENABLED": "false",
+            "QBT_MOVIE_QUEUE_RADARR_ENABLED": "false",
+            "QBT_LOG_FORMAT": "json",
+            "QBT_DECISION_LOG_LEVEL": "info",
+        }
+        availability_result = {
+            "status": "admitted",
+            "samples": 1,
+            "below_minimum_samples": 0,
+            "failed": 0,
+            "max_availability": 2.0,
+        }
+
+        with mock.patch.dict("os.environ", env, clear=False), mock.patch.object(
+            self.guard,
+            "process_availability_admission_torrent",
+            return_value=availability_result,
+        ), mock.patch.object(self.guard.time, "sleep"):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.guard.apply_single_download(
+                    [client],
+                    usage_bytes=0,
+                    monthly_limit_bytes=1_000,
+                    download_limit=1_024,
+                    limit_reason="unit test",
+                    storage_guard=FakeStorageGuard(),
+                )
+
+        actions = [
+            json.loads(line).get("action")
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{")
+            and json.loads(line).get("event") == "qbt_guard_decision"
+        ]
+        self.assertIn("availability_admitted", actions)
+        self.assertIn("try_candidate", actions)
+        self.assertLess(actions.index("availability_admitted"), actions.index("try_candidate"))
+        self.assertIn(["ready"], client.started)
+
     def test_apply_single_download_parks_zero_speed_torrent_after_wait_without_bytes(self):
         client = FakeQbtClient([
             {

@@ -471,6 +471,11 @@ the generic exponential no-progress backoff. When the configured window is
 shortened, persisted longer tracker-dead cooldown records are capped at read
 time so the new retry policy takes effect immediately.
 
+Availability admission is bounded across the whole controller run. After the
+configured probe batch is processed, the same run refreshes qBittorrent state
+and continues into ordinary queue selection instead of exiting and letting an
+old probe backlog monopolize every pass.
+
 For new magnets, configure qBittorrent to add torrents in the started state with
 the stop condition set to `MetadataReceived`. qBittorrent then performs this
 metadata-only transition immediately after add and leaves the torrent stopped

@@ -10131,6 +10131,7 @@ def apply_single_download(
         deadline = time.monotonic() + max_run_seconds
         active_queue_limit = None
         metadata_bootstrap_attempts = 0
+        availability_attempts = 0
 
         while True:
             if max_attempts > 0 and attempt >= max_attempts:
@@ -10321,10 +10322,19 @@ def apply_single_download(
                     if not cooldown_state:
                         metadata_bootstrap_preempts_availability = True
                         break
-            if availability_candidates and not metadata_bootstrap_preempts_availability:
-                availability_attempt_limit = availability_probe_max_attempts_per_run()
-                availability_attempts = 0
-                for availability_candidate in availability_candidates[:availability_attempt_limit]:
+            availability_attempt_limit = availability_probe_max_attempts_per_run()
+            availability_attempts_remaining = max(
+                0,
+                availability_attempt_limit - availability_attempts,
+            )
+            if (
+                availability_candidates
+                and availability_attempts_remaining > 0
+                and not metadata_bootstrap_preempts_availability
+            ):
+                for availability_candidate in availability_candidates[
+                    :availability_attempts_remaining
+                ]:
                     if availability_attempts > 0 and time.monotonic() >= deadline:
                         break
                     availability_attempts += 1
@@ -10366,7 +10376,7 @@ def apply_single_download(
                         below_minimum_samples=availability_result["below_minimum_samples"],
                         max_availability=round(availability_result["max_availability"], 6),
                     )
-                break
+                continue
             manual_override_torrents = force_started_torrents(torrents)
             if manual_override_torrents:
                 manual_override_hashes = {
