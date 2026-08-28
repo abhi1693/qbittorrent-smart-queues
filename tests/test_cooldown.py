@@ -260,6 +260,45 @@ class CooldownParsingTests(unittest.TestCase):
             self.assertEqual(5, store.no_progress_backoff_level(torrent))
             self.assertEqual(10000, store.cooldown_seconds_for_torrent(torrent, 3600, "no-progress"))
 
+    def test_tracker_dead_cooldown_is_fixed_and_caps_persisted_backoff(self):
+        now = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
+        torrent = {
+            "hash": "dead123",
+            "name": "Tracker.Dead.Show.S01E01",
+            "category": "tv",
+            "state": "stalledDL",
+            "amount_left": 1000,
+            "downloaded": 0,
+            "progress": 0.5,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {
+                "QBT_TORRENT_HEALTH_STATE_PATH": os.path.join(tmpdir, "health.json"),
+                "QBT_TORRENT_HEALTH_SCORING_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_STALL_BACKOFF_ENABLED": "true",
+                "QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_TRACKER_DEAD_SECONDS": "1800",
+            },
+            clear=False,
+        ):
+            store = self.guard.TorrentHealthStore()
+            entry = store.entry("dead123")
+            entry.update({
+                "cooldown_reason": "tracker-dead",
+                "cooldown_scope": "normal",
+                "cooldown_last_tried_at": self.guard.format_utc(now - timedelta(minutes=45)),
+                "cooldown_next_retry_at": self.guard.format_utc(now + timedelta(hours=20)),
+                "cooldown_seconds": 86_400,
+                "cooldown_failure_count": 5,
+                "no_progress_backoff_level": 5,
+            })
+
+            self.assertEqual(
+                1800,
+                store.cooldown_seconds_for_torrent(torrent, 3600, "tracker-dead"),
+            )
+            self.assertEqual({}, store.active_cooldown_state(torrent, now, scope="normal"))
+
 
 if __name__ == "__main__":
     unittest.main()

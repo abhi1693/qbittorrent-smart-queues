@@ -7987,6 +7987,18 @@ class TorrentHealthStore:
             return {}
 
         reason = normalize_stall_cooldown_reason(entry.get("cooldown_reason") or entry.get("last_cooldown_reason"))
+        last_tried_at = parse_utc(
+            entry.get("cooldown_last_tried_at") or entry.get("last_failure_at")
+        )
+        if reason == STALL_COOLDOWN_REASON_TRACKER_DEAD and last_tried_at is not None:
+            current_tracker_dead_seconds = stall_cooldown_seconds_for_reason(
+                env_int("QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS", 3600),
+                reason,
+            )
+            next_retry_at = min(
+                next_retry_at,
+                last_tried_at + timedelta(seconds=current_tracker_dead_seconds),
+            )
         remaining_seconds = max(0, int((next_retry_at - now).total_seconds()))
         try:
             failure_count = max(0, int(entry.get("cooldown_failure_count") or 0))
@@ -8016,10 +8028,7 @@ class TorrentHealthStore:
 
     def no_progress_backoff_reason(self, reason):
         normalized = normalize_stall_cooldown_reason(reason)
-        return normalized in {
-            STALL_COOLDOWN_REASON_NO_PROGRESS,
-            STALL_COOLDOWN_REASON_TRACKER_DEAD,
-        }
+        return normalized == STALL_COOLDOWN_REASON_NO_PROGRESS
 
     def no_progress_backoff_level(self, torrent):
         entry = self.entry(torrent_hash(torrent))

@@ -466,6 +466,11 @@ not active, when storage is already at/below reserve, or when qBittorrent file
 preallocation is enabled. Disabling bootstrap with preallocation avoids
 allocating an unknown-size payload before its storage fit can be verified.
 
+Tracker-dead cooldowns use their configured fixed retry window and do not enter
+the generic exponential no-progress backoff. When the configured window is
+shortened, persisted longer tracker-dead cooldown records are capped at read
+time so the new retry policy takes effect immediately.
+
 For new magnets, configure qBittorrent to add torrents in the started state with
 the stop condition set to `MetadataReceived`. qBittorrent then performs this
 metadata-only transition immediately after add and leaves the torrent stopped
