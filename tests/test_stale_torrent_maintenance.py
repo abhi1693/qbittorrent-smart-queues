@@ -532,7 +532,7 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertEqual([], client.deleted)
         self.assertEqual([], client.rechecked)
 
-    def test_completed_ryokan_anime_batch_is_kept_when_any_selected_media_source_remains(self):
+    def test_completed_ryokan_copy_mode_batch_is_deleted_only_after_complete_receipt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             batch_dir = os.path.join(tmpdir, "Batch")
             os.mkdir(batch_dir)
@@ -570,16 +570,16 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
 
         self.assertEqual(
             {
-                "attempted": 0,
-                "succeeded": 0,
+                "attempted": 1,
+                "succeeded": 1,
                 "failed": 0,
                 "requeued": 0,
-                "verification_failed": 1,
+                "verification_failed": 0,
                 "skipped": 0,
             },
             result,
         )
-        self.assertEqual([], client.deleted)
+        self.assertEqual([(["animepartial"], True)], client.deleted)
         self.assertEqual(1, len(reconciler.calls))
 
     def test_false_complete_ryokan_batch_is_requeued_even_when_a_source_remains(self):

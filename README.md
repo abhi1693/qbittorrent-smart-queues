@@ -264,6 +264,13 @@ trailers are sorted behind primary media files.
 
 Optional stale torrent maintenance:
 
+Generic `missingFiles` cleanup removes only the qBittorrent entry and always
+sends `deleteFiles=false`. A missing-files state does not prove that partial or
+moved payload data is disposable. Files are deleted only by the receipt-aware
+Arr and Ryokan cleanup paths after their import checks succeed. Torrents in the
+Ryokan-managed anime categories are retained entirely when Ryokan cleanup is
+enabled so receipt reconciliation can requeue and recheck an interrupted import.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QBT_STALE_TORRENT_MAINTENANCE_ENABLED` | `true` | Track stalled incomplete torrents in the health state and run stale maintenance. |
@@ -280,9 +287,9 @@ Optional stale torrent maintenance:
 | `QBT_ARR_IMPORT_REJECTION_VERIFY_EXISTING_FILE` | `true` | Require Sonarr/Radarr to show an existing episode or movie file before removing an already-imported or not-an-upgrade queue record. |
 | `QBT_ARR_IMPORT_REJECTION_BLOCKLIST` | `false` | Whether import-rejection cleanup asks Sonarr/Radarr to blocklist the release. The default only removes the queue item and torrent from qBittorrent. |
 | `QBT_ARR_IMPORT_REJECTION_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr verification and queue delete calls during import-rejection cleanup. |
-| `QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED` | `false` | Reconcile completed Ryokan anime leftovers and delete them only after both source movement and Ryokan import receipts are complete. |
+| `QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED` | `false` | Reconcile completed Ryokan anime leftovers and delete them only after exact Ryokan source receipts and distinct size-matched library targets are complete. This supports source-retaining copy mode. |
 | `QBT_RYOKAN_IMPORTED_ANIME_CATEGORIES` | `anime,priority-anime` | qBittorrent categories treated as Ryokan-managed anime downloads. |
-| `QBT_RYOKAN_IMPORTED_ANIME_DOWNLOAD_ROOT` | `/downloads` | Mounted download root used to verify Ryokan moved the selected media files away before deleting the qBittorrent entry. |
+| `QBT_RYOKAN_IMPORTED_ANIME_DOWNLOAD_ROOT` | `/downloads` | Mounted download root used to resolve every selected source safely for receipt verification. Sources may still exist in copy mode and are removed by qBittorrent only after verification. |
 | `QBT_RYOKAN_IMPORTED_ANIME_MIN_COMPLETED_SECONDS` | `1800` | Minimum age after qBittorrent completion before Ryokan imported-anime cleanup can delete the torrent entry. |
 | `QBT_RYOKAN_IMPORTED_ANIME_DELETE_FILES` | `QBT_DELETE_FILES` or `true` | qBittorrent `deleteFiles` value for Ryokan imported-anime cleanup after source media verification succeeds. |
 | `QBT_RYOKAN_IMPORT_RECONCILER_URL` | unset | Base URL of the Ryokan import reconciler. Cleanup fails closed when it is unset or unavailable. |

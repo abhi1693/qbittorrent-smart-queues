@@ -5315,11 +5315,27 @@ def watch_priority_log_suffix(torrent, tv_order_state):
 
 
 def cleanup_qbt_client(client):
-    delete_files = env_bool("QBT_DELETE_FILES", True)
     error_torrents = error_state_torrents(client)
+    ryokan_categories = set()
+    if env_bool("QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED", False):
+        ryokan_categories = normalized_set(split_lines_or_csv(
+            os.environ.get("QBT_RYOKAN_IMPORTED_ANIME_CATEGORIES", "anime,priority-anime")
+        ))
     to_delete = [
         torrent for torrent in error_torrents
-        if torrent_state(torrent) == "missingFiles" and torrent_hash(torrent)
+        if (
+            torrent_state(torrent) == "missingFiles"
+            and torrent_hash(torrent)
+            and torrent_category(torrent).lower() not in ryokan_categories
+        )
+    ]
+    ryokan_missing = [
+        torrent for torrent in error_torrents
+        if (
+            torrent_state(torrent) == "missingFiles"
+            and torrent_hash(torrent)
+            and torrent_category(torrent).lower() in ryokan_categories
+        )
     ]
     to_start = [
         torrent for torrent in error_torrents
@@ -5327,12 +5343,27 @@ def cleanup_qbt_client(client):
     ]
 
     if to_delete:
-        log_info(f"Deleting {len(to_delete)} missing-files torrent(s):")
+        log_info(
+            f"Removing {len(to_delete)} missing-files torrent entr{'y' if len(to_delete) == 1 else 'ies'} "
+            "without deleting filesystem data:"
+        )
         for torrent in to_delete:
             log_info(f"- {torrent_name(torrent)}")
-        client.delete_hashes([torrent_hash(torrent) for torrent in to_delete], delete_files)
+        # `missingFiles` only proves qBittorrent can no longer resolve the
+        # payload at its expected path. It does not prove the data is absent:
+        # an interrupted cross-filesystem importer can leave a partial source
+        # or destination that is still the only recoverable copy. Generic
+        # error cleanup therefore removes metadata only. Media deletion stays
+        # behind the Arr/Ryokan receipt-aware cleanup paths below.
+        client.delete_hashes([torrent_hash(torrent) for torrent in to_delete], False)
     else:
         log_debug("No missing-files torrents need cleanup")
+
+    if ryokan_missing:
+        log_info(
+            f"Retaining {len(ryokan_missing)} Ryokan-managed missing-files torrent "
+            f"entr{'y' if len(ryokan_missing) == 1 else 'ies'} for receipt reconciliation and recheck"
+        )
 
     if to_start:
         log_debug(
@@ -6391,17 +6422,6 @@ def ryokan_expected_media_files(torrent, files, download_root):
     return expected_files
 
 
-def ryokan_imported_anime_source_verifies_moved(source_state):
-    selected_media_count = source_state.get("selected_media_count", 0)
-    return (
-        source_state.get("download_root_available")
-        and selected_media_count > 0
-        and source_state.get("unresolved_media_count", 0) == 0
-        and source_state.get("existing_media_count", 0) == 0
-        and source_state.get("missing_media_count", 0) == selected_media_count
-    )
-
-
 def process_ryokan_imported_anime_torrents(client, torrents, now=None, reconciler=None):
     if not env_bool("QBT_RYOKAN_IMPORTED_ANIME_CLEANUP_ENABLED", False):
         return {
@@ -6533,29 +6553,19 @@ def process_ryokan_imported_anime_torrents(client, torrents, now=None, reconcile
             )
             continue
 
-        if not ryokan_imported_anime_source_verifies_moved(source_state):
-            result["verification_failed"] += 1
-            log_debug(
-                f"Leaving receipt-complete Ryokan anime torrent in qBittorrent because "
-                f"not every selected media source file has disappeared from downloads: "
-                f"{torrent_name(torrent)}",
-                hash=item_hash,
-                source_state=source_state,
-            )
-            continue
-
         result["attempted"] += 1
         try:
             client.delete_hashes([item_hash], delete_files)
             result["succeeded"] += 1
             log_info(
-                f"Deleted completed Ryokan-imported anime torrent after source "
-                f"and destination receipts matched: {torrent_name(torrent)}",
+                f"Deleted completed Ryokan-imported anime torrent after exact import "
+                f"receipts and destination files matched: {torrent_name(torrent)}",
                 hash=item_hash,
                 delete_files=delete_files,
                 selected_media_count=source_state["selected_media_count"],
                 download_root=source_state["download_root"],
                 receipt_target_count=receipt.get("receipt_target_count"),
+                source_files_present=source_state.get("existing_media_count", 0),
             )
         except ApiError as exc:
             result["failed"] += 1
