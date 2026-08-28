@@ -5985,6 +5985,20 @@ def availability_probe_download_limit():
     )
 
 
+def availability_probe_max_attempts_per_run():
+    return max(
+        1,
+        env_int("QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN", 2),
+    )
+
+
+def availability_probe_tracker_dead_retry_seconds():
+    return max(
+        0,
+        env_int("QBT_AVAILABILITY_PROBE_TRACKER_DEAD_RETRY_SECONDS", 1_800),
+    )
+
+
 def availability_verified_tags(torrent):
     tags = []
     for tag in torrent_tags(torrent):
@@ -6025,8 +6039,20 @@ def availability_probe_candidate(torrent, health_store=None, now=None):
         return False
     if torrent_matching_tags(torrent, AVAILABILITY_PROBE_TAG):
         if health_store is not None and now is not None:
-            if health_store.active_cooldown_state(torrent, now, scope="normal"):
-                return False
+            cooldown_state = health_store.active_cooldown_state(
+                torrent,
+                now,
+                scope="normal",
+            )
+            if cooldown_state:
+                if cooldown_state.get("reason") != STALL_COOLDOWN_REASON_TRACKER_DEAD:
+                    return False
+                last_tried_at = parse_utc(cooldown_state.get("last_tried_at"))
+                if last_tried_at is None:
+                    return False
+                retry_seconds = availability_probe_tracker_dead_retry_seconds()
+                if max(0.0, (now - last_tried_at).total_seconds()) < retry_seconds:
+                    return False
         return True
     if availability_verification_is_fresh(torrent, now):
         return False
@@ -6054,12 +6080,27 @@ def availability_probe_candidates(torrents, health_store=None, now=None):
     candidates.sort(
         key=lambda torrent: (
             0 if torrent_matching_tags(torrent, AVAILABILITY_PROBE_TAG) else 1,
+            availability_probe_last_tried_sort_key(torrent, health_store, now),
             -torrent_progress(torrent),
             -torrent_downloaded_bytes(torrent) if torrent_downloaded_bytes(torrent) is not None else 0,
             torrent_name(torrent).lower(),
         )
     )
     return candidates
+
+
+def availability_probe_last_tried_sort_key(torrent, health_store=None, now=None):
+    if health_store is None:
+        return float("-inf")
+    cooldown_state = health_store.cooldown_state(
+        torrent,
+        now or datetime.now(timezone.utc),
+        scope="normal",
+    )
+    last_tried_at = parse_utc(cooldown_state.get("last_tried_at"))
+    if last_tried_at is None:
+        return float("-inf")
+    return last_tried_at.timestamp()
 
 
 def prepare_availability_probe_torrents(client, torrents):
@@ -10228,41 +10269,50 @@ def apply_single_download(
                 now,
             )
             if availability_candidates:
-                availability_candidate = availability_candidates[0]
-                availability_result = process_availability_admission_torrent(
-                    client,
-                    availability_candidate,
-                    sonarr_queue,
-                    radarr_queue,
-                    health_store,
-                )
-                emit_decision_log(
-                    "qbt_guard_decision",
-                    **decision_base_context(run_decision_context, client, storage_state),
-                    action=f"availability_{availability_result['status']}",
-                    reason="validated total swarm availability before queue selection",
-                    rejected_counts={
-                        "availability_below_minimum_samples": availability_result[
-                            "below_minimum_samples"
-                        ],
-                        "availability_rejection_failed": availability_result["failed"],
-                    },
-                    candidate_counts={
-                        "availability_probe_candidates": len(availability_candidates),
-                        "availability_samples": availability_result["samples"],
-                    },
-                    selected_torrent=torrent_decision_summary(availability_candidate),
-                    availability_probe=availability_result,
-                )
-                log_decision_info(
-                    f"availability_{availability_result['status']}",
-                    "Validated torrent total swarm availability before queue selection",
-                    torrent=torrent_name(availability_candidate),
-                    hash=torrent_hash(availability_candidate),
-                    samples=availability_result["samples"],
-                    below_minimum_samples=availability_result["below_minimum_samples"],
-                    max_availability=round(availability_result["max_availability"], 6),
-                )
+                availability_attempt_limit = availability_probe_max_attempts_per_run()
+                availability_attempts = 0
+                for availability_candidate in availability_candidates[:availability_attempt_limit]:
+                    if availability_attempts > 0 and time.monotonic() >= deadline:
+                        break
+                    availability_attempts += 1
+                    availability_result = process_availability_admission_torrent(
+                        client,
+                        availability_candidate,
+                        sonarr_queue,
+                        radarr_queue,
+                        health_store,
+                    )
+                    emit_decision_log(
+                        "qbt_guard_decision",
+                        **decision_base_context(run_decision_context, client, storage_state),
+                        action=f"availability_{availability_result['status']}",
+                        reason="validated total swarm availability before queue selection",
+                        rejected_counts={
+                            "availability_below_minimum_samples": availability_result[
+                                "below_minimum_samples"
+                            ],
+                            "availability_rejection_failed": availability_result["failed"],
+                        },
+                        candidate_counts={
+                            "availability_probe_candidates": len(availability_candidates),
+                            "availability_probe_attempt": availability_attempts,
+                            "availability_probe_attempt_limit": availability_attempt_limit,
+                            "availability_samples": availability_result["samples"],
+                        },
+                        selected_torrent=torrent_decision_summary(availability_candidate),
+                        availability_probe=availability_result,
+                    )
+                    log_decision_info(
+                        f"availability_{availability_result['status']}",
+                        "Validated torrent total swarm availability before queue selection",
+                        torrent=torrent_name(availability_candidate),
+                        hash=torrent_hash(availability_candidate),
+                        attempt=availability_attempts,
+                        attempt_limit=availability_attempt_limit,
+                        samples=availability_result["samples"],
+                        below_minimum_samples=availability_result["below_minimum_samples"],
+                        max_availability=round(availability_result["max_availability"], 6),
+                    )
                 break
             manual_override_torrents = force_started_torrents(torrents)
             if manual_override_torrents:

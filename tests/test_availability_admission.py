@@ -60,6 +60,23 @@ class StaticQueue:
         return list(self._configs)
 
 
+class CooldownStore:
+    def __init__(self, states):
+        self.states = dict(states)
+
+    def cooldown_state(self, torrent, now=None, scope=None):
+        return dict(self.states.get(torrent.get("hash"), {}))
+
+    def active_cooldown_state(self, torrent, now, scope=None):
+        state = self.cooldown_state(torrent, now, scope)
+        if state.get("active"):
+            return state
+        return {}
+
+    def storage_recovery_no_progress_samples(self, torrent):
+        return 0
+
+
 class AvailabilityAdmissionTests(unittest.TestCase):
     def setUp(self):
         from qbittorrent_smart_queues import guard
@@ -219,6 +236,108 @@ class AvailabilityAdmissionTests(unittest.TestCase):
 
         self.assertFalse(fresh)
         self.assertTrue(expired)
+
+    def test_tracker_dead_probe_uses_shorter_retry_than_generic_cooldown(self):
+        now = self.guard.datetime(2026, 8, 28, 12, 0, tzinfo=self.guard.timezone.utc)
+        state = {
+            "active": True,
+            "reason": self.guard.STALL_COOLDOWN_REASON_TRACKER_DEAD,
+            "last_tried_at": "2026-08-28T11:20:00Z",
+            "next_retry_at": "2026-08-29T11:20:00Z",
+        }
+
+        with mock.patch.dict(
+            "os.environ",
+            {**self.env, "QBT_AVAILABILITY_PROBE_TRACKER_DEAD_RETRY_SECONDS": "1800"},
+            clear=True,
+        ):
+            eligible = self.guard.availability_probe_candidate(
+                self.base_torrent,
+                CooldownStore({"abc123": state}),
+                now,
+            )
+
+        self.assertTrue(eligible)
+
+    def test_tracker_dead_probe_respects_dedicated_retry_window(self):
+        now = self.guard.datetime(2026, 8, 28, 12, 0, tzinfo=self.guard.timezone.utc)
+        state = {
+            "active": True,
+            "reason": self.guard.STALL_COOLDOWN_REASON_TRACKER_DEAD,
+            "last_tried_at": "2026-08-28T11:50:00Z",
+            "next_retry_at": "2026-08-29T11:50:00Z",
+        }
+
+        with mock.patch.dict(
+            "os.environ",
+            {**self.env, "QBT_AVAILABILITY_PROBE_TRACKER_DEAD_RETRY_SECONDS": "1800"},
+            clear=True,
+        ):
+            eligible = self.guard.availability_probe_candidate(
+                self.base_torrent,
+                CooldownStore({"abc123": state}),
+                now,
+            )
+
+        self.assertFalse(eligible)
+
+    def test_tracker_dead_override_does_not_bypass_no_progress_cooldown(self):
+        now = self.guard.datetime(2026, 8, 28, 12, 0, tzinfo=self.guard.timezone.utc)
+        state = {
+            "active": True,
+            "reason": self.guard.STALL_COOLDOWN_REASON_NO_PROGRESS,
+            "last_tried_at": "2026-08-28T10:00:00Z",
+            "next_retry_at": "2026-08-29T10:00:00Z",
+        }
+
+        with mock.patch.dict(
+            "os.environ",
+            {**self.env, "QBT_AVAILABILITY_PROBE_TRACKER_DEAD_RETRY_SECONDS": "1800"},
+            clear=True,
+        ):
+            eligible = self.guard.availability_probe_candidate(
+                self.base_torrent,
+                CooldownStore({"abc123": state}),
+                now,
+            )
+
+        self.assertFalse(eligible)
+
+    def test_probe_candidates_rotate_oldest_attempt_first(self):
+        now = self.guard.datetime(2026, 8, 28, 12, 0, tzinfo=self.guard.timezone.utc)
+        older = dict(self.base_torrent, hash="older", name="Older", progress=0.1)
+        newer = dict(self.base_torrent, hash="newer", name="Newer", progress=0.9)
+        store = CooldownStore({
+            "older": {
+                "active": True,
+                "reason": self.guard.STALL_COOLDOWN_REASON_TRACKER_DEAD,
+                "last_tried_at": "2026-08-28T09:00:00Z",
+                "next_retry_at": "2026-08-29T09:00:00Z",
+            },
+            "newer": {
+                "active": True,
+                "reason": self.guard.STALL_COOLDOWN_REASON_TRACKER_DEAD,
+                "last_tried_at": "2026-08-28T10:00:00Z",
+                "next_retry_at": "2026-08-29T10:00:00Z",
+            },
+        })
+
+        with mock.patch.dict(
+            "os.environ",
+            {**self.env, "QBT_AVAILABILITY_PROBE_TRACKER_DEAD_RETRY_SECONDS": "1800"},
+            clear=True,
+        ):
+            candidates = self.guard.availability_probe_candidates(
+                [newer, older],
+                store,
+                now,
+            )
+
+        self.assertEqual(["older", "newer"], [torrent["hash"] for torrent in candidates])
+
+    def test_probe_attempt_limit_defaults_to_two(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(2, self.guard.availability_probe_max_attempts_per_run())
 
 
 if __name__ == "__main__":

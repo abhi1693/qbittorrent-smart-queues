@@ -323,6 +323,8 @@ swarm debt instead of protecting only new grabs.
 | `QBT_AVAILABILITY_PROBE_SAMPLES` | `6` | Maximum number of fresh availability samples collected after reannounce and start. |
 | `QBT_AVAILABILITY_REQUIRED_BELOW_MINIMUM_SAMPLES` | `5` | Positive below-threshold samples required before destructive rejection. Any complete sample admits immediately. |
 | `QBT_AVAILABILITY_PROBE_INTERVAL_SECONDS` | `10` | Delay between fresh qBittorrent availability samples. |
+| `QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN` | `2` | Maximum availability-admission torrents checked in one controller run. Attempts remain sequential and bounded by the normal run-time budget. |
+| `QBT_AVAILABILITY_PROBE_TRACKER_DEAD_RETRY_SECONDS` | `1800` | Retry interval for an admission-pending torrent whose last probe returned no swarm telemetry. This overrides a longer generic tracker-dead cooldown only for `availability-probe` torrents. |
 | `QBT_AVAILABILITY_LEGACY_MIN_PROGRESS` | `0.95` | Progress threshold that makes an existing incomplete, below-threshold torrent eligible for probing. |
 | `QBT_AVAILABILITY_LEGACY_MIN_NO_PROGRESS_SAMPLES` | `2` | Stored no-progress observations that make another existing below-threshold torrent eligible for probing. |
 | `QBT_AVAILABILITY_VERIFIED_RECHECK_SECONDS` | `21600` | Minimum time after a complete availability sample before a still-stalled torrent can be probed again. The timestamp is persisted in its `availability-verified-*` tag. |
