@@ -783,6 +783,13 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                 super().__init__(torrents, files=files)
                 self.torrent_download_limits = []
                 self.torrent_upload_limits = []
+                self.metadata_started = False
+
+            def torrents_info(self, filter_name=None):
+                torrents = super().torrents_info(filter_name)
+                if self.metadata_started:
+                    return [torrent for torrent in torrents if torrent["hash"] != "probe"]
+                return torrents
 
             def set_torrent_download_limit(self, hashes, limit):
                 self.torrent_download_limits.append((list(hashes), limit))
@@ -802,6 +809,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                     if torrent["hash"] not in hashes:
                         continue
                     if not torrent.get("has_metadata"):
+                        self.metadata_started = True
                         torrent.update({
                             "has_metadata": True,
                             "state": "metaDL",
@@ -826,7 +834,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                     "hash": "magnet",
                     "name": "Metadata.First.Movie.1080p",
                     "category": "movies",
-                    "state": "stoppedDL",
+                    "state": "queuedDL",
                     "dlspeed": 0,
                     "amount_left": 0,
                     "downloaded": 0,
@@ -854,6 +862,23 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
                     "up_limit": -1,
                     "tags": "",
                 },
+                {
+                    "hash": "probe",
+                    "name": "Old.Tracker.Dead.Probe.1080p",
+                    "category": "movies",
+                    "state": "stoppedDL",
+                    "dlspeed": 0,
+                    "amount_left": 1_000,
+                    "downloaded": 100,
+                    "size": 2_000,
+                    "total_size": 2_000,
+                    "progress": 0.5,
+                    "availability": 0,
+                    "has_metadata": True,
+                    "dl_limit": -1,
+                    "up_limit": -1,
+                    "tags": "availability-probe",
+                },
             ],
             files={
                 "magnet": [
@@ -872,6 +897,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
             "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_TIMEOUT_SECONDS": "2",
             "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_POLL_SECONDS": "0.1",
             "QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_MAX_ATTEMPTS_PER_RUN": "1",
+            "QBT_AVAILABILITY_ADMISSION_ENABLED": "true",
             "QBT_SINGLE_DOWNLOAD_TV_FILE_PRIORITY_ENABLED": "false",
             "QBT_TORRENT_HEALTH_SCORING_ENABLED": "false",
             "QBT_TV_QUEUE_SONARR_ENABLED": "false",
@@ -902,6 +928,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         actions = [event.get("action") for event in decision_events]
 
         self.assertIn("bootstrap_metadata_ready", actions)
+        self.assertFalse(any(action.startswith("availability_") for action in actions))
         self.assertIn("try_candidate", actions)
         self.assertLess(
             actions.index("bootstrap_metadata_ready"),
@@ -911,7 +938,7 @@ class ZeroSpeedBehaviorTests(unittest.TestCase):
         self.assertIn(["magnet"], client.stopped)
         self.assertEqual(
             [(["magnet"], 65_536), (["magnet"], 0)],
-            client.torrent_download_limits,
+            client.torrent_download_limits[:2],
         )
         self.assertEqual(
             [(["magnet"], 16_384), (["magnet"], 0)],

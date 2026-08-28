@@ -412,7 +412,7 @@ storage hard-stop, and shutdown hooks still apply.
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_ENABLED` | `true` | Keep stalled/no-progress torrents active instead of pausing them, and run replacement candidates beside them. |
 | `QBT_SINGLE_DOWNLOAD_PARK_STALLED_SAMPLES` | storage recovery stall samples | No-progress samples required before a non-productive running torrent is parked. qBittorrent `stalledDL`/`metaDL` torrents park immediately. |
 | `QBT_SINGLE_DOWNLOAD_MAX_PARKED_STALLED` | `0` | Maximum parked stalled torrents in normal mode. `0` means no cap, so stalled torrents are not paused just because the parked set is large. |
-| `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_ENABLED` | `true` | When storage-fit checks are enabled, briefly start one stopped magnet whose size is unknown so qBittorrent can fetch its metadata before the controller evaluates storage headroom. Productive downloads retain priority. |
+| `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_ENABLED` | `true` | When storage-fit checks are enabled, briefly start one stopped or queued magnet whose size is unknown so qBittorrent can fetch its metadata before the controller evaluates storage headroom. Productive downloads retain priority. |
 | `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_TIMEOUT_SECONDS` | `60` | Maximum time to wait for one magnet's metadata before stopping it and applying metadata cooldown. |
 | `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_POLL_SECONDS` | `2` | Poll interval while waiting for qBittorrent to report metadata. |
 | `QBT_SINGLE_DOWNLOAD_METADATA_BOOTSTRAP_MAX_ATTEMPTS_PER_RUN` | `1` | Maximum unknown-metadata magnets attempted during one controller run. |
@@ -451,13 +451,15 @@ does not know for a newly added magnet until its metadata arrives. Without a
 metadata bootstrap, an "add stopped" workflow can deadlock: the controller
 cannot prove the torrent fits, so it never starts the torrent that must run to
 learn its size. The bootstrap path breaks that cycle without bypassing the
-storage reserve. It temporarily opens one queue slot, applies the per-torrent
-traffic caps above, starts the stopped magnet, polls `has_metadata`, and always
-attempts to stop it before restoring its previous limits. If both targeted and
-global stop calls fail, the low traffic caps remain in place. A timeout enters
-the existing metadata cooldown, then removes and blocklists the associated
-Sonarr/Radarr queue item so unreachable magnets do not monopolize every pass and
-the media app can grab another release. When no Sonarr/Radarr queue item
+storage reserve. A runnable metadata bootstrap takes precedence over the older
+availability-probe backlog, so a newly queued magnet cannot be starved one
+probe at a time. It temporarily opens one queue slot, applies the per-torrent
+traffic caps above, starts the stopped or queued magnet, polls `has_metadata`,
+and always attempts to stop it before restoring its previous limits. If both
+targeted and global stop calls fail, the low traffic caps remain in place. A
+timeout enters the existing metadata cooldown, then removes and blocklists the
+associated Sonarr/Radarr queue item so unreachable magnets do not monopolize
+every pass and the media app can grab another release. When no Sonarr/Radarr queue item
 matches, Smart Queues deletes the timed-out torrent and its files directly from
 qBittorrent. The path is disabled automatically when torrent-fit enforcement is
 not active, when storage is already at/below reserve, or when qBittorrent file

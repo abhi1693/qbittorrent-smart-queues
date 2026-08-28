@@ -6816,6 +6816,10 @@ def is_stopped_torrent(torrent):
     return state.startswith("stopped") or state.startswith("paused")
 
 
+def is_metadata_bootstrap_runnable(torrent):
+    return is_stopped_torrent(torrent) or torrent_state(torrent).lower() == "queueddl"
+
+
 def is_force_started_torrent(torrent):
     return torrent_state(torrent).lower().startswith("forced")
 
@@ -9127,7 +9131,7 @@ class SmartQueuePolicyEngine:
                 if candidate_hash in self.attempted_hashes:
                     rejected_counts["metadata_bootstrap_attempted_this_run"] += 1
                     continue
-                if not is_stopped_torrent(torrent):
+                if not is_metadata_bootstrap_runnable(torrent):
                     rejected_counts["metadata_bootstrap_not_stopped"] += 1
                     continue
                 cooldown_state = {}
@@ -10278,7 +10282,37 @@ def apply_single_download(
                 health_store,
                 now,
             )
-            if availability_candidates:
+            metadata_bootstrap_preempts_availability = False
+            if client_metadata_bootstrap_enabled:
+                for torrent in torrents:
+                    if (
+                        torrent_hash(torrent) in attempted_hashes
+                        or is_force_started_torrent(torrent)
+                        or arr_import_rejection_block_reason(
+                            torrent,
+                            sonarr_queue,
+                            radarr_queue,
+                        )
+                        or availability_admission_block_reason(torrent)
+                        or single_download_reject_reason(
+                            torrent,
+                            min_progress,
+                            max_remaining_bytes,
+                            categories,
+                        )
+                        or not torrent_metadata_missing(torrent)
+                        or not is_metadata_bootstrap_runnable(torrent)
+                    ):
+                        continue
+                    cooldown_state = health_store.active_cooldown_state(
+                        torrent,
+                        now,
+                        scope="normal",
+                    )
+                    if not cooldown_state:
+                        metadata_bootstrap_preempts_availability = True
+                        break
+            if availability_candidates and not metadata_bootstrap_preempts_availability:
                 availability_attempt_limit = availability_probe_max_attempts_per_run()
                 availability_attempts = 0
                 for availability_candidate in availability_candidates[:availability_attempt_limit]:

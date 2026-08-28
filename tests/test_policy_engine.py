@@ -395,6 +395,7 @@ class PolicyEngineTests(unittest.TestCase):
 
         unknown = self.torrent(
             "unknown",
+            state="queuedDL",
             progress=0.0,
             amount_left=0,
             size=-1,
@@ -430,6 +431,34 @@ class PolicyEngineTests(unittest.TestCase):
         self.assertEqual(1, result.candidate_counts["metadata_unknown"])
         self.assertEqual(1, result.candidate_counts["metadata_bootstrap_available"])
         self.assertEqual(0, result.rejected_counts["storage_headroom"])
+
+    def test_metadata_bootstrap_rejects_other_running_states(self):
+        class StorageGuard:
+            require_torrent_fit = True
+
+        unknown = self.torrent(
+            "unknown",
+            state="metaDL",
+            progress=0.0,
+            amount_left=0,
+            size=-1,
+            total_size=-1,
+            has_metadata=False,
+        )
+        result = self.engine(
+            [unknown],
+            storage_guard=StorageGuard(),
+            storage_state={
+                "enabled": True,
+                "stop": False,
+                "free_bytes": 20_000,
+                "reserve_bytes": 1_000,
+                "headroom_bytes": 10_000,
+            },
+        ).run()
+
+        self.assertEqual([], result.filters.metadata_bootstrap_candidates)
+        self.assertEqual(1, result.rejected_counts["metadata_bootstrap_not_stopped"])
 
     def test_metadata_bootstrap_precedes_nonproductive_known_candidate(self):
         class StorageGuard:
