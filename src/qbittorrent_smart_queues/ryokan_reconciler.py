@@ -202,7 +202,13 @@ def inspect_import(db_path, media_root, item_hash, expected_files):
 
         grabbed_episode_count = grab_episode_count(grab["episode_numbers"])
         base["grabbed_episode_count"] = grabbed_episode_count
-        if grabbed_episode_count != len(expected_candidates):
+        # Older Ryokan batch rows can include secondary videos (openings,
+        # endings, and other extras) in episode_numbers even though the
+        # qBittorrent selected-file list correctly excludes them. A larger
+        # stored count is safe to tolerate only if the receipts and library
+        # targets below prove the exact selected set. A smaller count still
+        # indicates a partial/mis-shaped import and must fail closed.
+        if grabbed_episode_count < len(expected_candidates):
             base["status"] = "batch_shape_mismatch"
             return base
 

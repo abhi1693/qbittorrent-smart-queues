@@ -247,6 +247,28 @@ class RyokanReconcilerTests(unittest.TestCase):
         self.assertEqual("not_found", result["status"])
         self.assertFalse(result["delete_allowed"])
 
+    def test_extra_stored_batch_episodes_are_allowed_when_receipts_are_exact(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path, media_root = self.create_fixture(tmpdir)
+            database = sqlite3.connect(db_path)
+            database.execute(
+                "UPDATE grabbed_torrents SET episode_numbers = '[1,2,3]' WHERE id = 11"
+            )
+            database.commit()
+            database.close()
+
+            result = ryokan_reconciler.reconcile_import(
+                db_path,
+                media_root,
+                "abc123",
+                self.expected_files(),
+            )
+
+        self.assertEqual("complete", result["status"])
+        self.assertTrue(result["delete_allowed"])
+        self.assertEqual(3, result["grabbed_episode_count"])
+        self.assertEqual(2, result["expected_count"])
+
     def test_post_processing_disabled_completion_is_not_requeued(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path, media_root = self.create_fixture(tmpdir, target_count=0)
