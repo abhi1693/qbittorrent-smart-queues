@@ -708,3 +708,11 @@ constrained.
 PYTHONPATH=src python -m unittest discover -s tests
 docker build -t qbittorrent-smart-queues:dev .
 ```
+
+## Next patch release
+
+Version 0.2.13 refreshes the runtime and development dependencies. See
+[CHANGELOG.md](CHANGELOG.md) for the dependency versions.
+
+Pull requests run the application tests on every supported Python minor version
+before the dependency refresh is merged.
