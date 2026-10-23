@@ -14,7 +14,7 @@ qbittorrent-smart-queues = "qbittorrent_smart_queues.guard:main"
 ryokan-import-reconciler = "qbittorrent_smart_queues.ryokan_reconciler:main"
 
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.dynamic]

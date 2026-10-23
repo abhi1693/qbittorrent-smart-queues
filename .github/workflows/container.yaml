@@ -1,3 +1,4 @@
+---
 name: Container
 on:
   push:
@@ -6,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Semver image version without a leading v
+        description: Semver image version; run only from its matching vVERSION tag
         required: true
 permissions:
   contents: read
@@ -14,12 +15,41 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 jobs:
+  release-identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the exact release tag and source
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: bash scripts/check_release_identity.sh
+  ci:
+    needs: release-identity
+    name: Required CI
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ inputs.version }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
   images:
+    needs: ci
     uses: abhi1693/actions/.github/workflows/container-images.yml@v1
     with:
       manifest: .github/images.json
       publish: true
-      version: ${{ inputs.version }}
+      version: ${{ needs.ci.outputs.version }}
+      scan: true
+      scan-ignore-unfixed: false
     permissions:
       contents: read
       packages: write
