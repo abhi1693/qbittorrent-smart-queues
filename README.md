@@ -34,6 +34,27 @@ The same image can run the Ryokan database-side reconciliation adapter:
 python -m qbittorrent_smart_queues.ryokan_reconciler
 ```
 
+Images use Python 3.14.9 on Alpine 3.24, run as UID/GID `65532`, and retain native
+SQLite, TLS, compression and timezone support. Neither entrypoint needs runtime
+package installers, so pip, ensurepip and setuptools are absent from the image.
+
+Pull requests build the published `linux/arm64` platform on a native GitHub-hosted
+runner. The shared image workflow generates an SBOM, rejects HIGH/CRITICAL
+vulnerabilities including unfixed findings and secrets, and runs both entrypoints
+against isolated local fixtures. Release publication repeats these checks after
+the supported Python tests pass. The source `__version__` remains authoritative;
+requested image versions and release tags must match it before building.
+Publication, including manual dispatch, requires its exact `vVERSION` Git tag
+and identical resolved tag commit, checked-out HEAD and workflow source SHA.
+Moving branch dispatches fail before publication checks or image builds.
+
+The runtime smoke runs without external networking, as the image's non-root user
+with a read-only root filesystem. It checks real controller health/status/metrics
+and a complete empty-queue decision against a synthetic qBittorrent API. It also
+checks reconciler authentication and complete receipt verification against a
+synthetic SQLite database and media file, proving verification leaves both intact.
+The fixture never connects to a real media service or creates a torrent.
+
 Run that adapter in Ryokan's pod with the live database at `/data/ryokan.db`
 and the library at `/media/anime`. It requires `RYOKAN_RECONCILER_API_KEY` and
 accepts optional `RYOKAN_RECONCILER_DB_PATH`, `RYOKAN_RECONCILER_MEDIA_ROOT`,
@@ -706,13 +727,20 @@ constrained.
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests
-docker build -t qbittorrent-smart-queues:dev .
+version=$(python3 scripts/check_version.py)
+docker build --build-arg APP_VERSION="$version" -t qbittorrent-smart-queues:dev .
+bash scripts/smoke-runtime.sh qbittorrent-smart-queues:dev linux/amd64 "$version"
 ```
 
-## Next patch release
+Use `linux/arm64` for the smoke command on a native ARM64 host. The smoke rejects
+architecture emulation and version mismatches. Both command-line entrypoints and
+the supported Python 3.13/3.14 source compatibility remain unchanged.
+
+## Version 0.2.13
 
 Version 0.2.13 refreshes the runtime and development dependencies. See
 [CHANGELOG.md](CHANGELOG.md) for the dependency versions.
 
-Pull requests run the application tests on every supported Python minor version
-before the dependency refresh is merged.
+Promote one verified image digest for both the controller and any deployed Ryokan
+import-reconciler sidecar. Updating that sidecar restarts the containing Ryokan pod;
+retain its database/library mounts, API-key binding and command override.

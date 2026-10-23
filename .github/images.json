@@ -6,6 +6,11 @@
       "image": "ghcr.io/abhi1693/qbittorrent-smart-queues",
       "context": ".",
       "file": "Dockerfile",
+      "smoke-script": "scripts/smoke-runtime.sh",
+      "build-args": {
+        "APP_VERSION": "{version}",
+        "REVISION": "{revision}"
+      },
       "platforms": [
         "linux/arm64"
       ]
