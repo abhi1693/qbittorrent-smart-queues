@@ -130,31 +130,91 @@ class AvailabilityAdmissionTests(unittest.TestCase):
         )
         self.assertEqual([(["abc123"], 0)], client.download_limits)
 
-    def test_stably_incomplete_availability_is_blocklisted_through_sonarr(self):
-        client = ProbeClient([{"availability": 0.999}] * 6)
-        sonarr = StaticQueue(
-            {"queue_id": 42, "source": "sonarr"},
-            [("sonarr", "http://sonarr.test", "api-key")],
+    def test_low_availability_never_deletes_even_arr_owned_data(self):
+        for category in ("tv", "ryokan", ""):
+            for metadata in (None, {"queue_id": 42, "source": "sonarr"}):
+                with self.subTest(category=category, metadata=metadata):
+                    client = ProbeClient([{"availability": 0.704}] * 6)
+                    sonarr = StaticQueue(metadata, [("sonarr", "http://sonarr.test", "key")])
+                    with mock.patch.dict("os.environ", self.env, clear=True), mock.patch.object(
+                        self.guard, "request_json"
+                    ) as request:
+                        result = self.guard.process_availability_admission_torrent(
+                            client, dict(self.base_torrent, category=category),
+                            sonarr, StaticQueue(None),
+                        )
+                    self.assertEqual("deferred", result["status"])
+                    self.assertEqual(6, result["below_minimum_samples"])
+                    self.assertEqual([], client.deleted)
+                    self.assertEqual([["abc123"]], client.stopped)
+                    request.assert_not_called()
+
+    def test_manual_override_at_entry_is_untouched(self):
+        for override in ({"state": "forcedDL"}, {"force_start": True}):
+            client = ProbeClient([])
+            with mock.patch.dict("os.environ", self.env, clear=True):
+                result = self.guard.process_availability_admission_torrent(
+                    client, dict(self.base_torrent, **override), None, None,
+                )
+            self.assertEqual("manual-override", result["status"])
+            self.assertEqual([], client.started)
+            self.assertEqual([], client.stopped)
+            self.assertEqual([], client.deleted)
+            self.assertEqual([], client.download_limits)
+
+    def test_manual_override_or_completion_during_probe_preserves_data(self):
+        for change, status in (
+            ({"state": "forcedDL"}, "manual-override"),
+            ({"force_start": True}, "manual-override"),
+            ({"progress": 1, "amount_left": 0}, "completed"),
+        ):
+            with self.subTest(change=change):
+                client = ProbeClient(
+                    [{"availability": 0.704}] * 5
+                    + [{"availability": 0.704, **change}]
+                )
+                with mock.patch.dict("os.environ", self.env, clear=True), mock.patch.object(
+                    self.guard, "request_json"
+                ) as request:
+                    result = self.guard.process_availability_admission_torrent(
+                        client, self.base_torrent, None, None,
+                    )
+                self.assertEqual(status, result["status"])
+                self.assertEqual([], client.deleted)
+                self.assertEqual([], client.stopped)
+                request.assert_not_called()
+
+    def test_metadata_timeout_preserves_manual_or_downloaded_payload(self):
+        for change in (
+            {"state": "forcedDL"},
+            {"force_start": True},
+            {"progress": 0.1},
+            {"downloaded": 1024},
+            {"progress": 1.0},
+        ):
+            with self.subTest(change=change):
+                client = ProbeClient([])
+                torrent = dict(self.base_torrent, progress=0, downloaded=0)
+                torrent.update(change)
+                with mock.patch.object(self.guard, "request_json") as request:
+                    result = self.guard.process_metadata_timeout_torrent(
+                        client, torrent,
+                        StaticQueue({"queue_id": 42, "source": "sonarr"},
+                                    [("sonarr", "http://sonarr.test", "key")]),
+                        StaticQueue(None),
+                    )
+                self.assertEqual(0, result["succeeded"])
+                self.assertEqual([], client.deleted)
+                request.assert_not_called()
+
+    def test_metadata_timeout_preserves_unknown_manager(self):
+        client = ProbeClient([])
+        result = self.guard.process_metadata_timeout_torrent(
+            client, dict(self.base_torrent, category="ryokan", progress=0, downloaded=0),
+            StaticQueue(None), StaticQueue(None),
         )
-
-        with mock.patch.dict("os.environ", self.env, clear=True), \
-                mock.patch.object(self.guard, "request_json", return_value=({}, object())) as request_json:
-            result = self.guard.process_availability_admission_torrent(
-                client,
-                self.base_torrent,
-                sonarr,
-                StaticQueue(None),
-            )
-
-        self.assertEqual("rejected", result["status"])
-        self.assertEqual(6, result["samples"])
-        self.assertEqual(6, result["below_minimum_samples"])
-        request_json.assert_called_once()
-        delete_url = request_json.call_args.args[2]
-        self.assertIn("/api/v3/queue/42?", delete_url)
-        self.assertIn("removeFromClient=true", delete_url)
-        self.assertIn("blocklist=true", delete_url)
-        self.assertIn("skipRedownload=false", delete_url)
+        self.assertEqual(1, result["no_arr_match"])
+        self.assertEqual(0, result["succeeded"])
         self.assertEqual([], client.deleted)
 
     def test_unknown_availability_is_stopped_and_deferred_without_deletion(self):
@@ -172,40 +232,6 @@ class AvailabilityAdmissionTests(unittest.TestCase):
         self.assertEqual(0, result["below_minimum_samples"])
         self.assertEqual([["abc123"]], client.stopped)
         self.assertEqual([], client.deleted)
-
-    def test_failed_arr_rejection_is_stopped_and_excluded_from_selection(self):
-        client = ProbeClient([{"availability": 0.999}] * 6)
-        sonarr = StaticQueue(
-            {"queue_id": 42, "source": "sonarr"},
-            [("sonarr", "http://sonarr.test", "api-key")],
-        )
-
-        with mock.patch.dict("os.environ", self.env, clear=True), \
-                mock.patch.object(
-                    self.guard,
-                    "request_json",
-                    side_effect=self.guard.ApiError("Sonarr unavailable"),
-                ):
-            result = self.guard.process_availability_admission_torrent(
-                client,
-                self.base_torrent,
-                sonarr,
-                StaticQueue(None),
-            )
-            failed_torrent = dict(
-                self.base_torrent,
-                tags="availability-probe,availability-rejection-failed",
-            )
-            block_reason = self.guard.availability_admission_block_reason(failed_torrent)
-
-        self.assertEqual("rejection-failed", result["status"])
-        self.assertEqual("availability_rejection_failed", block_reason)
-        self.assertEqual([["abc123"]], client.stopped)
-        self.assertEqual(
-            [(["abc123"], ["availability-rejection-failed"])],
-            client.added_tags,
-        )
-        self.assertEqual([], client.removed_tags)
 
     def test_new_worker_is_capped_and_tagged_before_admission(self):
         torrent = dict(self.base_torrent, tags="", availability=0)

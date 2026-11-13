@@ -338,21 +338,21 @@ Before a new worker starts, the controller applies an `availability-probe` tag
 and a small per-torrent download cap. A later pass reannounces the torrent and
 collects multiple fresh qBittorrent availability samples. Any sample at or
 above `1.0` admits the torrent, removes the probe cap, and tags it
-`availability-verified`. Repeated positive samples below `1.0` remove and
-blocklist the release through Sonarr/Radarr, with `skipRedownload=false`, so Arr
-can choose a different release. Zero or unavailable telemetry is inconclusive:
-the torrent is stopped and cooled down without being deleted. Force-started
-torrents remain manual overrides. The controller also evaluates legacy stalled
-torrents near completion, so enabling the feature drains existing incomplete
-swarm debt instead of protecting only new grabs.
+`availability-verified`. Repeated positive samples below `1.0`, zero availability,
+and unavailable telemetry stop and cool down the torrent without deleting or
+blocklisting it. Swarm availability does not establish that downloaded data is
+disposable. This protection applies to Arr, Ryokan, and manually added torrents.
+Force-started torrents remain manual overrides, including overrides observed
+during a probe. Completed downloads are also preserved. The controller can
+evaluate legacy stalled torrents near completion without discarding their data.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QBT_AVAILABILITY_ADMISSION_ENABLED` | `false` | Enable bounded total-availability probes, Arr blocklisting, and qBittorrent removal for incomplete swarms. |
+| `QBT_AVAILABILITY_ADMISSION_ENABLED` | `false` | Enable bounded, non-destructive total-availability probes and cooldown for incomplete swarms. |
 | `QBT_AVAILABILITY_MIN_COMPLETE` | `1.0` | Minimum qBittorrent total availability that proves all selected pieces exist in the observed swarm. |
 | `QBT_AVAILABILITY_PROBE_DOWNLOAD_LIMIT_BYTES_PER_SEC` | `1048576` | Per-torrent download cap while availability is unverified. |
 | `QBT_AVAILABILITY_PROBE_SAMPLES` | `6` | Maximum number of fresh availability samples collected after reannounce and start. |
-| `QBT_AVAILABILITY_REQUIRED_BELOW_MINIMUM_SAMPLES` | `5` | Positive below-threshold samples required before destructive rejection. Any complete sample admits immediately. |
+| `QBT_AVAILABILITY_REQUIRED_BELOW_MINIMUM_SAMPLES` | `5` | Positive below-threshold samples required to classify a deferred probe as an incomplete swarm. Any complete sample admits immediately. |
 | `QBT_AVAILABILITY_PROBE_INTERVAL_SECONDS` | `10` | Delay between fresh qBittorrent availability samples. |
 | `QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN` | `2` | Maximum availability-admission torrents checked in one controller run. Attempts remain sequential and bounded by the normal run-time budget. |
 | `QBT_AVAILABILITY_IDLE_MAX_ATTEMPTS_PER_RUN` | `QBT_AVAILABILITY_PROBE_MAX_ATTEMPTS_PER_RUN` | Higher availability-probe limit used only when no torrent is downloading productively. This lets an idle queue rotate through a dead-swarm backlog without changing normal active-download behavior. |
@@ -361,7 +361,6 @@ swarm debt instead of protecting only new grabs.
 | `QBT_AVAILABILITY_LEGACY_MIN_PROGRESS` | `0.95` | Progress threshold that makes an existing incomplete, below-threshold torrent eligible for probing. |
 | `QBT_AVAILABILITY_LEGACY_MIN_NO_PROGRESS_SAMPLES` | `2` | Stored no-progress observations that make another existing below-threshold torrent eligible for probing. |
 | `QBT_AVAILABILITY_VERIFIED_RECHECK_SECONDS` | `21600` | Minimum time after a complete availability sample before a still-stalled torrent can be probed again. The timestamp is persisted in its `availability-verified-*` tag. |
-| `QBT_AVAILABILITY_ARR_TIMEOUT` | `QBT_ARR_QUEUE_TIMEOUT` or `10` | Timeout for Sonarr/Radarr removal and blocklist calls. |
 
 Stale maintenance is intentionally conservative. It does not delete incomplete
 14-day stalled torrents just because they are old; it tags, reannounces, and
@@ -486,8 +485,9 @@ targeted and global stop calls fail, the low traffic caps remain in place. A
 timeout enters the existing metadata cooldown, then removes and blocklists the
 associated Sonarr/Radarr queue item so unreachable magnets do not monopolize
 every pass and the media app can grab another release. When no Sonarr/Radarr queue item
-matches, Smart Queues deletes the timed-out torrent and its files directly from
-qBittorrent. The path is disabled automatically when torrent-fit enforcement is
+matches, Smart Queues preserves the torrent and its files. Metadata-timeout
+rejection also preserves manual overrides and any torrent with downloaded
+payload; it must not be used as imported-data cleanup. The path is disabled automatically when torrent-fit enforcement is
 not active, when storage is already at/below reserve, or when qBittorrent file
 preallocation is enabled. Disabling bootstrap with preallocation avoids
 allocating an unknown-size payload before its storage fit can be verified.

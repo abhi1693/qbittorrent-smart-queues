@@ -1033,7 +1033,7 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
         self.assertEqual([], client.deleted)
         self.assertEqual([], client.added_tags)
 
-    def test_metadata_timeout_deletes_torrent_when_no_arr_queue_record_matches(self):
+    def test_metadata_timeout_preserves_torrent_when_no_arr_queue_record_matches(self):
         client = FakeQbtClient()
         torrent = {
             "hash": "nometaarr",
@@ -1054,9 +1054,9 @@ class StaleTorrentMaintenanceTests(unittest.TestCase):
                 radarr,
             )
 
-        self.assertEqual({"attempted": 1, "succeeded": 1, "failed": 0, "no_arr_match": 1}, result)
+        self.assertEqual({"attempted": 1, "succeeded": 0, "failed": 1, "no_arr_match": 1}, result)
         request_json.assert_not_called()
-        self.assertEqual([(["nometaarr"], True)], client.deleted)
+        self.assertEqual([], client.deleted)
         self.assertEqual([], client.added_tags)
 
     def test_metadata_timeout_marks_failure_when_arr_delete_fails(self):

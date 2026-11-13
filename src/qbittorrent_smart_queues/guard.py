@@ -5774,6 +5774,16 @@ def remove_and_blocklist_arr_torrent(
         result["failed"] = 1
         return result
 
+    # Metadata-timeout rejection is only safe before any payload exists.
+    # Verified imported-data cleanup has its own separate checks.
+    if (
+        is_force_started_torrent(torrent)
+        or torrent_progress(torrent) > 0
+        or (torrent_downloaded_bytes(torrent) or 0) > 0
+    ):
+        result["failed"] = 1
+        return result
+
     candidates = arr_queue_candidates_for_torrent(torrent, sonarr_queue, radarr_queue)
     deleted = False
     matched = False
@@ -5815,26 +5825,14 @@ def remove_and_blocklist_arr_torrent(
         )
         return result
 
+    # Absence from Arr is not permission to delete: other managers (for
+    # example Ryokan) and users own torrents too, and Arr may be unavailable.
     result["no_arr_match"] = 1
-    try:
-        client.delete_hashes([item_hash], delete_files)
-        result["succeeded"] = 1
-        log_info(
-            f"Deleted torrent directly after {reason} because no Sonarr/Radarr "
-            f"queue record matched: {torrent_name(torrent)}",
-            hash=item_hash,
-            delete_files=delete_files,
-        )
-    except ApiError as exc:
-        result["failed"] = 1
-        mark_torrent_failure_tag(client, torrent, failure_tag)
-        log_warning(
-            f"Failed to delete torrent directly after {reason}: "
-            f"{torrent_name(torrent)}: {exc}",
-            hash=item_hash,
-            delete_files=delete_files,
-            failure_tag=failure_tag,
-        )
+    result["failed"] = 1
+    log_warning(
+        f"Preserving torrent after {reason}: no verified Arr queue ownership",
+        hash=item_hash,
+    )
     return result
 
 
@@ -6259,6 +6257,13 @@ def process_availability_admission_torrent(
         result["failed"] = 1
         return result
 
+    if is_force_started_torrent(torrent):
+        result["status"] = "manual-override"
+        return result
+    if is_completed_torrent(torrent):
+        result["status"] = "completed"
+        return result
+
     prepare_availability_probe_torrents(client, [torrent])
     try:
         client.reannounce_hashes([item_hash])
@@ -6296,6 +6301,14 @@ def process_availability_admission_torrent(
             result["succeeded"] = 1
             return result
         latest = refreshed
+        # A user may force-start, or the download may finish during sampling.
+        # Exit before changing limits/tags or stopping the torrent.
+        if is_force_started_torrent(refreshed):
+            result["status"] = "manual-override"
+            return result
+        if is_completed_torrent(refreshed):
+            result["status"] = "completed"
+            return result
         availability = torrent_availability(refreshed)
         result["samples"] += 1
         result["max_availability"] = max(result["max_availability"], availability)
@@ -6313,46 +6326,25 @@ def process_availability_admission_torrent(
         if 0 < availability < minimum:
             result["below_minimum_samples"] += 1
 
-    if result["below_minimum_samples"] >= required_below:
-        action = remove_and_blocklist_arr_torrent(
-            client,
-            latest,
-            sonarr_queue,
-            radarr_queue,
-            env_int("QBT_AVAILABILITY_ARR_TIMEOUT", env_int("QBT_ARR_QUEUE_TIMEOUT", 10)),
-            delete_files=True,
-            failure_tag=AVAILABILITY_REJECTION_FAILED_TAG,
-            reason=(
-                f"availability remained below {minimum:.3f} for "
-                f"{result['below_minimum_samples']} fresh samples"
-            ),
-        )
-        result.update({key: action.get(key, result.get(key)) for key in (
-            "succeeded", "failed", "no_arr_match"
-        )})
-        result["status"] = "rejected" if action.get("succeeded") else "rejection-failed"
-        if action.get("failed"):
-            try:
-                client.stop_hashes([item_hash])
-            except ApiError as exc:
-                log_warning(
-                    f"Failed to stop torrent after availability rejection failed: {exc}",
-                    hash=item_hash,
-                )
-        return result
-
+    # Swarm availability is not evidence of safe disposal or a verified
+    # import. Never delete/blocklist data here, including Arr-owned downloads.
+    below_minimum = result["below_minimum_samples"] >= required_below
     try:
         client.stop_hashes([item_hash])
     except ApiError as exc:
         log_warning(
-            f"Failed to stop torrent after inconclusive availability probe: {exc}",
+            f"Failed to stop torrent after deferred availability probe: {exc}",
             hash=item_hash,
         )
     if health_store is not None:
         health_store.record_failure(
             latest,
             datetime.now(timezone.utc),
-            "availability probe returned no complete or partial swarm telemetry",
+            (
+                "availability remained below minimum; data preserved"
+                if below_minimum
+                else "availability probe returned no complete or partial swarm telemetry"
+            ),
             cooldown_reason=STALL_COOLDOWN_REASON_TRACKER_DEAD,
             cooldown_scope="normal",
         )
@@ -6869,7 +6861,10 @@ def is_metadata_bootstrap_runnable(torrent):
 
 
 def is_force_started_torrent(torrent):
-    return torrent_state(torrent).lower().startswith("forced")
+    return (
+        torrent_state(torrent).lower().startswith("forced")
+        or torrent.get("force_start") is True
+    )
 
 
 def force_started_torrents(torrents):
