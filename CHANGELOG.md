@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.15 — 2026-11-22
+
+- Reuse qBittorrent sessions across polling cycles and renew rejected sessions once.
+
 ## 0.2.14 — 2026-11-13
 
 - Make availability admission non-destructive: incomplete swarms are deferred without deleting or blocklisting downloaded data.
