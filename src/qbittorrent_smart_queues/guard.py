@@ -16,6 +16,7 @@ import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -2991,11 +2992,16 @@ def qbt_urls():
     return split_lines_or_csv(os.environ.get("QBT_URLS")) or QBT_DEFAULT_URLS
 
 
+@lru_cache(maxsize=32)
+def _qbt_client(url):
+    return QbtClient(url)
+
+
 def reachable_qbt_clients():
     urls = qbt_urls()
     clients = []
     for url in urls:
-        client = QbtClient(url)
+        client = _qbt_client(url.rstrip("/"))
         try:
             client.login()
             client.request("GET", "/api/v2/app/version")

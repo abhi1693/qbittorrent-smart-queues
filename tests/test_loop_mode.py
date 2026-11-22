@@ -115,6 +115,8 @@ class LoopModeTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"QBT_URLS": "http://qbittorrent.test:8080"}, clear=True), \
                 mock.patch.object(self.guard, "QbtClient", FakeQbtClient):
             clients = self.guard.reachable_qbt_clients()
+            self.assertIs(clients[0], self.guard.reachable_qbt_clients()[0])
+            self.guard._qbt_client.cache_clear()
 
         self.assertEqual(instances, clients)
         self.assertEqual(("GET", "/api/v2/app/version", None), instances[0].requested_version)
@@ -125,7 +127,7 @@ class LoopModeTests(unittest.TestCase):
                 "availability-verified",
                 "availability-rejection-failed",
             ]],
-            instances[0].created_tags,
+            instances[0].created_tags[:1],
         )
 
     def test_qbt_client_create_tags_uses_global_tags_endpoint(self):

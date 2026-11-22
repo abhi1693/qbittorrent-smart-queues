@@ -1,4 +1,5 @@
 import json
+import urllib.error
 import unittest
 from unittest import mock
 
@@ -10,6 +11,17 @@ class QbtClientTests(unittest.TestCase):
     def client(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             return QbtClient("http://qbittorrent.test/")
+
+    def test_evicted_session_is_renewed_once_and_rejection_is_bounded(self):
+        client = self.client()
+        client.username = "test"
+        denied = urllib.error.HTTPError(client.base_url, 403, "Forbidden", {}, None)
+        with mock.patch.object(client, "_request", side_effect=[denied, b"Ok.", denied]) as request:
+            with self.assertRaises(ApiError):
+                client.request("GET", "/api/v2/app/version")
+        self.assertEqual([call.args[1] for call in request.call_args_list], [
+            "/api/v2/app/version", "/api/v2/auth/login", "/api/v2/app/version",
+        ])
 
     def test_hash_actions_share_the_same_encoded_form(self):
         client = self.client()

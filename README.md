@@ -744,3 +744,5 @@ Version 0.2.13 refreshes the runtime and development dependencies. See
 Promote one verified image digest for both the controller and any deployed Ryokan
 import-reconciler sidecar. Updating that sidecar restarts the containing Ryokan pod;
 retain its database/library mounts, API-key binding and command override.
+
+The controller reuses one qBittorrent cookie jar per service URL across polling cycles. If the server rejects a session, the controller logs in again and retries the rejected request once.

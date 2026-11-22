@@ -33,6 +33,19 @@ class QbtClient:
         )
 
     def request(self, method, path, form=None):
+        try:
+            return self._request(method, path, form)
+        except urllib.error.HTTPError as exc:
+            if not self.username or path == "/api/v2/auth/login":
+                raise ApiError(f"{method} {path} rejected: {exc}") from exc
+            self.cookie_jar.clear()
+            self.login()
+            try:
+                return self._request(method, path, form)
+            except urllib.error.HTTPError as retry_error:
+                raise ApiError(f"{method} {path} rejected: {retry_error}") from retry_error
+
+    def _request(self, method, path, form=None):
         body = None
         headers = {}
         if form is not None:
@@ -51,6 +64,9 @@ class QbtClient:
                 with self.opener.open(request, timeout=self.timeout) as response:
                     return response.read()
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+                if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403):
+                    exc.close()
+                    raise
                 last_error = exc
                 if attempt < self.request_attempts:
                     time.sleep(self.retry_delay)
@@ -59,7 +75,10 @@ class QbtClient:
         )
 
     def login(self):
-        if not self.username:
+        if not self.username or any(
+            (cookie.name == "SID" or cookie.name.startswith("QBT_SID_"))
+            and not cookie.is_expired() for cookie in self.cookie_jar
+        ):
             return
         response = self.request(
             "POST",
