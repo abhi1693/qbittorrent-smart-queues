@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.16 — 2026-11-22
+
+- Delete unused timestamped availability verification tags during regular cleanup. Preserve assigned tags and custom labels.
+
 ## 0.2.15 — 2026-11-22
 
 - Reuse qBittorrent sessions across polling cycles and renew rejected sessions once.

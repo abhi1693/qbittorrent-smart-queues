@@ -9788,9 +9788,6 @@ def cleanup_stall_tags(client, health_store=None):
     for prefix in (stall_tag_prefix, storage_stall_tag_prefix):
         if prefix and prefix not in stall_tag_prefixes:
             stall_tag_prefixes.append(prefix)
-    if not stall_tag_prefixes:
-        return
-
     now = datetime.now(timezone.utc)
     stall_cooldown_seconds = env_int("QBT_SINGLE_DOWNLOAD_STALL_COOLDOWN_SECONDS", 3600)
     active_stall_tags = set()
@@ -9867,6 +9864,14 @@ def cleanup_stall_tags(client, health_store=None):
         )
         return
 
+    assigned_tags = {tag for torrent in torrents for tag in torrent_tags(torrent)}
+    unused_verified_tags = []
+    for tag in all_tags:
+        if tag in assigned_tags or not re.fullmatch(r"availability-verified-[0-9]{8}T[0-9]{6}Z", tag):
+            continue
+        if parse_stall_cooldown_tag(tag, AVAILABILITY_VERIFIED_TAG) is not None:
+            unused_verified_tags.append(tag)
+
     unused_stall_tags = sorted(
         tag for tag in all_tags
         if any(
@@ -9875,16 +9880,17 @@ def cleanup_stall_tags(client, health_store=None):
         )
         and tag not in active_stall_tags
     )
-    if not unused_stall_tags:
-        log_debug("No unused quota-stall tags need cleanup")
+    if not unused_stall_tags and not unused_verified_tags:
+        log_debug("No unused controller tags need cleanup")
         return
 
     try:
-        client.delete_tags(unused_stall_tags)
-        log_info(f"Deleted {len(unused_stall_tags)} unused quota-stall tag(s)")
+        client.delete_tags(sorted(set(unused_stall_tags + unused_verified_tags)))
+        log_info(f"Deleted {len(unused_stall_tags)} unused stall tags and "
+                 f"{len(unused_verified_tags)} unused verification tags")
     except ApiError as exc:
         log_warning(
-            f"Failed to delete unused quota-stall tag(s): {exc}",
+            f"Failed to delete unused controller tags: {exc}",
         )
 
 

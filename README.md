@@ -746,3 +746,5 @@ import-reconciler sidecar. Updating that sidecar restarts the containing Ryokan 
 retain its database/library mounts, API-key binding and command override.
 
 The controller reuses one qBittorrent cookie jar per service URL across polling cycles. If the server rejects a session, the controller logs in again and retries the rejected request once.
+
+Regular tag cleanup removes timestamped availability verification labels after their last torrent assignment disappears, including when availability admission is disabled.
